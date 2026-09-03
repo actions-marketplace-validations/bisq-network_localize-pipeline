@@ -256,6 +256,7 @@ async def test_failed_model_translation_marks_ledger_and_skips_memory(integratio
     target_file_path = os.path.join(env['translation_queue_folder'], 'app_de.properties')
     ledger_path = os.path.join(env['input_folder'], 'ledger.json')
     memory_path = os.path.join(env['input_folder'], 'translation_memory.json')
+    validation_summary = {}
 
     with open(source_file_path, 'w', encoding='utf-8') as f:
         f.write("key.fail=Needs translation\n")
@@ -281,11 +282,14 @@ async def test_failed_model_translation_marks_ledger_and_skips_memory(integratio
         await localize.translate_localization_files.process_translation_queue(
             translation_queue_folder=env['translation_queue_folder'],
             translated_queue_folder=env['translated_queue_folder'],
-            glossary_file_path=env['mock_glossary_path_resolved']
+            glossary_file_path=env['mock_glossary_path_resolved'],
+            validation_summary=validation_summary,
         )
 
     ledger = localize.translate_localization_files.load_translation_key_ledger(ledger_path)
     assert ledger["app_de.properties"]["key.fail"]["status"] == "failed"
+    assert validation_summary["app_de.properties"]["model_translation_failed_count"] == 1
+    assert validation_summary["app_de.properties"]["model_translation_failed_keys"] == ["key.fail"]
 
     memory = load_translation_memory(memory_path)
     assert memory.lookup(
@@ -304,6 +308,47 @@ async def test_failed_model_translation_marks_ledger_and_skips_memory(integratio
     )
     assert keys == ["key.fail"]
     assert texts == ["Needs translation"]
+
+
+@pytest.mark.asyncio
+async def test_failed_holistic_review_marks_keys_failed(integration_test_environment):
+    """A draft is not a successful two-pass translation when review failed."""
+    env = integration_test_environment
+    source_file_path = os.path.join(env['input_folder'], 'app.properties')
+    target_file_path = os.path.join(env['translation_queue_folder'], 'app_de.properties')
+    ledger_path = os.path.join(env['input_folder'], 'ledger.json')
+    validation_summary = {}
+
+    with open(source_file_path, 'w', encoding='utf-8') as f:
+        f.write("key.review=Needs review\n")
+    with open(target_file_path, 'w', encoding='utf-8') as f:
+        f.write("")
+
+    provider = MagicMock()
+    provider.create_chat_completion = AsyncMock(return_value=SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="Braucht Prüfung"))]
+    ))
+    provider.count_tokens.side_effect = lambda text, model: len(text.split())
+    provider.estimate_run_cost.return_value = MagicMock()
+    provider.format_estimate.return_value = "estimate"
+    provider.is_retryable_error.return_value = False
+
+    with patch('localize.translate_localization_files.MODEL_PROVIDER', provider), \
+         patch('localize.translate_localization_files.TRANSLATION_KEY_LEDGER_FILE_PATH', ledger_path), \
+         patch('localize.translate_localization_files.get_working_tree_changed_keys', return_value=set()), \
+         patch('localize.translate_localization_files.holistic_review_async', new_callable=AsyncMock) as review:
+        review.return_value = None
+        await localize.translate_localization_files.process_translation_queue(
+            translation_queue_folder=env['translation_queue_folder'],
+            translated_queue_folder=env['translated_queue_folder'],
+            glossary_file_path=env['mock_glossary_path_resolved'],
+            validation_summary=validation_summary,
+        )
+
+    ledger = localize.translate_localization_files.load_translation_key_ledger(ledger_path)
+    assert ledger["app_de.properties"]["key.review"]["status"] == "failed"
+    assert validation_summary["app_de.properties"]["model_translation_failed_count"] == 1
+    assert validation_summary["app_de.properties"]["model_translation_failed_keys"] == ["key.review"]
 
 
 @pytest.mark.asyncio
@@ -551,9 +596,9 @@ async def test_process_translation_queue_preserves_ignored_json_comment_keys(int
     env = integration_test_environment
     layout = LocalizationLayout(id="locale_filename", source_locale="en")
     source_content = {
-        "#1": "Phrases in basic/Main.tsx",
-        "#2": "Phrases in basic/BookPage/index.tsx",
-        "welcome": "Welcome to RoboSats",
+        "#1": "Phrases in app/Main.tsx",
+        "#2": "Phrases in app/SettingsPage/index.tsx",
+        "welcome": "Welcome to Acme",
         "amount": "Amount {{amount}} sats",
     }
     target_content = {}
@@ -574,13 +619,13 @@ async def test_process_translation_queue_preserves_ignored_json_comment_keys(int
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
                 content=json.dumps({
                     "/amount": "Betrag {{amount}} sats",
-                    "/welcome": "Willkommen bei RoboSats",
+                    "/welcome": "Willkommen bei Acme",
                 })
             ))])
         if "Key: /amount" in prompt_text:
             content = "Betrag {{amount}} sats"
         elif "Key: /welcome" in prompt_text:
-            content = "Willkommen bei RoboSats"
+            content = "Willkommen bei Acme"
         else:
             raise AssertionError(f"Unexpected model prompt: {prompt_text}")
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
@@ -623,15 +668,15 @@ async def test_process_translation_queue_preserves_ignored_json_comment_keys(int
     assert skipped_files == {}
     assert total_keys == 2
     assert final_payload == {
-        "#1": "Phrases in basic/Main.tsx",
-        "#2": "Phrases in basic/BookPage/index.tsx",
-        "welcome": "Willkommen bei RoboSats",
+        "#1": "Phrases in app/Main.tsx",
+        "#2": "Phrases in app/SettingsPage/index.tsx",
+        "welcome": "Willkommen bei Acme",
         "amount": "Betrag {{amount}} sats",
     }
     assert provider.estimate_run_cost.call_args.kwargs["num_keys"] == 2
     assert all('"#1"' not in prompt for prompt in seen_prompt_texts)
     assert all('"#2"' not in prompt for prompt in seen_prompt_texts)
-    assert all("Phrases in basic" not in prompt for prompt in seen_prompt_texts)
+    assert all("Phrases in app" not in prompt for prompt in seen_prompt_texts)
 
 
 @pytest.mark.asyncio
@@ -639,8 +684,8 @@ async def test_process_translation_queue_writes_only_ignored_json_keys(integrati
     env = integration_test_environment
     layout = LocalizationLayout(id="locale_filename", source_locale="en")
     source_content = {
-        "#1": "Phrases in basic/Main.tsx",
-        "#2": "Phrases in basic/BookPage/index.tsx",
+        "#1": "Phrases in app/Main.tsx",
+        "#2": "Phrases in app/SettingsPage/index.tsx",
     }
     source_file_path = os.path.join(env['input_folder'], 'en.json')
     target_file_path = os.path.join(env['translation_queue_folder'], 'de.json')

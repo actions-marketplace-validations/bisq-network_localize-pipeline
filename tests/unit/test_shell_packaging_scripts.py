@@ -98,6 +98,46 @@ def test_dockerfile_uses_orchestration_default_command():
     assert 'CMD ["/app/update-translations.sh"]' in dockerfile
 
 
+def test_dockerfile_builds_go_tools_with_fixed_dependencies():
+    dockerfile = (REPO_ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+
+    go_builder = (
+        "FROM golang:1.26.6-bookworm@"
+        "sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36"
+    )
+    assert dockerfile.count(go_builder) == 4
+    assert "ARG GH_VERSION=2.96.0" in dockerfile
+    assert "ARG GH_COMMIT=b300f2ec7ec9dc9addc39b2ad88c54097ded7ca0" in dockerfile
+    assert "ARG YQ_VERSION=4.53.3" in dockerfile
+    assert "ARG YQ_COMMIT=1b9b4ac5187171d2e5e3129be0cfa827c7f9d53d" in dockerfile
+    assert "ARG TX_VERSION=1.6.17" in dockerfile
+    assert "ARG TX_COMMIT=30dac142446db7bd1919894e9eb93545f58cc980" in dockerfile
+    assert "ARG GOSU_VERSION=1.19" in dockerfile
+    assert "ARG GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513" in dockerfile
+    assert "ARG X_SYS_VERSION=0.46.0" in dockerfile
+    assert "ARG GRPC_VERSION=1.83.2" in dockerfile
+    assert "ARG X_MOD_VERSION=0.40.0" in dockerfile
+    assert "ARG GO_GIT_VERSION=5.19.2" in dockerfile
+    assert "ARG X_CRYPTO_VERSION=0.55.0" in dockerfile
+    assert "ARG X_TEXT_VERSION=0.41.0" in dockerfile
+    assert "ARG X_TEXT_VERSION=0.40.0" in dockerfile
+    assert 'test "$(git rev-parse HEAD)" = "$GH_COMMIT"' in dockerfile
+    assert 'test "$(git rev-parse HEAD)" = "$YQ_COMMIT"' in dockerfile
+    assert 'test "$(git rev-parse HEAD)" = "$TX_COMMIT"' in dockerfile
+    assert 'test "$(git rev-parse HEAD)" = "$GOSU_COMMIT"' in dockerfile
+    assert 'go get "google.golang.org/grpc@v${GRPC_VERSION}"' in dockerfile
+    assert 'go get "golang.org/x/mod@v${X_MOD_VERSION}"' in dockerfile
+    assert 'go get "github.com/go-git/go-git/v5@v${GO_GIT_VERSION}"' in dockerfile
+    assert 'go get "golang.org/x/crypto@v${X_CRYPTO_VERSION}"' in dockerfile
+    assert 'go get "golang.org/x/sys@v${X_SYS_VERSION}"' in dockerfile
+    assert dockerfile.count('go get "golang.org/x/text@v${X_TEXT_VERSION}"') == 2
+    assert "golang[.]org/x/mod[[:space:]]+v${X_MOD_VERSION}" in dockerfile
+    assert "golang[.]org/x/crypto[[:space:]]+v${X_CRYPTO_VERSION}" in dockerfile
+    assert "COPY --from=yq-builder /out/yq /usr/bin/yq" in dockerfile
+    assert "COPY --from=tx-builder /out/tx /usr/local/bin/tx" in dockerfile
+    assert "COPY --from=gosu-builder /out/gosu /usr/sbin/gosu" in dockerfile
+
+
 def test_dockerignore_excludes_local_configs_and_agent_scratch():
     dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
 
@@ -120,16 +160,17 @@ def test_dockerignore_excludes_local_configs_and_agent_scratch():
         assert pattern in dockerignore
 
 
-def test_dockerfile_verifies_transifex_cli_tarball_checksum():
+def test_dockerfile_rebuilds_transifex_cli_instead_of_using_vendor_binary():
+    """The image builds a pinned, auditable Transifex CLI from source."""
     dockerfile = (REPO_ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert "TX_SHA256" in dockerfile
-    assert "002dec5b9e71248a7e6a0808118e9da940205828d5a33ce88e04bb57a967164d" in dockerfile
-    assert "c380ed9aece5d34316aa0fe2e5afa0633553656f98909f88cb72609e2fa13153" in dockerfile
-    assert 'echo "$TX_SHA256  tx-${TX_ARCH}.tar.gz" | sha256sum -c -' in dockerfile
+    assert "TX_SHA256" not in dockerfile
+    assert "github.com/transifex/cli.git" in dockerfile
+    assert "go version -m /out/tx" in dockerfile
 
 
-def test_run_local_translation_resolves_config_before_chdir():
+def test_run_local_translation_delegates_config_validation_to_python():
+    """The wrapper uses the typed loader instead of reparsing YAML in shell."""
     script = (REPO_ROOT / "run-local-translation.sh").read_text(encoding="utf-8")
 
     assert 'CALLER_CWD=$(pwd)' in script
@@ -137,6 +178,8 @@ def test_run_local_translation_resolves_config_before_chdir():
     assert 'CONFIG_FILE_PATH=$(resolve_to_absolute "$1")' in script
     assert 'CONFIG_FILE_PATH=$(resolve_to_absolute "$TRANSLATOR_CONFIG_FILE")' in script
     assert 'if [ -n "${1:-}" ]; then' in script
+    assert '"$VENV_PYTHON" -m localize.cli check --config "$CONFIG_FILE_PATH"' in script
+    assert "yaml_get()" not in script
     assert "TRANSLATOR_CONFIG_FILE" in script
     assert "./setup.sh" not in script
 

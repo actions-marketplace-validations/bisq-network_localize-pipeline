@@ -25,6 +25,13 @@ localization_format: "java_properties"
 localization_layout:
   id: "suffix"
   source_locale: "en"
+  # Optional when both source and targets carry locale suffixes, for example
+  # Messages_en.properties and Messages_de.properties.
+  # base_name: "Messages"
+
+# Placeholder detection is conservative by default. Opt into java-indexed only
+# when the application uses %0, %1, ... as runtime substitution tokens.
+placeholder_profile: "standard"
 
 # Mixed projects can replace the singular settings above with a profile list.
 # Every runtime sidecar uses the same profile list: parsing, validation, semantic
@@ -50,14 +57,16 @@ translation_source: "git"
 # --- Model / provider ---
 model_provider: "aisuite"           # Default AISuite-backed provider abstraction.
 model_name: "gpt-4o-mini"          # fast initial translation
-review_model_name: "gpt-4o"        # holistic review pass (set equal to model_name to save cost)
+review_model_name: "gpt-5.6-terra" # balanced holistic review pass
+review_reasoning_effort: "none"    # deterministic, low-latency review behavior
 
 # Optional semantic sidecar. If auto_apply_error_suggestions is true, only
 # error-level findings with concrete suggested_value are applied, and only after
 # deterministic placeholder/control-character checks pass.
 # semantic_review:
 #   enabled: true
-#   model: "gpt-4o"
+#   model: "gpt-5.4-mini"
+#   reasoning_effort: "none"        # reasoning-capable semantic models only
 #   auto_apply_error_suggestions: false
 
 # (Optional) OpenAI-compatible endpoint. Point this at a local Ollama server to
@@ -84,6 +93,10 @@ review_model_name: "gpt-4o"        # holistic review pass (set equal to model_na
 # --- Glossary (optional but recommended) ---
 # JSON file of per-language term mappings. See glossary.example.json for the format.
 glossary_file_path: "glossary.example.json"
+# "exact" (default) deterministically requires the configured target text.
+# Use "prompt-only" when mappings are grammatical lemmas whose surface form
+# must be inflected in the target language (for example Russian nouns).
+translation_glossary_enforcement: "exact"
 
 # Brand/technical terms that must never be translated.
 brand_technical_glossary:
@@ -95,7 +108,7 @@ brand_technical_glossary:
 # and "/nav/settings"; Java properties use the dotted property key. Matching
 # keys are never sent to the model and are copied from the source locale.
 # ignore_key_patterns:
-#   - "^/#\\d+$"  # RoboSats-style JSON pseudo-comments: "#1", "#2", ...
+#   - "^/#\\d+$"  # JSON pseudo-comment keys: "#1", "#2", ...
 
 # If true, the script logs actions without calling the API or writing files.
 dry_run: false

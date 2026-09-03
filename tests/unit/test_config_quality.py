@@ -1,6 +1,8 @@
 """Regression tests for production translation prompt guidance."""
 from pathlib import Path
 import re
+import tomllib
+import unicodedata
 
 import pytest
 import yaml
@@ -41,6 +43,20 @@ def test_aisuite_is_packaged_as_primary_provider():
     assert in_match is not None
     assert txt_match is not None
     assert txt_match.group(1) == in_match.group(1)
+
+
+def test_unused_gitpython_dependency_is_absent():
+    requirements_in = (PROJECT_ROOT / "requirements.in").read_text(encoding="utf-8")
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dependency_texts = [
+        requirements_in,
+        (PROJECT_ROOT / "requirements-dev.in").read_text(encoding="utf-8"),
+        "\n".join(pyproject["project"]["dependencies"]),
+        (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8"),
+        (PROJECT_ROOT / "requirements-dev.txt").read_text(encoding="utf-8"),
+    ]
+
+    assert all("gitpython" not in text.lower() for text in dependency_texts)
 
 
 def test_runtime_requirements_are_hash_pinned():
@@ -231,6 +247,9 @@ def test_bisq_mobile_profile_packages_sanitized_production_shape():
     assert "Bisq mobile" in config["project_context"]
     assert config["semantic_review"]["enabled"] is True
     assert config["semantic_review"]["auto_apply_error_suggestions"] is True
+    assert config["semantic_review"]["reasoning_effort"] == "none"
+    assert config["review_model_name"] == "gpt-5.6-terra"
+    assert config["review_reasoning_effort"] == "none"
     assert config["quality_gate"]["semantic_qa_audit_scope"] == "changed"
     assert isinstance(glossary, dict) and {"de", "es", "fr"}.issubset(glossary)
 
@@ -332,6 +351,9 @@ def test_recent_coderabbit_translation_nits_are_encoded_as_style_rules(config_pa
     )
     assert semantic_review.get("enabled") is True
     assert semantic_review.get("model") == "gpt-5.4-mini"
+    assert semantic_review.get("reasoning_effort") == "none"
+    assert config["review_model_name"] == "gpt-5.6-terra"
+    assert config["review_reasoning_effort"] == "none"
     assert "version" in retained_allowlist["da"]
     assert "version" in retained_allowlist["de"]
     assert {"information", "message", "messages", "version"}.issubset(retained_allowlist["fr"])
@@ -434,6 +456,18 @@ def test_preimage_is_a_protected_brand_technical_term():
     assert {"Lightning", "Lightning Escrow", "Submarine Swaps"}.issubset(set(brand_glossary))
 
 
+def test_telebirr_is_a_protected_brand_term():
+    """Keep the Telebirr payment-method name in its official spelling.
+
+    bisq2#4904 transliterated Telebirr in thirteen locales even though the
+    source value is a brand name. The protected glossary must make exact
+    source-identical values intentional and keep the model from rewriting it.
+    """
+    config = yaml.safe_load(BISQ_PROFILE_CONFIG.read_text(encoding="utf-8"))
+
+    assert "Telebirr" in config["brand_technical_glossary"]
+
+
 _NETWORK_RULE_IDS = {
     "network-seed-node-not-seed-phrase",
     "network-transport-not-physical-transport",
@@ -458,13 +492,19 @@ def test_network_terminology_rules_from_1606_are_encoded(config_path):
     assert _NETWORK_RULE_IDS.issubset(rules_by_id)
     for rule_id in _NETWORK_RULE_IDS:
         rule = rules_by_id[rule_id]
-        assert rule["source"] == "bisq-mobile#1606 CodeRabbit"
         assert rule["severity"] == "error"
         assert set(rule["locales"]) <= supported
 
     seed_rule = rules_by_id["network-seed-node-not-seed-phrase"]
     assert seed_rule["keys"] == ["mobile.networkInfo.connections.seed"]
+    # French was added after the #1669 regression (glossary term
+    # "seed phrase" -> "Mots de Récupération" leaked into the seed-node label);
+    # keep provenance and locale coverage in lock-step so fr cannot be dropped.
+    assert "#1669" in seed_rule["source"]
+    assert "fr" in seed_rule["locales"]
     transport_rule = rules_by_id["network-transport-not-physical-transport"]
+    assert seed_rule["source"] == "bisq-mobile#1606, #1669 CodeRabbit"
+    assert transport_rule["source"] == "bisq-mobile#1606 CodeRabbit"
     assert set(transport_rule["keys"]) == {
         "mobile.networkInfo.myNode.transport",
         "mobile.networkInfo.overview.transport",
@@ -504,6 +544,8 @@ def test_network_terminology_rules_flag_the_real_1606_mistranslations():
         _seed("id", "Kata Seed"),
         _seed("it", "Parole Seed"),
         _seed("vi", "Từ khóa seed"),
+        # bisq-mobile#1669: French leaked the "seed phrase" glossary term.
+        _seed("fr", "Mots de Récupération"),
         _transport("af_ZA", "Vervoer"),
         _transport("cs", "Doprava"),
         _transport("vi", "Vận chuyển"),
@@ -524,8 +566,76 @@ def test_network_terminology_rules_flag_the_real_1606_mistranslations():
         _seed("vi", "Nút seed"),
         _seed("de", "Seed"),
         _seed("pcm", "Seed node"),
+        _seed("fr", "Nœud seed"),
         _transport("af_ZA", "Transport"),
         _transport("cs", "Přenos"),
         _transport("de", "Transport"),
     ]
     assert evaluate_semantic_rules(changes=clean, rules=rules) == []
+
+
+_CONTAMINATION_RULE_ID = "no-vietnamese-horn-vowels-outside-vi"
+
+
+@pytest.mark.parametrize("config_path", [BISQ_PROFILE_CONFIG, BISQ_MOBILE_PROFILE_CONFIG])
+def test_cross_language_contamination_guard_is_encoded(config_path):
+    """bisq2#4884 CodeRabbit flagged a cross-language contamination token.
+
+    The merged Yoruba `bisqEasy.takeOffer.noMediatorAvailable.warning`
+    contained `dữdata`, fusing the Vietnamese word `dữ` (from vi's
+    "dữ liệu mạng" = network data) with English "data". Vietnamese horn
+    vowels never appear in any other Bisq target locale, so a locale-wide
+    guard (every locale except vi) catches this class of vi-fragment bleed.
+    The guard is mirrored into every profile like the other shared nits.
+    """
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    rules_by_id = {rule["id"]: rule for rule in config.get("semantic_quality_rules", [])}
+
+    assert _CONTAMINATION_RULE_ID in rules_by_id
+    rule = rules_by_id[_CONTAMINATION_RULE_ID]
+    assert rule["source"] == "bisq2#4884 CodeRabbit"
+    assert rule["severity"] == "error"
+    assert rule["locales"] == ["*"]
+    assert rule["excluded_locales"] == ["vi"]
+    assert rule["keys"] == ["*"]
+
+
+@pytest.mark.parametrize("config_path", [BISQ_PROFILE_CONFIG, BISQ_MOBILE_PROFILE_CONFIG])
+def test_contamination_guard_flags_the_real_4884_token(config_path):
+    """The guard must catch the merged Yoruba `dữdata` token but not clean vi."""
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    rules = load_semantic_rules(config["semantic_quality_rules"])
+
+    def _warning(locale, value):
+        return TranslationChange(
+            file=f"bisq_easy_{locale}.properties",
+            locale_code=locale,
+            key="bisqEasy.takeOffer.noMediatorAvailable.warning",
+            source_value="No mediator is currently available.",
+            old_value=None,
+            new_value=value,
+        )
+
+    # The merged contamination must be flagged in the affected (non-vi) locale.
+    contaminated = _warning(
+        "yo",
+        "O lè tún bẹ̀rẹ̀ ohun èlò náà láti tún gba dữdata nẹ́tíwọ̀kì.",
+    )
+    findings = evaluate_semantic_rules(changes=[contaminated], rules=rules)
+    assert any(f.rule_id == _CONTAMINATION_RULE_ID for f in findings)
+
+    decomposed = _warning("yo", unicodedata.normalize("NFD", contaminated.new_value))
+    findings = evaluate_semantic_rules(changes=[decomposed], rules=rules)
+    assert any(f.rule_id == _CONTAMINATION_RULE_ID for f in findings)
+
+    # Legitimate Vietnamese (horn vowels expected) and a cleaned Yoruba value
+    # (no horn vowels) must both pass the guard.
+    clean = [
+        _warning("vi", "Bạn có thể thử khởi động lại ứng dụng để tải lại dữ liệu mạng."),
+        _warning("yo", "O lè tún bẹ̀rẹ̀ ohun èlò náà láti tún gba data nẹ́tíwọ̀kì."),
+    ]
+    clean_findings = [
+        f for f in evaluate_semantic_rules(changes=clean, rules=rules)
+        if f.rule_id == _CONTAMINATION_RULE_ID
+    ]
+    assert clean_findings == []

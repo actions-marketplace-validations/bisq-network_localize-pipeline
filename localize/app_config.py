@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from localize.ignore_keys import compile_ignore_key_patterns
 from localize.logging_config import setup_logger
+from localize.placeholder_rules import DEFAULT_PLACEHOLDER_PROFILE, validate_placeholder_profile
 from localize.localization_formats import (
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,
@@ -26,11 +27,16 @@ from localize.model_provider import (
     ChatModelProvider,
     DEFAULT_MODEL_PROVIDER,
     ModelProviderConfigurationError,
+    REASONING_EFFORT_VALUES,
     create_model_provider,
+    normalize_reasoning_effort,
     normalize_model_provider_name,
     requires_openai_credentials,
 )
 from localize.semantic_quality import normalize_retained_source_word_allowlist
+
+
+TRANSLATION_GLOSSARY_ENFORCEMENT_VALUES = frozenset({"exact", "prompt-only"})
 
 
 @dataclass
@@ -105,6 +111,15 @@ class AppConfig:
     localization_profiles: Tuple[LocalizationProfile, ...] = field(default_factory=lambda: (
         LocalizationProfile(JAVA_PROPERTIES_FORMAT, SUFFIX_LAYOUT),
     ))
+    review_reasoning_effort: Optional[str] = None
+
+    # Placeholder-detection profile ("standard" or "java-indexed"). Runtime
+    # entry points activate it after loading so this loader remains state-free.
+    placeholder_profile: str = DEFAULT_PLACEHOLDER_PROFILE
+
+    # "exact" deterministically requires the configured target text;
+    # "prompt-only" treats values as terminology lemmas that models may inflect.
+    translation_glossary_enforcement: str = "exact"
 
 
 @dataclass(frozen=True)
@@ -121,8 +136,6 @@ _PLACEHOLDER_PATHS = frozenset({
     "/path/to/your/git/repo",
     "/path/to/properties/files",
 })
-
-
 def validate_config(
     config: Dict[str, Any],
     *,
@@ -196,6 +209,32 @@ def validate_config(
     except ValueError as exc:
         issues.append(ConfigIssue("error", str(exc)))
 
+    placeholder_profile = str(
+        config.get("placeholder_profile") or DEFAULT_PLACEHOLDER_PROFILE
+    ).strip()
+    try:
+        validate_placeholder_profile(placeholder_profile)
+    except ValueError as exc:
+        issues.append(ConfigIssue("error", str(exc)))
+
+    translation_glossary_enforcement = str(
+        config.get("translation_glossary_enforcement") or "exact"
+    ).strip().lower()
+    if translation_glossary_enforcement not in TRANSLATION_GLOSSARY_ENFORCEMENT_VALUES:
+        issues.append(ConfigIssue(
+            "error",
+            "translation_glossary_enforcement must be one of: "
+            + ", ".join(sorted(TRANSLATION_GLOSSARY_ENFORCEMENT_VALUES))
+            + ".",
+        ))
+
+    translation_source = str(config.get("translation_source") or "transifex").strip().lower()
+    if translation_source not in {"git", "transifex"}:
+        issues.append(ConfigIssue(
+            "error",
+            "translation_source must be either 'git' or 'transifex'.",
+        ))
+
     # style_rules referencing locales that are not declared is almost always a typo.
     style_rules = config.get("style_rules") or {}
     if isinstance(style_rules, dict) and locale_codes:
@@ -219,6 +258,14 @@ def validate_config(
     dry_run = dry_run_override if dry_run_override is not None else _as_bool(config.get("dry_run", False), False)
     model_name = str(config.get("model_name") or "gpt-4")
     review_model_name = str(config.get("review_model_name") or model_name)
+    review_reasoning_effort = str(config.get("review_reasoning_effort") or "").strip()
+    if review_reasoning_effort and review_reasoning_effort not in REASONING_EFFORT_VALUES:
+        issues.append(ConfigIssue(
+            "error",
+            "review_reasoning_effort must be one of: "
+            + ", ".join(sorted(REASONING_EFFORT_VALUES))
+            + ".",
+        ))
     model_provider_name = normalize_model_provider_name(
         str(config.get("model_provider", DEFAULT_MODEL_PROVIDER) or DEFAULT_MODEL_PROVIDER)
     )
@@ -598,11 +645,12 @@ def load_app_config() -> AppConfig:
     ):
         os.environ['TRANSLATION_FILTER_GLOB'] = config_filter_glob
     review_model_env = _non_empty_env('REVIEW_MODEL_NAME')
-    validation_config = (
-        {**config, 'review_model_name': review_model_env}
-        if review_model_env
-        else config
-    )
+    review_reasoning_effort_env = _non_empty_env('REVIEW_REASONING_EFFORT')
+    validation_config = dict(config)
+    if review_model_env:
+        validation_config['review_model_name'] = review_model_env
+    if review_reasoning_effort_env:
+        validation_config['review_reasoning_effort'] = review_reasoning_effort_env
 
     # Validate the configuration and surface actionable problems (non-fatal).
     _log_config_issues(
@@ -634,6 +682,11 @@ def load_app_config() -> AppConfig:
     )
     model_name = str(config.get('model_name') or 'gpt-4')
     review_model_name = review_model_env or str(config.get('review_model_name') or model_name)
+    review_reasoning_effort = normalize_reasoning_effort(
+        review_reasoning_effort_env
+        if review_reasoning_effort_env is not None
+        else config.get('review_reasoning_effort')
+    )
     model_provider_name = normalize_model_provider_name(
         str(config.get('model_provider', DEFAULT_MODEL_PROVIDER) or DEFAULT_MODEL_PROVIDER)
     )
@@ -647,6 +700,23 @@ def load_app_config() -> AppConfig:
         default=False,
     )
     ignore_key_patterns = compile_ignore_key_patterns(config.get('ignore_key_patterns') or [])
+    placeholder_profile = str(
+        config.get('placeholder_profile') or DEFAULT_PLACEHOLDER_PROFILE
+    ).strip()
+    try:
+        validate_placeholder_profile(placeholder_profile)
+    except ValueError as exc:
+        logger.critical("CRITICAL: %s", exc)
+        sys.exit(1)
+    translation_glossary_enforcement = str(
+        config.get('translation_glossary_enforcement') or 'exact'
+    ).strip().lower()
+    if translation_glossary_enforcement not in TRANSLATION_GLOSSARY_ENFORCEMENT_VALUES:
+        logger.critical(
+            "CRITICAL: translation_glossary_enforcement must be one of: %s.",
+            ", ".join(sorted(TRANSLATION_GLOSSARY_ENFORCEMENT_VALUES)),
+        )
+        sys.exit(1)
     quality_gate_config = config.get('quality_gate', {}) or {}
     quality_gate = QualityGateConfig(
         source_identical_min_block_count=_as_positive_int(
@@ -804,4 +874,7 @@ def load_app_config() -> AppConfig:
         localization_format=localization_format,
         localization_layout=localization_layout,
         localization_profiles=localization_profiles,
+        review_reasoning_effort=review_reasoning_effort,
+        placeholder_profile=placeholder_profile,
+        translation_glossary_enforcement=translation_glossary_enforcement,
     )

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
 from localize.localization_adapters import get_localization_adapter
 from localize.localization_profiles import LocalizationProfile
+from localize.placeholder_rules import strip_placeholder_tokens
 from localize.translation_validator import (
     check_placeholder_parity,
     find_disallowed_control_characters,
@@ -103,11 +106,21 @@ def _matching_profile(
 
 
 def _skip(result: SemanticRemediationResult, finding: Mapping[str, Any], reason: str) -> None:
+    """Record one rejected remediation candidate with its concrete reason."""
     result.skipped.append({
         "file": str(finding.get("file", "")),
         "key": str(finding.get("key", "")),
         "reason": reason,
     })
+
+
+def _numeric_literals(value: str) -> set[str]:
+    """Return normalized decimal literals outside active-profile placeholders."""
+    without_placeholders = strip_placeholder_tokens(value)
+    return {
+        "".join(str(unicodedata.decimal(character)) for character in match.group())
+        for match in re.finditer(r"\d+", without_placeholders)
+    }
 
 
 def apply_semantic_review_suggestions(
@@ -123,7 +136,8 @@ def apply_semantic_review_suggestions(
 
     Suggestions are intentionally conservative: the finding must name a changed
     target file/key, provide ``suggested_value``, map to a configured format
-    profile, and preserve source placeholder parity.
+    profile, preserve source placeholder parity, and avoid introducing numeric
+    requirements that are absent from the authoritative source.
     """
     result = SemanticRemediationResult()
     input_path = _input_folder_path(repo_root, input_folder)
@@ -198,6 +212,9 @@ def apply_semantic_review_suggestions(
         source_value = source_translations.get(key)
         if source_value is None:
             _skip(result, finding, "source key not found")
+            continue
+        if not _numeric_literals(suggested_value).issubset(_numeric_literals(source_value)):
+            _skip(result, finding, "suggestion introduces numeric literals absent from source")
             continue
 
         escaped_value = adapter.escape_translation(source_value, suggested_value)

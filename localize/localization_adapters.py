@@ -14,6 +14,7 @@ from localize.localization_formats import (
     unregister_localization_format,
 )
 from localize.properties_parser import (
+    _escape_key,
     _has_unescaped_trailing_backslash,
     _split_property_line,
     _unescape_key,
@@ -89,7 +90,7 @@ def lint_properties_file(file_path: str) -> List[str]:
                     raw_key, _separator_group, value = split_line
                     key = _unescape_key(raw_key)
 
-                    if '..' in key:
+                    if re.search(r'(?<!\.)\.\.(?!\.)', key):
                         errors.append(f"Linter Error: Malformed key '{key}' with double dots found on line {i}.")
 
                     value_to_check = value.rstrip('\r\n')
@@ -100,7 +101,10 @@ def lint_properties_file(file_path: str) -> List[str]:
                     else:
                         in_continuation = False
 
-                    if re.search(r'\\(?!u[0-9a-fA-F]{4}|[tnfr\\=:#\s!"])', value_to_check):
+                    if re.search(
+                        r'(?<!\\)(?:\\\\)*\\(?!u[0-9a-fA-F]{4}|[tnfr\\=:#\s!"])',
+                        value_to_check,
+                    ):
                         errors.append(
                             f"Linter Warning: Unknown escape sequence in value for key '{key}' on line {i}."
                         )
@@ -148,7 +152,7 @@ def _escape_messageformat_if_needed(src_text: str, value: str) -> str:
 
 
 def _build_properties_review_content(translations: Translations, keys: Sequence[str]) -> str:
-    return "\n".join([f"{key}={translations.get(key, '')}" for key in keys])
+    return "\n".join([f"{_escape_key(key)}={translations.get(key, '')}" for key in keys])
 
 
 def _json_pointer_escape(segment: str) -> str:

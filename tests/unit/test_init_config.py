@@ -246,6 +246,7 @@ class TestCodeToName:
 
 class TestBuildConfig:
     def test_defaults_to_git_source(self):
+        """Generated configs use the production-proven two-pass model defaults."""
         cfg = build_config(
             target_project_root="/repo", input_folder="i18n",
             locales=[{"code": "de", "name": "German"}],
@@ -254,7 +255,9 @@ class TestBuildConfig:
         assert cfg["target_project_root"] == "/repo"
         assert cfg["input_folder"] == "i18n"
         assert cfg["supported_locales"] == [{"code": "de", "name": "German"}]
-        assert "model_name" in cfg and "review_model_name" in cfg
+        assert cfg["model_name"] == "gpt-4o-mini"
+        assert cfg["review_model_name"] == "gpt-5.6-terra"
+        assert cfg["review_reasoning_effort"] == "none"
         assert cfg["dry_run"] is True
         assert cfg["localization_format"] == "java_properties"
         assert cfg["localization_layout"] == {"id": "suffix", "source_locale": "en"}
@@ -278,6 +281,24 @@ class TestBuildConfig:
         )
 
         assert cfg["localization_layout"] == {"id": "locale_directory", "source_locale": "en"}
+
+    def test_preserves_suffix_base_name(self):
+        cfg = build_config(
+            target_project_root="/repo",
+            input_folder="i18n",
+            locales=[{"code": "de", "name": "German"}],
+            localization_layout={
+                "id": "suffix",
+                "source_locale": "en",
+                "base_name": "Messages",
+            },
+        )
+
+        assert cfg["localization_layout"] == {
+            "id": "suffix",
+            "source_locale": "en",
+            "base_name": "Messages",
+        }
 
     def test_optional_base_url_included_when_provided(self):
         cfg = build_config(

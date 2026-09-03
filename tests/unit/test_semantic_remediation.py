@@ -1,6 +1,7 @@
 import json
 
 from localize.localization_profiles import load_localization_profiles
+from localize.placeholder_rules import placeholder_profile
 from localize.semantic_remediation import apply_semantic_review_suggestions
 
 
@@ -58,6 +59,114 @@ def test_semantic_remediation_skips_suggestions_that_break_placeholders(tmp_path
     assert result.applied_count == 0
     assert result.skipped_count == 1
     assert "hello=Hallo\n" in target_path.read_text(encoding="utf-8")
+
+
+def test_semantic_remediation_rejects_source_absent_numeric_constraints(tmp_path):
+    """Suggested requirements may not introduce numbers absent from source."""
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    (resources / "messages.properties").write_text(
+        "validation.invalidAmount=Invalid amount\n",
+        encoding="utf-8",
+    )
+    target_path = resources / "messages_de.properties"
+    target_path.write_text(
+        "validation.invalidAmount=Ungültiger Betrag\n",
+        encoding="utf-8",
+    )
+
+    result = apply_semantic_review_suggestions(
+        repo_root=str(tmp_path),
+        input_folder=str(resources),
+        findings=[
+            {
+                "file": "messages_de.properties",
+                "key": "validation.invalidAmount",
+                "severity": "error",
+                "suggested_value": "Gib einen Betrag mit höchstens 8 Dezimalstellen ein",
+            }
+        ],
+        locale_codes=["de"],
+        localization_profiles=load_localization_profiles({"localization_format": "java_properties"}),
+        changed_identities={("messages_de.properties", "validation.invalidAmount")},
+    )
+
+    assert result.applied_count == 0
+    assert result.skipped[0]["reason"] == "suggestion introduces numeric literals absent from source"
+    assert target_path.read_text(encoding="utf-8") == (
+        "validation.invalidAmount=Ungültiger Betrag\n"
+    )
+
+
+def test_semantic_remediation_excludes_java_indexed_placeholders_from_numbers(tmp_path):
+    """Java placeholder indices must not authorize new literal numbers."""
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    (resources / "messages.properties").write_text(
+        "path=Write to %0\n",
+        encoding="utf-8",
+    )
+    target_path = resources / "messages_ru.properties"
+    target_path.write_text("path=Записать в %0\n", encoding="utf-8")
+
+    with placeholder_profile("java-indexed"):
+        result = apply_semantic_review_suggestions(
+            repo_root=str(tmp_path),
+            input_folder=str(resources),
+            findings=[
+                {
+                    "file": "messages_ru.properties",
+                    "key": "path",
+                    "severity": "error",
+                    "suggested_value": "Записать в %0, код 0",
+                }
+            ],
+            locale_codes=["ru"],
+            localization_profiles=load_localization_profiles(
+                {"localization_format": "java_properties"}
+            ),
+            changed_identities={("messages_ru.properties", "path")},
+        )
+
+    assert result.applied_count == 0
+    assert result.skipped[0]["reason"] == (
+        "suggestion introduces numeric literals absent from source"
+    )
+    assert target_path.read_text(encoding="utf-8") == "path=Записать в %0\n"
+
+
+def test_semantic_remediation_allows_localized_source_numeric_literals(tmp_path):
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    (resources / "messages.properties").write_text(
+        "validation.invalidAmount=Use at most 8 decimal places\n",
+        encoding="utf-8",
+    )
+    target_path = resources / "messages_ar.properties"
+    target_path.write_text(
+        "validation.invalidAmount=قيمة غير صالحة\n",
+        encoding="utf-8",
+    )
+
+    result = apply_semantic_review_suggestions(
+        repo_root=str(tmp_path),
+        input_folder=str(resources),
+        findings=[
+            {
+                "file": "messages_ar.properties",
+                "key": "validation.invalidAmount",
+                "severity": "error",
+                "suggested_value": "استخدم ٨ منازل عشرية كحد أقصى",
+            }
+        ],
+        locale_codes=["ar"],
+        localization_profiles=load_localization_profiles({"localization_format": "java_properties"}),
+        changed_identities={("messages_ar.properties", "validation.invalidAmount")},
+    )
+
+    assert result.applied_count == 1
+    assert result.skipped_count == 0
+    assert "استخدم ٨ منازل عشرية كحد أقصى" in target_path.read_text(encoding="utf-8")
 
 
 def test_semantic_remediation_skips_suggestions_with_line_breaks(tmp_path):

@@ -277,6 +277,93 @@ class TestCoreLogic(unittest.TestCase):
             self.assertIn("key1", context_text)
             self.assertNotIn("key2", context_text)
 
+    def test_build_context_marks_prompt_only_terms_as_inflectable(self):
+        _, glossary_text = build_context(
+            {},
+            {},
+            {"entry": "запись"},
+            4000,
+            "gpt-4o-mini",
+            translation_glossary_enforcement="prompt-only",
+        )
+
+        self.assertIn("preferred base term", glossary_text)
+        self.assertIn("inflect or adapt", glossary_text)
+        self.assertNotIn("should be translated as", glossary_text)
+
+    def test_build_context_prioritizes_sibling_keys(self):
+        """
+        Tests that build_context surfaces sibling keys (sharing a dotted prefix
+        with the key being translated) even when the token budget only fits one
+        example, and never feeds the key its own prior translation back.
+        """
+        def mock_count_tokens(text: str, model_name: str) -> int:
+            return len(text)
+
+        with patch('localize.translate_localization_files.count_tokens', side_effect=mock_count_tokens):
+            # The sibling terminology key is deliberately last in insertion order.
+            existing_translations = {
+                "app.unrelated.first": "translationA",
+                "app.unrelated.second": "translationB",
+                "trusted.pairingCode.unsupportedVersion": "old value",
+                "trusted.pairingCode.textField": "Kode pasangan",
+            }
+            source_translations = {
+                "app.unrelated.first": "sourceA",
+                "app.unrelated.second": "sourceB",
+                "trusted.pairingCode.unsupportedVersion": "Old value source",
+                "trusted.pairingCode.textField": "Pairing code",
+            }
+            language_glossary = {}
+            model_name = "test-model"
+            sibling_example = 'trusted.pairingCode.textField = "Kode pasangan"'
+            reserved_len = 1000
+            # Budget for exactly one example beyond the reserved block.
+            max_tokens = reserved_len + mock_count_tokens(sibling_example, model_name) + 1
+
+            context_text, _ = build_context(
+                existing_translations,
+                source_translations,
+                language_glossary,
+                max_tokens,
+                model_name,
+                current_key="trusted.pairingCode.unsupportedVersion",
+            )
+
+            self.assertEqual(context_text.count("="), 1)
+            self.assertIn("trusted.pairingCode.textField", context_text)
+            self.assertNotIn("app.unrelated.first", context_text)
+            # The key being translated is never fed back as its own context.
+            self.assertNotIn("trusted.pairingCode.unsupportedVersion", context_text)
+
+    def test_build_context_skips_oversized_sibling_and_keeps_searching(self):
+        """An oversized high-priority sibling must not hide later siblings."""
+        def mock_count_tokens(text: str, model_name: str) -> int:
+            return len(text)
+
+        with patch('localize.translate_localization_files.count_tokens', side_effect=mock_count_tokens):
+            existing_translations = {
+                "trusted.pairingCode.longExplanation": "x" * 200,
+                "trusted.pairingCode.textField": "Kode pasangan",
+            }
+            source_translations = {
+                "trusted.pairingCode.longExplanation": "Long explanation",
+                "trusted.pairingCode.textField": "Pairing code",
+            }
+            short_example = 'trusted.pairingCode.textField = "Kode pasangan"'
+            max_tokens = 1000 + mock_count_tokens(short_example, "test-model") + 1
+
+            context_text, _ = build_context(
+                existing_translations,
+                source_translations,
+                {},
+                max_tokens,
+                "test-model",
+                current_key="trusted.pairingCode.unsupportedVersion",
+            )
+
+            self.assertEqual(context_text, short_example)
+
     def test_normalize_value_logic(self):
         """Tests the `normalize_value` helper function."""
         self.assertEqual(normalize_value("hello\nworld"), "hello<newline>world")
@@ -397,15 +484,15 @@ class TestRetryHandling(unittest.IsolatedAsyncioTestCase):
     def test_extract_texts_to_translate_skips_ignored_keys(self):
         """Ignored keys should never be selected for model translation."""
         parsed_lines = [
-            {'type': 'entry', 'key': '/#1', 'value': 'Phrases in basic/Main.tsx', 'line_number': 0},
+            {'type': 'entry', 'key': '/#1', 'value': 'Phrases in app/Main.tsx', 'line_number': 0},
             {'type': 'entry', 'key': '/welcome', 'value': 'Welcome', 'line_number': 1},
         ]
         target_translations = {
-            '/#1': 'Phrases in basic/Main.tsx',
+            '/#1': 'Phrases in app/Main.tsx',
             '/welcome': 'Welcome',
         }
         source_translations = {
-            '/#1': 'Phrases in basic/Main.tsx',
+            '/#1': 'Phrases in app/Main.tsx',
             '/welcome': 'Welcome',
         }
 
@@ -424,15 +511,15 @@ class TestRetryHandling(unittest.IsolatedAsyncioTestCase):
     def test_extract_texts_to_translate_is_unchanged_without_ignore_patterns(self):
         """Unset ignore_key_patterns should preserve existing selection behavior."""
         parsed_lines = [
-            {'type': 'entry', 'key': '/#1', 'value': 'Phrases in basic/Main.tsx', 'line_number': 0},
+            {'type': 'entry', 'key': '/#1', 'value': 'Phrases in app/Main.tsx', 'line_number': 0},
             {'type': 'entry', 'key': '/welcome', 'value': 'Welcome', 'line_number': 1},
         ]
         target_translations = {
-            '/#1': 'Phrases in basic/Main.tsx',
+            '/#1': 'Phrases in app/Main.tsx',
             '/welcome': 'Welcome',
         }
         source_translations = {
-            '/#1': 'Phrases in basic/Main.tsx',
+            '/#1': 'Phrases in app/Main.tsx',
             '/welcome': 'Welcome',
         }
 
@@ -457,7 +544,7 @@ class TestRetryHandling(unittest.IsolatedAsyncioTestCase):
         """Empty ignore_key_patterns should be byte-for-byte inert."""
         content = textwrap.dedent("""\
             # Existing target file
-            comment.1=Phrases in basic/Main.tsx
+            comment.1=Phrases in app/Main.tsx
             welcome=Willkommen
         """)
         with tempfile.NamedTemporaryFile('w', delete=False, encoding='utf-8') as temp_file:
@@ -472,7 +559,7 @@ class TestRetryHandling(unittest.IsolatedAsyncioTestCase):
                 parsed_lines,
                 target_translations,
                 {
-                    'comment.1': 'Phrases in basic/Main.tsx',
+                    'comment.1': 'Phrases in app/Main.tsx',
                     'welcome': 'Welcome',
                 },
                 [],
@@ -486,12 +573,12 @@ class TestRetryHandling(unittest.IsolatedAsyncioTestCase):
     def test_per_key_validation_excludes_ignored_keys_from_failures(self):
         valid_translations, summary = run_per_key_validation_with_summary(
             {
-                '/#1': 'Phrases in basic/Main.tsx',
+                '/#1': 'Phrases in app/Main.tsx',
                 '/welcome': 'Willkommen',
                 '/broken': 'Hallo',
             },
             {
-                '/#1': 'Phrases in basic/Main.tsx {{name}}',
+                '/#1': 'Phrases in app/Main.tsx {{name}}',
                 '/welcome': 'Welcome',
                 '/broken': 'Hello {{name}}',
             },
@@ -499,7 +586,7 @@ class TestRetryHandling(unittest.IsolatedAsyncioTestCase):
             ignore_key_patterns=compile_ignore_key_patterns([r'^/#\d+$']),
         )
 
-        self.assertEqual(valid_translations['/#1'], 'Phrases in basic/Main.tsx {{name}}')
+        self.assertEqual(valid_translations['/#1'], 'Phrases in app/Main.tsx {{name}}')
         self.assertEqual(valid_translations['/welcome'], 'Willkommen')
         self.assertEqual(valid_translations['/broken'], 'Hello {{name}}')
         self.assertEqual(summary['failed_keys'], ['/broken'])
@@ -523,6 +610,27 @@ class TestRetryHandling(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(texts, ['Source Existing'])
         self.assertEqual(indices, [0])
         self.assertEqual(keys, ['key_existing'])
+
+    def test_extract_texts_to_translate_includes_nonempty_source_with_empty_target(self):
+        parsed_lines = [
+            {'type': 'entry', 'key': 'needs.translation', 'value': '', 'line_number': 0},
+            {'type': 'entry', 'key': 'intentionally.empty', 'value': '', 'line_number': 1},
+        ]
+        target_translations = {'needs.translation': '', 'intentionally.empty': ''}
+        source_translations = {
+            'needs.translation': 'Copy citation key',
+            'intentionally.empty': '',
+        }
+
+        texts, indices, keys = extract_texts_to_translate(
+            parsed_lines,
+            source_translations,
+            target_translations,
+        )
+
+        self.assertEqual(texts, ['Copy citation key'])
+        self.assertEqual(indices, [0])
+        self.assertEqual(keys, ['needs.translation'])
 
     def test_extract_texts_to_translate_includes_existing_key_when_source_hash_changed(self):
         """Existing keys should be translated when source text changed since last run."""
@@ -922,6 +1030,34 @@ class TestValidationLogic(unittest.TestCase):
             self.assertEqual(len(errors), 1)
             self.assertIn("Unknown escape sequence in value for key 'key.three'", errors[0])
             self.assertTrue(errors[0].startswith("Linter Warning:"))
+        finally:
+            os.remove(temp_file_path)
+
+    def test_linting_treats_even_backslash_runs_as_literal_backslashes(self):
+        """A valid ``\\\\`` pair must not expose its second slash as an escape."""
+        from localize.translate_localization_files import lint_properties_file
+
+        content = (
+            r"regex=Use \\(deep|machine\\) learning" "\n"
+            r"literal=Unknown-looking \\z remains literal" "\n"
+            r"invalid=An odd run \\\z still contains an invalid escape" "\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            suffix=".properties",
+            encoding="utf-8",
+        ) as temp_f:
+            temp_f.write(content)
+            temp_file_path = temp_f.name
+
+        try:
+            errors = lint_properties_file(temp_file_path)
+            self.assertEqual(len(errors), 1)
+            self.assertIn(
+                "Unknown escape sequence in value for key 'invalid'",
+                errors[0],
+            )
         finally:
             os.remove(temp_file_path)
 

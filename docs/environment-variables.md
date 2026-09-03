@@ -23,6 +23,7 @@ override or secret.
 | `TRANSLATOR_PROFILE` | Docker Compose | Selects `profiles/<name>/config.yaml` and `profiles/<name>/glossary.json`. |
 | `OPENAI_BASE_URL` | Python pipeline, Action wrapper | Optional OpenAI-compatible API base URL. Blank values are unset by the Action wrapper. |
 | `REVIEW_MODEL_NAME` | Python pipeline, Action wrapper | Overrides the configured holistic/semantic review model. |
+| `REVIEW_REASONING_EFFORT` | Python pipeline | Overrides `review_reasoning_effort` for holistic review. |
 | `PROCESS_ALL_FILES` | Python pipeline, Action wrapper | When true, process all discoverable translation files rather than changed files only. |
 
 ## Runtime Controls
@@ -32,7 +33,7 @@ override or secret.
 | `LOCALIZE_DRY_RUN` | Python pipeline, shell scripts, Action | Forces dry-run mode when true, even if the config says otherwise. |
 | `LOCALIZE_SMOKE_ONLY` | `update-translations.sh` | Runs the smoke path and exits before Transifex, translation, commit, or PR work. |
 | `TX_PULL_TIMEOUT` | `update-translations.sh` | Timeout in seconds for `tx pull`; defaults to `3600`. |
-| `MAX_FILES_PER_PR` | `update-translations.sh` | Maximum files per generated PR batch; defaults to `150`. |
+| `MAX_FILES_PER_PR` | `update-translations.sh` | Maximum files per generated PR batch; defaults to `90`. |
 | `TRANSLATION_FILTER_GLOB` | Python pipeline, local runner, shell scripts | Filters translation files by basename glob. The `translation_file_filter_glob` config key sets this when the environment does not. |
 | `TRANSLATION_QUALITY_AUDIT_SCOPE` | `update-translations.sh` | Optional CLI override for quality-gate audit scope. When unset, the gate uses config. |
 | `LOCALIZE_ALLOW_RESET_LEDGER` | Python pipeline | Allows a corrupt translation-key ledger to be backed up and reset. Default behavior fails closed. |

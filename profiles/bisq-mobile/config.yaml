@@ -9,6 +9,8 @@ project_context: >
   preserve product names, and prefer mobile UI wording over long desktop-style
   phrases.
 model_name: "gpt-4o-mini"
+review_model_name: "gpt-5.6-terra"
+review_reasoning_effort: "none"
 translation_queue_folder: "translation_queue"
 translated_queue_folder: "translated_queue"
 dry_run: false
@@ -29,6 +31,7 @@ quality_gate:
 semantic_review:
   enabled: true
   model: "gpt-5.4-mini"
+  reasoning_effort: "none"
   auto_apply_error_suggestions: true
 semantic_quality_rules:
   - id: "trade-history-traders-label"
@@ -83,12 +86,12 @@ semantic_quality_rules:
     source: "bisq-mobile#1484 CodeRabbit"
   - id: "network-seed-node-not-seed-phrase"
     message: "On the Network connections screen 'Seed' labels a seed node (bootstrap peer), not a wallet recovery phrase; do not translate it as seed phrase/words."
-    locales: ["cs", "es", "ru", "id", "it", "vi"]
+    locales: ["cs", "es", "ru", "id", "it", "vi", "fr"]
     keys: ["mobile.networkInfo.connections.seed"]
-    forbidden_target_regex: "(Slova|Frase|фраза|Kata|Parole|khóa)"
+    forbidden_target_regex: "(Slova|Frase|фраза|Kata|Parole|khóa|Récupération)"
     regex_ignorecase: true
     severity: "error"
-    source: "bisq-mobile#1606 CodeRabbit"
+    source: "bisq-mobile#1606, #1669 CodeRabbit"
   - id: "network-transport-not-physical-transport"
     message: "On the Network screens 'Transport' is the network transport (e.g. Tor/clearnet), not physical transportation/shipping."
     locales: ["af_ZA", "cs", "vi"]
@@ -97,6 +100,14 @@ semantic_quality_rules:
     regex_ignorecase: true
     severity: "error"
     source: "bisq-mobile#1606 CodeRabbit"
+  - id: "no-vietnamese-horn-vowels-outside-vi"
+    message: "Vietnamese horn vowels (ư/ơ and their tone-mark variants) must not appear outside the Vietnamese locale; they signal cross-language contamination such as the Yoruba 'dữdata' token that fused Vietnamese 'dữ' with English 'data'."
+    locales: ["*"]
+    excluded_locales: ["vi"]
+    keys: ["*"]
+    forbidden_target_regex: '[ưừứữửựƯỪỨỮỬỰơờớỡởợƠỜỚỠỞỢ]'
+    severity: "error"
+    source: "bisq2#4884 CodeRabbit"
 supported_locales:
   - code: "af_ZA"
     name: "Afrikaans"

@@ -782,8 +782,10 @@ ls -la "$TARGET_PROJECT_ROOT"
 log "Listing permissions for $TARGET_PROJECT_ROOT/.git before git status:"
 ls -la "$TARGET_PROJECT_ROOT/.git"
 
-# Maximum files per PR before splitting. CodeRabbit skips review above 150.
-DEFAULT_MAX_FILES_PER_PR=150
+# Maximum files per PR before splitting. CodeRabbit refuses to review a PR with
+# more than 100 files, and an unreviewed batch is the one thing batching exists
+# to prevent, so stay strictly below that cap with a margin for headroom.
+DEFAULT_MAX_FILES_PER_PR=90
 MAX_FILES_PER_PR=${MAX_FILES_PER_PR:-$DEFAULT_MAX_FILES_PER_PR}
 if [[ ! "$MAX_FILES_PER_PR" =~ ^[1-9][0-9]*$ ]]; then
     log "Invalid MAX_FILES_PER_PR '$MAX_FILES_PER_PR'; expected a positive integer. Falling back to $DEFAULT_MAX_FILES_PER_PR." "WARNING"
@@ -835,6 +837,7 @@ stage_and_submit_batch() {
     local QUALITY_REPORT_JSON="$report_dir/translation_quality_report-${branch}.json"
     local QUALITY_REPORT_MD="$report_dir/translation_quality_report-${branch}.md"
     local VALIDATION_SUMMARY="$report_dir/translation_validation_summary.json"
+    local TOKEN_USAGE_JSON="$report_dir/token_usage_summary.json"
     local QUALITY_AUDIT_SCOPE="${TRANSLATION_QUALITY_AUDIT_SCOPE:-}"
     local SEMANTIC_REVIEW_EXIT=0
     set +e
@@ -845,6 +848,7 @@ stage_and_submit_batch() {
             --input-folder "$ABSOLUTE_INPUT_FOLDER" \
             --config "$CONFIG_FILE" \
             --validation-summary "$VALIDATION_SUMMARY" \
+            --token-usage-summary "$TOKEN_USAGE_JSON" \
             --changed-files "${BATCH_FILES[@]}"
     )
     SEMANTIC_REVIEW_EXIT=$?
@@ -956,14 +960,15 @@ This PR is from branch \`$branch\` on the \`${FORK_OWNER}/${FORK_REPO_NAME_SHORT
         record_pipeline_event "skipped_files" "count=0"
     fi
 
-    # Append per-run token usage / estimated cost so reviewers see what the run cost.
-    local TOKEN_USAGE_JSON="$report_dir/token_usage_summary.json"
+    # Append per-run token usage / estimated cost so reviewers see what all AI stages cost.
     if [ -s "$TOKEN_USAGE_JSON" ]; then
         local COST_MD
         COST_MD=$(jq -r '
-            ["### Translation cost (estimated)",
+            ["### Translation cost (estimated, all AI stages)",
              "- Total: \(.totals.total_tokens) tokens, est. $\(.totals.estimated_cost_usd)"
                + (if .totals.cost_complete == false then " (partial — some models had no price set)" else "" end)]
+            + ((.stages // {}) | to_entries | map("- Stage \(.key | gsub(\"_\"; \" \")): "
+               + "\(.value.totals.total_tokens) tokens, est. $\(.value.totals.estimated_cost_usd)"))
             + (.models | to_entries | map("- \(.key): \(.value.total_tokens) tokens, est. "
                + (if .value.estimated_cost_usd == null then "n/a" else "$\(.value.estimated_cost_usd)" end)))
             | join("\n")

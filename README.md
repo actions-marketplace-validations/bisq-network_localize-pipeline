@@ -113,7 +113,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
-      - uses: bisq-network/localize-pipeline@v0.1.7
+      - uses: bisq-network/localize-pipeline@v0.1.20
         with:
           config-file: config.yaml
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -158,6 +158,16 @@ localization_layout:
   source_locale: "en"
 ```
 
+Suffix layouts can set `base_name` when the source file also carries its locale:
+
+```yaml
+localization_layout:
+  id: "suffix"
+  base_name: "Messages"
+  source_locale: "en"
+placeholder_profile: "java-indexed" # opt-in support for %0, %1, ...
+```
+
 Mixed-format projects use profiles:
 
 ```yaml
@@ -181,15 +191,19 @@ Key settings:
 | `target_project_root` | Repository that contains the localization files. |
 | `input_folder` | Localization folder, absolute or relative to `target_project_root`. |
 | `localization_format` | Built-in format id for single-format projects. |
-| `localization_layout` | `suffix`, `locale_directory`, or `locale_filename`. |
+| `localization_layout` | `suffix`, `locale_directory`, or `locale_filename`; suffix layouts optionally accept `base_name`. |
 | `localization_formats` | Profile list for mixed-format projects. |
 | `translation_source` | `git` or `transifex`. New projects usually start with `git`. |
+| `placeholder_profile` | `standard` by default; use `java-indexed` for `%0`, `%1`, ... runtime tokens. |
 | `model_provider` | `aisuite` by default; `openai_compatible` is the direct SDK fallback. |
 | `model_name`, `review_model_name` | Translation and review models. |
+| `review_reasoning_effort` | Optional reasoning effort for the holistic review model. |
+| `semantic_review.reasoning_effort` | Optional reasoning effort for the semantic review model. |
 | `api_base_url` | OpenAI-compatible endpoint, for example Ollama. |
 | `supported_locales` | Target locales. |
 | `project_context` | Product/domain context injected into prompts. |
 | `brand_technical_glossary` | Terms that must not be translated. |
+| `translation_glossary_enforcement` | `exact` by default; use `prompt-only` for preferred lemmas that require grammatical inflection. |
 | `ignore_key_patterns` | Python regexes matched against adapter keys; matching keys are copied from source and never translated. |
 | `style_rules` | Locale-specific writing rules. |
 
@@ -216,11 +230,11 @@ localize validate --config config.yaml
 localize run --dry-run --config config.yaml
 localize run --config config.yaml
 localize quality-gate --repo-root . --input-folder i18n --config config.yaml --validation-summary logs/translation_validation_summary.json --output-json logs/quality.json --output-markdown logs/quality.md --changed-files i18n/messages_de.properties
-localize bootstrap-pr --target-project-root path/to/repo --action-ref v0.1.7
+localize bootstrap-pr --target-project-root path/to/repo --action-ref v0.1.20
 localize memory stats --memory-file logs/translation_memory.json
 ```
 
-Custom adapter modules can be loaded before any command:
+Custom adapter modules can be loaded before translation commands:
 
 ```bash
 localize --plugin my_project.localize_adapter formats
@@ -231,12 +245,64 @@ group, or users can set `LOCALIZE_PLUGIN_MODULES=module_a,module_b`.
 
 Full guide: [docs/localization-cli.md](docs/localization-cli.md).
 
+## Optional Self-Hosted PR Guardian
+
+[Localize Guardian](docs/guardian.md) is an optional post-PR review loop for
+operator-owned translation pull requests. It is self-hosted, not a service run
+by the Localize Pipeline maintainers: each operator supplies the machine,
+credentials, and reviewer/bot allowlists. By default it uses that operator's
+Codex access and ChatGPT plan allowance; metered API billing is opt-in.
+
+Start in report-only mode with the generic
+[Guardian policy example](examples/guardian.config.yaml):
+
+```bash
+localize guardian init --config "$HOME/.config/localize/guardian.yaml"
+localize guardian login --config "$HOME/.config/localize/guardian.yaml"
+localize guardian doctor --config "$HOME/.config/localize/guardian.yaml"
+localize guardian run --config "$HOME/.config/localize/guardian.yaml"
+localize guardian status --config "$HOME/.config/localize/guardian.yaml"
+```
+
+Authority is local and explicit, including immutable numeric repository and
+actor IDs, the exact target `base_branch`, owned head repositories/branches,
+paths, locales, and trusted reviewers or bots. The shipped Codex assessment
+default is `gpt-5.6-terra` with reasoning effort `high`. The dedicated Guardian
+login is kept outside monitored repositories; inherited API keys are not used
+in the default subscription mode.
+
+Write modes support the backward-compatible OpenPGP signer or an opt-in,
+agent-backed SSH signing key. The SSH path stores only an exact public-key
+fingerprint and public-key file; the agent socket reaches only the commit
+subprocess, and signatures are reverified before publication. See the full
+Guardian guide for setup and Keychain/launchd notes.
+
+Pipeline validation policy defaults to the exact repository base SHA. Projects
+that keep localization config outside the repository can opt into a private,
+operator-owned config snapshot with `pipeline_config_source: operator`.
+Scheduled runs honor the configured local `schedule.hour` and
+`schedule.minute`, while manual runs remain available at any time.
+
+Guardian intentionally rejects `--plugin` and ignores
+`LOCALIZE_PLUGIN_MODULES` and adapter entry points, so project plugin code never
+runs inside its credential-bearing process. Keep its config and generated
+launchd files outside monitored repositories. The launchd wrapper starts at most
+one scheduled poll per local calendar day, whether it succeeds or fails;
+diagnose a failed scheduled attempt and retry it with an explicit manual
+`guardian run`.
+
+On Linux, bounded Codex and prevention-test processes require a delegated
+cgroup-v2 parent and are recursively terminated through `cgroup.kill`, including
+descendants that create another process group or session. `guardian doctor`
+checks that boundary and the sandbox's denial of parent-cgroup migration. See
+the full guide for the macOS containment tradeoff.
+
 ## Bootstrap A Project PR
 
 To onboard another repository without hand-copying files, run:
 
 ```bash
-localize bootstrap-pr --target-project-root path/to/repo --action-ref v0.1.7
+localize bootstrap-pr --target-project-root path/to/repo --action-ref v0.1.20
 ```
 
 The command refuses dirty worktrees, creates a `localize/onboarding` branch, and
@@ -318,7 +384,7 @@ matches only.
 Pin a tagged release for production workflows once tags are available:
 
 ```yaml
-- uses: bisq-network/localize-pipeline@v0.1.7
+- uses: bisq-network/localize-pipeline@v0.1.20
 ```
 
 Use `@main` only when you intentionally want the latest unreleased changes.

@@ -74,6 +74,8 @@ class TestLoadAppConfig:
             "target_project_root": "/custom/target",
             "input_folder": "/custom/input",
             "model_name": "gpt-4o-mini",
+            "review_model_name": "gpt-5.6-terra",
+            "review_reasoning_effort": "none",
             "dry_run": True,
             "retranslate_identical_source_strings": True,
             "translation_key_ledger_file_path": "/tmp/test-ledger.json",
@@ -113,6 +115,8 @@ class TestLoadAppConfig:
         assert config.target_project_root == "/custom/target"
         assert config.input_folder == "/custom/input"
         assert config.model_name == "gpt-4o-mini"
+        assert config.review_model_name == "gpt-5.6-terra"
+        assert config.review_reasoning_effort == "none"
         assert config.dry_run is True
         assert config.retranslate_identical_source_strings is True
         assert config.translation_key_ledger_file_path == "/tmp/test-ledger.json"
@@ -352,6 +356,70 @@ class TestLoadAppConfig:
         assert config.localization_layout.source_locale == "en"
         assert config.localization_profiles[0].localization_format.id == "custom_json"
 
+    def test_load_config_records_profile_without_mutating_placeholder_state(self):
+        import localize.placeholder_rules as placeholder_rules
+
+        mock_config = {
+            "dry_run": True,
+            "placeholder_profile": "java-indexed",
+        }
+
+        with placeholder_rules.placeholder_profile("standard"):
+            with patch("localize.app_config._load_yaml_config", return_value=mock_config):
+                with patch("os.path.exists", return_value=False):
+                    with patch("localize.app_config.setup_logger") as mock_logger:
+                        mock_logger.return_value = MagicMock()
+                        with patch.dict(os.environ, {}, clear=True):
+                            config = load_app_config()
+
+            assert config.placeholder_profile == "java-indexed"
+            from collections import Counter
+
+            from localize.placeholder_rules import extract_placeholder_tokens
+
+            assert extract_placeholder_tokens("%0 of %1") == Counter()
+
+    def test_load_config_defaults_to_standard_placeholder_profile(self):
+        mock_config = {"dry_run": True}
+
+        with patch("localize.app_config._load_yaml_config", return_value=mock_config):
+            with patch("os.path.exists", return_value=False):
+                with patch("localize.app_config.setup_logger") as mock_logger:
+                    mock_logger.return_value = MagicMock()
+                    with patch.dict(os.environ, {}, clear=True):
+                        config = load_app_config()
+
+        assert config.placeholder_profile == "standard"
+
+    def test_load_config_accepts_prompt_only_glossary_enforcement(self):
+        mock_config = {
+            "dry_run": True,
+            "translation_glossary_enforcement": "prompt-only",
+        }
+
+        with patch("localize.app_config._load_yaml_config", return_value=mock_config):
+            with patch("os.path.exists", return_value=False):
+                with patch("localize.app_config.setup_logger") as mock_logger:
+                    mock_logger.return_value = MagicMock()
+                    with patch.dict(os.environ, {}, clear=True):
+                        config = load_app_config()
+
+        assert config.translation_glossary_enforcement == "prompt-only"
+
+    def test_load_config_rejects_unknown_placeholder_profile(self):
+        mock_config = {
+            "dry_run": True,
+            "placeholder_profile": "no-such-profile",
+        }
+
+        with patch("localize.app_config._load_yaml_config", return_value=mock_config):
+            with patch("os.path.exists", return_value=False):
+                with patch("localize.app_config.setup_logger") as mock_logger:
+                    mock_logger.return_value = MagicMock()
+                    with patch.dict(os.environ, {}, clear=True):
+                        with pytest.raises(SystemExit):
+                            load_app_config()
+
     def test_load_config_compiles_ignore_key_patterns(self):
         mock_config = {
             "dry_run": True,
@@ -510,13 +578,34 @@ class TestLoadAppConfig:
                         mock_logger.return_value = MagicMock()
                         with patch.dict(os.environ, {
                             "REVIEW_MODEL_NAME": "gpt-4o",
+                            "REVIEW_REASONING_EFFORT": "low",
                             "HOLISTIC_REVIEW_CHUNK_SIZE": "100"
                         }):
                             config = load_app_config()
 
         assert config.model_name == "gpt-4"  # From config file
         assert config.review_model_name == "gpt-4o"  # From environment
+        assert config.review_reasoning_effort == "low"
         assert config.holistic_review_chunk_size == 100  # From environment
+
+    def test_invalid_review_reasoning_effort_is_disabled(self):
+        mock_config = {
+            "model_name": "gpt-4o-mini",
+            "review_reasoning_effort": "medium",
+            "dry_run": True,
+        }
+
+        with patch("localize.app_config._load_yaml_config", return_value=mock_config):
+            with patch("localize.app_config.setup_logger") as mock_logger:
+                mock_logger.return_value = MagicMock()
+                with patch.dict(
+                    os.environ,
+                    {"REVIEW_REASONING_EFFORT": "medum"},
+                    clear=True,
+                ):
+                    config = load_app_config()
+
+        assert config.review_reasoning_effort is None
 
     def test_load_config_with_dotenv_file(self):
         """Test that .env file is loaded properly."""
@@ -727,6 +816,27 @@ class TestValidateConfig:
     def test_valid_config_has_no_errors(self):
         issues = validate_config(self.GOOD, path_exists=lambda p: True)
         assert self._errors(issues) == []
+
+    def test_unknown_placeholder_profile_is_validation_error(self):
+        config = {**self.GOOD, "placeholder_profile": "no-such-profile"}
+
+        errors = self._errors(validate_config(config, path_exists=lambda p: True))
+
+        assert any("Unknown placeholder profile" in error for error in errors)
+
+    def test_unknown_glossary_enforcement_is_validation_error(self):
+        config = {**self.GOOD, "translation_glossary_enforcement": "sometimes"}
+
+        errors = self._errors(validate_config(config, path_exists=lambda p: True))
+
+        assert any("translation_glossary_enforcement must be one of" in error for error in errors)
+
+    def test_unknown_translation_source_is_validation_error(self):
+        config = {**self.GOOD, "translation_source": "crowdin"}
+
+        errors = self._errors(validate_config(config, path_exists=lambda p: True))
+
+        assert any("translation_source" in error for error in errors)
 
     def test_missing_required_paths_are_errors(self):
         issues = validate_config({"supported_locales": self.GOOD["supported_locales"]},
