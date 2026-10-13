@@ -236,3 +236,18 @@ changes, unexpected source echoes and failed attempts still process normally.
 The same exact policy applies to the deterministic source-identical quality gate.
 Wildcards and malformed entries are rejected. Removing a policy entry removes
 its exemption; conflicted memory remains unavailable until explicitly reviewed.
+
+### Source changes with unchanged targets
+
+For `translation_source: git`, the pipeline passes its existing persisted source
+baseline (`TRANSLATION_DIFF_BASE`) to the deterministic quality gate. Existing
+`semantic_quality_rules` also check current targets for the exact source keys
+whose parsed values changed, even when translation produces no file changes.
+A blocking no-change audit retains the old baseline and withholds the success
+heartbeat. A successful no-change run retains the existing baseline advancement
+behavior. No model call or PR is created merely to perform this audit.
+
+This does not add new semantic policy: configure rules for the invariants your
+project needs. Empty rule configurations skip source enumeration. The standalone
+`localize quality-gate --source-diff-base` interface and format/layout behavior are
+described in [the Action guide](github-action.md).

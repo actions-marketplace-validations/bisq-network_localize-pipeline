@@ -312,6 +312,7 @@ runs:
         LOCALIZE_REVIEW_MODEL_INPUT: ${{ inputs.review-model }}
         LOCALIZE_DRY_RUN: ${{ inputs.dry-run }}
         LOCALIZE_PLUGIN_MODULES: ${{ inputs.plugin-modules }}
+        DIFF_BASE_INPUT: ${{ inputs.diff-base }}
       run: |
         set -euo pipefail
         gate_paths_file="$(mktemp)"
@@ -407,8 +408,20 @@ runs:
           fi
         done < "$changed_files_file"
 
-        if [ "${#changed_files[@]}" -eq 0 ]; then
-          echo "No changed localization files; quality gate has nothing to check."
+        source_diff_base="${DIFF_BASE_INPUT:-HEAD}"
+        if [[ "$source_diff_base" =~ ^0+$ ]]; then
+          source_diff_base=HEAD
+        fi
+        mkdir -p "$ACTION_QUALITY_REPORT_DIR"
+        if [ -z "${changed_files[*]:-}" ]; then
+          python -m localize.cli quality-gate \
+            --repo-root "$repo_root" \
+            --input-folder "$input_folder" \
+            --config "$TRANSLATOR_CONFIG_FILE" \
+            --validation-summary "$ACTION_QUALITY_REPORT_DIR/translation_validation_summary.json" \
+            --output-json "$ACTION_QUALITY_REPORT_DIR/translation_quality_report.json" \
+            --output-markdown "$ACTION_QUALITY_REPORT_DIR/translation_quality_report.md" \
+            --source-diff-base "$source_diff_base"
           exit 0
         fi
 
@@ -445,6 +458,7 @@ runs:
           --validation-summary "$ACTION_QUALITY_REPORT_DIR/translation_validation_summary.json" \
           --output-json "$ACTION_QUALITY_REPORT_DIR/translation_quality_report.json" \
           --output-markdown "$ACTION_QUALITY_REPORT_DIR/translation_quality_report.md" \
+          --source-diff-base "$source_diff_base" \
           --changed-files "${changed_files[@]}"
 
     - name: Open pull request

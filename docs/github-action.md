@@ -162,6 +162,34 @@ localization_formats:
 The action, quality gate, semantic reviewer, and PR publisher all read the same
 profile list.
 
+The changed-entry gate also applies existing `semantic_quality_rules` to current
+targets whose source values changed since the action's `diff-base`, including
+source changes already committed upstream. It compares parsed values, so a
+formatting-only source edit does not audit unrelated keys. Ignored keys, locale
+filters and configured format/layout profiles still apply. These additional
+entries run configured rules only; they do not enable a full-tree heuristic or
+AI review. A run with no generated target edits still produces a deterministic
+report and fails if this source-change audit blocks.
+
+For the standalone command, supply a reachable, trusted Git baseline:
+
+```bash
+localize quality-gate --repo-root /path/to/repo \
+  --input-folder /path/to/repo/locales --config /path/to/config.yaml \
+  --validation-summary /path/to/validation.json \
+  --output-json /path/to/report.json --output-markdown /path/to/report.md \
+  --source-diff-base BASE_COMMIT
+```
+
+`--changed-files` remains required unless `--source-diff-base` explicitly enables
+this source audit. Use `HEAD` to check staged or working-tree source edits; use
+the pre-change commit for already-committed changes. The comparison uses the
+baseline's merge base with `HEAD`, matching translation change detection. A
+missing or invalid baseline fails the configured-rule audit. With no configured
+rules, source enumeration is skipped. This checks the stated rules, not general
+natural-language equivalence; use `semantic_qa_audit_scope: all` for an intentional
+full audit.
+
 ## Reviewed source-identical values
 
 Some complete UI values legitimately match English in a particular locale.
