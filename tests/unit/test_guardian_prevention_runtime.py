@@ -7382,7 +7382,7 @@ def test_coordinator_accounts_author_retries_on_their_actual_utc_days(
         assert float(state.budget_committed_for_day(second_day.date())) == 0.01
 
 
-def test_coordinator_skips_project_specific_scope_and_requires_private_opt_in(
+def test_coordinator_holds_missing_policy_context_and_requires_private_opt_in(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
@@ -7415,7 +7415,8 @@ def test_coordinator_skips_project_specific_scope_and_requires_private_opt_in(
             require_current_base_unchanged=_current_base,
             **_open_source_kwargs(),
         )
-        assert outcome.skipped == 1
+        assert outcome.policy_proposals == ()
+        assert outcome.failures == ("PolicyProposalError",)
         assert author.calls == 0
 
     private_root = tmp_path / "private"

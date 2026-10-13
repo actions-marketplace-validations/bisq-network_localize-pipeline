@@ -8939,6 +8939,31 @@ class GuardianState:
             )
         return int(cursor.lastrowid)
 
+    def record_project_policy_proposal(
+        self, *, run_id: str, event_revision_id: int, proposal_id: str,
+        path: str, evidence_status: str, occurred_at: datetime,
+    ) -> None:
+        """Record a private decision without resolving feedback; recover artifact-first crashes."""
+        if not re.fullmatch(r"[0-9a-f]{64}", proposal_id):
+            raise ValueError("Project-policy proposal identity must be a digest.")
+        if evidence_status not in {"needs_operator_review", "evidence_incomplete", "declined"}:
+            raise ValueError("Project-policy proposal evidence status is invalid.")
+        with self._connection:
+            existing = self._connection.execute(
+                """SELECT 1 FROM actions WHERE event_revision_id = ?
+                   AND action = 'project_policy_proposal'
+                   AND json_extract(details_json, '$.proposal_id') = ? LIMIT 1""",
+                (event_revision_id, proposal_id),
+            ).fetchone()
+            if existing is None:
+                self.record_action(
+                    run_id=run_id, event_revision_id=event_revision_id,
+                    action="project_policy_proposal", status="pending",
+                    details={"proposal_id": proposal_id, "path": path,
+                             "outcome": evidence_status, "decision_required": True},
+                    occurred_at=occurred_at,
+                )
+
     def latest_feedback_report(
         self,
         revision_id: int,

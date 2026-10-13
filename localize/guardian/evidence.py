@@ -61,6 +61,11 @@ test that could prevent it. Do not invent a pipeline root cause: pipeline code
 is not in this bundle, so identify hypotheses for the prevention author to verify
 against current code before proposing a fix. Distinguish generic pipeline defects
 from project-specific terminology or configuration; use the appropriate scope.
+Use project_config for exact project labels, spelling choices, lexicons, locale
+style, and accepted alternatives. Those are installation policy, even if a hardcoded
+Python rule could detect them. pipeline_code requires a reusable engine-behavior
+defect, not merely repetition across several keys or locales. Private project
+policy proposals do not authorize active config changes or public code PRs.
 Source-identical brand names and legitimate shared-language wording are not
 automatically defects. Never manufacture candidates just to fill the list.
 In the result summary, explain the recurrence assessment, including why no
