@@ -1327,8 +1327,8 @@ def _build_controller(
             checkout_factory=checkout_factory,
             broker_factory=create_prevention_broker,
             author=PreventionCodexAuthor(
-                model=config.runtime.codex_model,
-                reasoning_effort=config.runtime.codex_reasoning_effort,
+                model=config.runtime.effective_prevention_model,
+                reasoning_effort=config.runtime.effective_prevention_reasoning_effort,
                 auth_mode=config.runtime.codex_auth_mode,
                 codex_home=config.runtime.codex_home,
                 executable=config.runtime.codex_executable,

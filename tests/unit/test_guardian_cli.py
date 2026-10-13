@@ -729,6 +729,31 @@ def test_doctor_validates_local_dependencies_and_exact_github_identities(
     github_probe.assert_called_once()
 
 
+@pytest.mark.parametrize("split", [False, True])
+def test_doctor_reports_effective_prevention_model_without_claiming_availability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], split: bool,
+) -> None:
+    config_path = _init_config(tmp_path)
+    config = _prevention_doctor_config(config_path)
+    config = replace(config, runtime=replace(
+        config.runtime, codex_model="gpt-6-sol", codex_reasoning_effort="high",
+        prevention_model="gpt-6-astra" if split else None,
+        prevention_reasoning_effort="medium" if split else None,
+    ))
+    monkeypatch.setattr(cli, "_load_config_or_raise", lambda _: config)
+    monkeypatch.setattr(cli, "_command_available", lambda _: True)
+    monkeypatch.setattr(cli, "_probe_github", lambda _: ())
+    monkeypatch.setattr(cli, "_signing_key_configured", lambda *a, **kw: True)
+    monkeypatch.setattr(cli, "_prevention_sandbox_probe", lambda _: True)
+
+    assert cli.main(["doctor", "--config", str(config_path)]) == 0
+    output = capsys.readouterr().out
+    expected = "gpt-6-astra / medium" if split else "gpt-6-sol / high"
+    assert f"Prevention model/effort: configured {expected} (not capability-validated)" in output
+    assert "Codex model/effort: configured gpt-6-sol / high" in output
+
+
 def test_doctor_fails_when_codex_permission_canary_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
