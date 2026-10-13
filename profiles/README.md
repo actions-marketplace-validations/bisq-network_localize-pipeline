@@ -17,3 +17,8 @@ Pinned originals and corrections are recorded in
 [`bisq_review_regressions.json`](../tests/fixtures/project_policy/bisq_review_regressions.json).
 Constructed alternative-wording and URL/name controls are labelled separately
 from observed corrections; they are not claims of native-speaker approval.
+
+Rules do not enable additional translation locales. The Mobile reference profile
+currently selects neither `pcm` nor `hi`; its PCM and Hindi rules become active
+only in an installation that explicitly selects those locales. Keep the selected
+locale list and deployed policy snapshot aligned when applying a proposal.

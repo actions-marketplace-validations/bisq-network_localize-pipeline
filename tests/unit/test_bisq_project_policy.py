@@ -121,7 +121,10 @@ def test_original_and_correction_reach_real_profile_quality_gate(tmp_path, recor
 def test_fixture_evidence_is_pinned_and_rules_are_exact(record):
     for evidence in [record["source"], record["original"], *record["corrections"]]:
         assert re.fullmatch(r"[a-f0-9]{40}", evidence["commit"])
-        assert evidence["url"].startswith("https://github.com/" + evidence["repository"] + "/")
+        assert evidence["url"] == (
+            f"https://github.com/{evidence['repository']}/blob/"
+            f"{evidence['commit']}/{evidence['path']}"
+        )
         assert hashlib.sha256(evidence["value"].encode()).hexdigest() == evidence["value_sha256"]
     rules = profile_config(record["profile"])[3]
     rule = next(rule for rule in rules if rule.id == record["rule_id"])
@@ -134,3 +137,49 @@ def test_fixture_evidence_is_pinned_and_rules_are_exact(record):
     assert rule.required_target_regex is None
     assert rule.source_regex.search(record["source"]["value"])
     assert rule.forbidden_target_regex.search(record["original"]["value"])
+
+
+@pytest.mark.parametrize("profile", ["bisq", "bisq-mobile"])
+@pytest.mark.parametrize("enable_fixture_locales", [False, True])
+def test_cli_respects_selected_profile_locale_scope(tmp_path, profile, enable_fixture_locales):
+    """A rule does not implicitly enable translation for an unselected locale."""
+    import subprocess
+    import yaml
+    from localize.translation_quality_gate import main
+
+    records = [record for record in RECORDS if record["profile"] == profile]
+    config_path = ROOT / "profiles" / profile / "config.yaml"
+    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if enable_fixture_locales:
+        present = {locale["code"] for locale in raw_config["supported_locales"]}
+        for locale in sorted({record["locale"] for record in records} - present):
+            raw_config["supported_locales"].append({"code": locale, "name": locale})
+        config_path = tmp_path / "explicit-test-locales.yaml"
+        config_path.write_text(yaml.safe_dump(raw_config, allow_unicode=True), encoding="utf-8")
+    selected = {locale["code"] for locale in raw_config["supported_locales"]}
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    sources = {record["key"]: record["source"]["value"] for record in records}
+    (resources / "messages.properties").write_text(
+        "\n".join(f"{key}={value}" for key, value in sources.items()) + "\n", encoding="utf-8")
+    targets = {}
+    for record in records:
+        targets.setdefault(record["locale"], {})[record["key"]] = record["original"]["value"]
+    for locale, values in targets.items():
+        (resources / f"messages_{locale}.properties").write_text(
+            "\n".join(f"{key}={value}" for key, value in values.items()) + "\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "resources"], check=True, capture_output=True)
+    report = tmp_path / "report.json"
+    result = main([
+        "--repo-root", str(tmp_path), "--input-folder", str(resources),
+        "--config", str(config_path), "--validation-summary", str(tmp_path / "missing.json"),
+        "--output-json", str(report), "--output-markdown", str(tmp_path / "report.md"),
+        "--changed-files", *(f"resources/messages_{locale}.properties" for locale in targets),
+    ])
+    data = json.loads(report.read_text(encoding="utf-8"))
+    expected = {record["rule_id"] for record in records if record["locale"] in selected}
+    assert result == 1
+    assert data["semantic_qa"]["errors_count"] == len(expected)
+    assert {finding["rule_id"] for finding in data["semantic_qa"]["examples"]
+            if finding["severity"] == "error"} == expected
