@@ -112,6 +112,9 @@ schedule:
 runtime:
   codex_model: gpt-5.6-terra
   codex_reasoning_effort: high
+  # Optional prevention-only overrides; omitted settings inherit the above.
+  # prevention_model: gpt-6-astra
+  # prevention_reasoning_effort: high
   # Uses the operator's Codex/ChatGPT plan allowance, not API billing.
   codex_auth_mode: chatgpt
   # ChatGPT mode only; remove this key when selecting api-key mode.
@@ -1588,6 +1591,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     )
     healthy &= codex_capabilities
     if config.mode is GuardianMode.PROPOSE_PREVENTION:
+        print(
+            "Prevention model/effort: configured "
+            f"{config.runtime.effective_prevention_model} / "
+            f"{config.runtime.effective_prevention_reasoning_effort} "
+            "(not capability-validated)"
+        )
         author_capabilities = (
             _codex_capability_probe(
                 config.runtime.codex_executable,

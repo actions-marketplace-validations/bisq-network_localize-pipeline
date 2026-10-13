@@ -249,6 +249,10 @@ _CONFIG_SCHEMA: dict[str, Any] = {
                 "codex_reasoning_effort": {
                     "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
                 },
+                "prevention_model": _NON_EMPTY_STRING,
+                "prevention_reasoning_effort": {
+                    "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
+                },
                 "codex_executable": _NON_EMPTY_STRING,
                 "git_executable": _NON_EMPTY_STRING,
                 "signing_program": _NON_EMPTY_STRING,
@@ -1101,6 +1105,7 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
     )
     for field in (
         "codex_model",
+        "prevention_model",
         "codex_executable",
         "git_executable",
         "signing_program",
@@ -1187,6 +1192,8 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
                 "codex_reasoning_effort",
                 runtime_defaults.codex_reasoning_effort,
             ),
+            prevention_model=raw_runtime.get("prevention_model"),
+            prevention_reasoning_effort=raw_runtime.get("prevention_reasoning_effort"),
             codex_auth_mode=auth_mode,
             codex_home=codex_home,
             codex_executable=raw_runtime.get(

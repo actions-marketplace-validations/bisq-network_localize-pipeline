@@ -317,6 +317,46 @@ and [Codex rate card](https://help.openai.com/en/articles/11481834). Model and
 effort remain explicit operator policy: use Sol/max only when representative
 evaluations justify the additional plan allowance or API cost.
 
+### Separate assessment and prevention models
+
+`runtime.codex_model` and `runtime.codex_reasoning_effort` select the model
+that assesses reviewer feedback and proposes translation-value corrections,
+including historical assessments. Optional `runtime.prevention_model` and
+`runtime.prevention_reasoning_effort` select the separate author that investigates
+recurrence and prepares pipeline prevention changes. For example:
+
+```yaml
+runtime:
+  codex_model: gpt-6-sol
+  codex_reasoning_effort: high
+  prevention_model: gpt-6-astra
+  prevention_reasoning_effort: high
+```
+
+Each omitted prevention setting independently inherits its assessment setting;
+existing configurations retain their behavior. Omit an override to inherit it,
+rather than setting it to `null`. Model IDs and supported efforts must be
+available to the operator's account and CLI. `guardian doctor` displays the
+effective prevention selection in `propose-prevention` mode, but its confinement
+canaries do not validate model availability or semantic quality.
+
+Routing follows the existing stages, not model confidence or instructions in
+review comments. The assessment model still identifies recurrence candidates;
+there is no automatic second-model review of every translation suggestion.
+Prevention overrides do not enable prevention or increase write authority in
+lower modes. Both stages retain their existing credential isolation, validation,
+publication controls, and bounded attempts. An unavailable prevention model
+fails through the existing error handling; Guardian does not silently fall back
+to the assessment model.
+
+All attempts share `limits.max_model_calls_per_day`, regardless of model.
+The model-call ledger records the actual model and purpose for each attempt.
+API-key mode also shares the existing daily USD budget and per-call reservation;
+size that reservation for either selected model. Switching models does not reset
+budgets, retry completed publications, or clear assessment history. Test the
+chosen pair on representative corrections and prevention cases before changing
+an unattended installation.
+
 ### Plugin isolation
 
 `localize guardian` deliberately does not run the translation plugin loader.

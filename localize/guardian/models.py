@@ -495,6 +495,22 @@ class GuardianRuntime:
     signing_key: str | None = None
     signing_format: SigningFormat = SigningFormat.OPENPGP
     signing_public_key: str | None = None
+    prevention_model: str | None = None
+    prevention_reasoning_effort: str | None = None
+
+    @property
+    def effective_prevention_model(self) -> str:
+        """Inherit the assessment model unless the operator selects another."""
+        return self.codex_model if self.prevention_model is None else self.prevention_model
+
+    @property
+    def effective_prevention_reasoning_effort(self) -> str:
+        """Resolve the prevention effort independently of its model override."""
+        return (
+            self.codex_reasoning_effort
+            if self.prevention_reasoning_effort is None
+            else self.prevention_reasoning_effort
+        )
 
     def __post_init__(self) -> None:
         try:
@@ -526,6 +542,22 @@ class GuardianRuntime:
             raise ValueError(
                 "codex_reasoning_effort must be low, medium, high, xhigh, max, or "
                 "ultra."
+            )
+        if self.prevention_model is not None and (
+            not _is_bounded_single_line(self.prevention_model)
+            or not self.prevention_model.strip()
+        ):
+            raise ValueError(
+                "prevention_model must be a non-empty single-line value of at most "
+                "4096 UTF-8 bytes."
+            )
+        if self.prevention_reasoning_effort is not None and (
+            not isinstance(self.prevention_reasoning_effort, str)
+            or self.prevention_reasoning_effort not in _CODEX_REASONING_EFFORTS
+        ):
+            raise ValueError(
+                "prevention_reasoning_effort must be low, medium, high, xhigh, max, "
+                "or ultra."
             )
         _validate_codex_home(self.codex_home)
 

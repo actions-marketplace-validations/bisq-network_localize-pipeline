@@ -1358,6 +1358,9 @@ def test_write_broker_exists_only_for_write_modes(
         lambda **kwargs: captured.setdefault("broker", kwargs) or object(),
     )
     config = _config(mode)
+    config = replace(config, runtime=replace(
+        config.runtime, prevention_model="gpt-6-astra", prevention_reasoning_effort="medium",
+    ))
     github_credential = SimpleNamespace(argv=config.runtime.github_token_command)
     controller = runtime._build_controller(
         config=config,
@@ -1370,6 +1373,9 @@ def test_write_broker_exists_only_for_write_modes(
 
     factory = controller["write_broker_factory"]
     assert (factory is not None) is write_enabled
+    assert (controller["prevention_runner"] is not None) is (
+        mode is GuardianMode.PROPOSE_PREVENTION
+    )
     if factory is not None:
         broker = factory(_policy())
         assert broker is captured["broker"]

@@ -1560,6 +1560,69 @@ limits:
 
 
 @pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, ("gpt-6-sol", "high")),
+        ({"prevention_model": "gpt-6-astra"}, ("gpt-6-astra", "high")),
+        ({"prevention_reasoning_effort": "medium"}, ("gpt-6-sol", "medium")),
+        (
+            {"prevention_model": "gpt-6-astra", "prevention_reasoning_effort": "xhigh"},
+            ("gpt-6-astra", "xhigh"),
+        ),
+    ],
+)
+def test_prevention_model_overrides_leave_assessment_settings_unchanged(
+    overrides: dict, expected: tuple[str, str],
+) -> None:
+    raw = yaml.safe_load(_minimal_config())
+    raw["runtime"] = {
+        "codex_model": "gpt-6-sol", "codex_reasoning_effort": "high", **overrides,
+    }
+    runtime = parse_guardian_config(raw).runtime
+
+    assert (runtime.codex_model, runtime.codex_reasoning_effort) == ("gpt-6-sol", "high")
+    assert (
+        runtime.effective_prevention_model,
+        runtime.effective_prevention_reasoning_effort,
+    ) == expected
+    if not overrides:
+        changed = replace(runtime, codex_model="other-model", codex_reasoning_effort="low")
+        assert changed.effective_prevention_model == "other-model"
+        assert changed.effective_prevention_reasoning_effort == "low"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("prevention_model", ""),
+        ("prevention_model", " "),
+        ("prevention_model", "gpt-6-astra\n--unsafe"),
+        ("prevention_model", "x" * 4097),
+        ("prevention_model", True),
+        ("prevention_model", ["gpt-6-astra"]),
+        ("prevention_reasoning_effort", "extreme"),
+        ("prevention_reasoning_effort", "none"),
+        ("prevention_reasoning_effort", ["high"]),
+    ],
+)
+def test_invalid_prevention_model_settings_fail_closed(field: str, value: object) -> None:
+    raw = yaml.safe_load(_minimal_config())
+    raw["runtime"] = {field: value}
+    with pytest.raises(GuardianConfigError, match=field):
+        parse_guardian_config(raw)
+    with pytest.raises(ValueError, match=field):
+        GuardianRuntime(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["prevention_model", "prevention_reasoning_effort"])
+def test_prevention_override_yaml_requires_omission_rather_than_null(field: str) -> None:
+    raw = yaml.safe_load(_minimal_config())
+    raw["runtime"] = {field: None}
+    with pytest.raises(GuardianConfigError, match=field):
+        parse_guardian_config(raw)
+
+
+@pytest.mark.parametrize(
     ("kwargs", "offending"),
     [
         ({"run_timeout_seconds": 0}, "run_timeout_seconds"),
