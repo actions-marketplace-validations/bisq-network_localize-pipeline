@@ -1,10 +1,11 @@
-FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS gh-builder
+FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS gh-builder
 
 ARG GH_VERSION=2.96.0
 ARG GH_COMMIT=b300f2ec7ec9dc9addc39b2ad88c54097ded7ca0
 ARG GRPC_VERSION=1.83.2
-ARG X_MOD_VERSION=0.40.0
-ARG X_TEXT_VERSION=0.41.0
+ARG X_MOD_VERSION=0.41.0
+ARG X_TEXT_VERSION=0.42.0
+ARG X_NET_VERSION=0.60.0
 ENV CGO_ENABLED=0
 
 WORKDIR /src/gh
@@ -14,6 +15,7 @@ RUN git clone --depth 1 --branch "v${GH_VERSION}" \
     go get "google.golang.org/grpc@v${GRPC_VERSION}" && \
     go get "golang.org/x/mod@v${X_MOD_VERSION}" && \
     go get "golang.org/x/text@v${X_TEXT_VERSION}" && \
+    go get "golang.org/x/net@v${X_NET_VERSION}" && \
     GH_VERSION="${GH_VERSION}" go run script/build.go bin/gh && \
     install -D bin/gh /out/gh
 RUN go version -m /out/gh > /tmp/gh-buildinfo && \
@@ -22,13 +24,16 @@ RUN go version -m /out/gh > /tmp/gh-buildinfo && \
     grep -E "golang[.]org/x/mod[[:space:]]+v${X_MOD_VERSION}([[:space:]]|$)" \
         /tmp/gh-buildinfo && \
     grep -E "golang[.]org/x/text[[:space:]]+v${X_TEXT_VERSION}([[:space:]]|$)" \
+        /tmp/gh-buildinfo && \
+    grep -E "golang[.]org/x/net[[:space:]]+v${X_NET_VERSION}([[:space:]]|$)" \
         /tmp/gh-buildinfo
 
-FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS yq-builder
+FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS yq-builder
 
 ARG YQ_VERSION=4.53.3
 ARG YQ_COMMIT=1b9b4ac5187171d2e5e3129be0cfa827c7f9d53d
-ARG X_TEXT_VERSION=0.40.0
+ARG X_TEXT_VERSION=0.42.0
+ARG X_NET_VERSION=0.60.0
 ENV CGO_ENABLED=0
 
 WORKDIR /src/yq
@@ -36,18 +41,22 @@ RUN git clone --depth 1 --branch "v${YQ_VERSION}" \
         https://github.com/mikefarah/yq.git . && \
     test "$(git rev-parse HEAD)" = "$YQ_COMMIT" && \
     go get "golang.org/x/text@v${X_TEXT_VERSION}" && \
+    go get "golang.org/x/net@v${X_NET_VERSION}" && \
     go build -trimpath -ldflags="-s -w" -o /out/yq .
 RUN /out/yq --version && \
     go version -m /out/yq > /tmp/yq-buildinfo && \
     grep -E "golang[.]org/x/text[[:space:]]+v${X_TEXT_VERSION}([[:space:]]|$)" \
+        /tmp/yq-buildinfo && \
+    grep -E "golang[.]org/x/net[[:space:]]+v${X_NET_VERSION}([[:space:]]|$)" \
         /tmp/yq-buildinfo
 
-FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS tx-builder
+FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS tx-builder
 
 ARG TX_VERSION=1.6.17
 ARG TX_COMMIT=30dac142446db7bd1919894e9eb93545f58cc980
 ARG GO_GIT_VERSION=5.19.2
-ARG X_CRYPTO_VERSION=0.55.0
+ARG X_CRYPTO_VERSION=0.57.0
+ARG X_NET_VERSION=0.60.0
 ENV CGO_ENABLED=0
 
 WORKDIR /src/tx
@@ -56,6 +65,7 @@ RUN git clone --depth 1 --branch "v${TX_VERSION}" \
     test "$(git rev-parse HEAD)" = "$TX_COMMIT" && \
     go get "github.com/go-git/go-git/v5@v${GO_GIT_VERSION}" && \
     go get "golang.org/x/crypto@v${X_CRYPTO_VERSION}" && \
+    go get "golang.org/x/net@v${X_NET_VERSION}" && \
     go build -p=1 -trimpath \
         -ldflags="-s -w -X github.com/transifex/cli/internal/txlib.Version=v${TX_VERSION}" \
         -o /out/tx .
@@ -64,9 +74,11 @@ RUN /out/tx --version && \
     grep -E "github[.]com/go-git/go-git/v5[[:space:]]+v${GO_GIT_VERSION}([[:space:]]|$)" \
         /tmp/tx-buildinfo && \
     grep -E "golang[.]org/x/crypto[[:space:]]+v${X_CRYPTO_VERSION}([[:space:]]|$)" \
+        /tmp/tx-buildinfo && \
+    grep -E "golang[.]org/x/net[[:space:]]+v${X_NET_VERSION}([[:space:]]|$)" \
         /tmp/tx-buildinfo
 
-FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS gosu-builder
+FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS gosu-builder
 
 ARG GOSU_VERSION=1.19
 ARG GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513
