@@ -291,7 +291,19 @@ def test_bisq_mobile_profile_packages_sanitized_production_shape():
         if locale != "*"
     }
     assert {"de", "es", "fr", "id", "it", "vi"}.issubset(supported_locale_codes)
-    assert semantic_rule_locale_codes <= supported_locale_codes
+    # These packaged recurrence guards are intentionally dormant until the
+    # installation opts into those locales; a rule must not enable a language.
+    optional_rule_ids = {
+        "mobile-pcm-private-chat-known-typo",
+        "mobile-pcm-private-chats-known-typo",
+        "mobile-log-known-stale-hi",
+    }
+    dormant_rules = {
+        rule["id"] for rule in config.get("semantic_quality_rules", [])
+        if set(rule.get("locales", [])) - supported_locale_codes - {"*"}
+    }
+    assert dormant_rules == optional_rule_ids
+    assert semantic_rule_locale_codes - supported_locale_codes == {"pcm", "hi"}
 
 
 def test_docker_compose_mounts_the_selected_profile():
