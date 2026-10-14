@@ -138,7 +138,9 @@ def test_action_runs_quality_gate_before_opening_pr(action):
     semantic_index = gate["run"].index(
         "python -m localize.translation_semantic_reviewer"
     )
-    quality_index = gate["run"].index("python -m localize.cli quality-gate")
+    # Source-only audits need no AI call; the changed-target gate still follows
+    # semantic review and re-staging.
+    quality_index = gate["run"].rindex("python -m localize.cli quality-gate")
     assert semantic_index < quality_index
     assert (
         '--token-usage-summary "$ACTION_QUALITY_REPORT_DIR/token_usage_summary.json"'
