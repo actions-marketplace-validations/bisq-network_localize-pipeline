@@ -495,7 +495,14 @@ def source_affected_translation_entries(
                 previous_values: Dict[str, str] = {}
                 if path in base_paths:
                     snapshot = Path(temporary) / f"source{fmt.file_extension}"
-                    snapshot.write_text(git("show", f"{base}:{path}"), encoding="utf-8")
+                    blob = subprocess.run(
+                        ["git", "show", f"{base}:{path}"], cwd=root, text=False,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                    )
+                    if blob.returncode:
+                        detail = blob.stderr.decode("utf-8", errors="replace").strip()
+                        raise RuntimeError(f"Source-change audit baseline blob is unavailable: {detail}")
+                    snapshot.write_bytes(blob.stdout)
                     _, previous_values = adapter.parse_file(str(snapshot))
                 changed_values = {key: value for key, value in current_values.items()
                                   if previous_values.get(key) != value}

@@ -64,7 +64,7 @@ def _case(tmp_path, case, *, commit_source=True):
     return repo, folder, source, target, config, base
 
 
-def _gate(repo, folder, config, output, *, base=None, changed_files=()):
+def _gate(repo, folder, config, output, *, base=None, changed_files=(), env=None):
     argv = [sys.executable, "-m", "localize.cli", "quality-gate", "--repo-root", str(repo),
             "--input-folder", str(folder), "--config", str(config),
             "--validation-summary", str(output.parent / "missing-summary.json"),
@@ -72,7 +72,7 @@ def _gate(repo, folder, config, output, *, base=None, changed_files=()):
     argv.extend(["--source-diff-base", base or "HEAD"])
     if changed_files:
         argv.extend(["--changed-files", *changed_files])
-    return _run(argv, ROOT, check=False)
+    return _run(argv, ROOT, env=env, check=False)
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -166,7 +166,8 @@ prepare_git_source_diff_base git
     assert json.loads(report.read_text())["semantic_qa"]["errors_count"] == int(blocking)
 
 
-def test_action_hands_committed_source_baseline_to_no_change_gate(tmp_path):
+@pytest.mark.parametrize("zero_base", [False, True])
+def test_action_hands_committed_source_baseline_to_no_change_gate(tmp_path, zero_base):
     repo, _, _, _, config, base = _case(tmp_path, CASES[0])
     raw = yaml.safe_load(config.read_text())
     raw.update(target_project_root=str(repo), input_folder="l10n")
@@ -176,12 +177,16 @@ def test_action_hands_committed_source_baseline_to_no_change_gate(tmp_path):
     env = dict(os.environ, PATH=f"{Path(sys.executable).parent}:{os.environ['PATH']}",
                PYTHONPATH=str(ROOT), TRANSLATOR_CONFIG_FILE=str(config),
                ACTION_QUALITY_REPORT_DIR=str(tmp_path / "reports"),
-               LOCALIZE_ACTION_WORKSPACE=str(repo), DIFF_BASE_INPUT=base)
+               LOCALIZE_ACTION_WORKSPACE=str(repo), DIFF_BASE_INPUT="0" * 40 if zero_base else base)
     result = _run(["bash", "-c", step["run"]], repo, env=env, check=False)
     report = tmp_path / "reports" / "translation_quality_report.json"
     assert report.exists(), result.stdout + result.stderr
-    assert result.returncode == 1
-    assert json.loads(report.read_text())["semantic_qa"]["errors_count"] == 1
+    assert result.returncode == (0 if zero_base else 1)
+    assert json.loads(report.read_text())["semantic_qa"]["errors_count"] == (0 if zero_base else 1)
+    if zero_base:
+        assert "::warning::" in result.stdout
+        assert "committed source changes cannot be audited" in result.stdout
+        assert "only uncommitted source changes are covered" in result.stdout
     assert step["env"]["DIFF_BASE_INPUT"] == "${{ inputs.diff-base }}"
 
 
@@ -230,3 +235,27 @@ def test_unreachable_source_baseline_fails_without_running_shell_text(tmp_path):
     assert not output.exists()
     assert not marker.exists()
     assert "Source-change audit Git context is unavailable" in result.stderr
+
+
+@pytest.mark.parametrize("case", [CASES[0], CASES[2]])
+def test_utf8_baseline_preserves_unchanged_unicode_key_under_ascii_locale(tmp_path, case):
+    repo, folder, source, target, config, _ = _case(tmp_path, case)
+    old = {"remove": "Anyone may remove a record", "café": "Only administrators may remove a record"}
+    _write(source, old, case[0])
+    _write(target, {key: "Jeder darf einen Eintrag entfernen" for key in old}, case[0])
+    _run(["git", "add", "."], repo)
+    _run(["git", "commit", "-qm", "Seed unchanged Unicode source key"], repo)
+    base = _run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+    _write(source, {**old, "remove": old["café"]}, case[0])
+    _run(["git", "add", "."], repo)
+    _run(["git", "commit", "-qm", "Change only the ASCII source key"], repo)
+    env = dict(os.environ, LC_ALL="C", LANG="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+    encoding = _run([sys.executable, "-c", "import locale; print(locale.getencoding())"], ROOT, env=env).stdout
+    assert "utf" not in encoding.lower(), encoding
+    output = tmp_path / "report.json"
+    result = _gate(repo, folder, config, output, base=base, env=env)
+    assert output.exists(), result.stderr
+    assert result.returncode == 1
+    stats = json.loads(output.read_text(encoding="utf-8"))["semantic_qa"]
+    assert stats["errors_count"] == 1
+    assert stats["examples"][0]["key"] == ("/remove" if case[0] == "json" else "remove")

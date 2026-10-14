@@ -410,6 +410,7 @@ runs:
 
         source_diff_base="${DIFF_BASE_INPUT:-HEAD}"
         if [[ "$source_diff_base" =~ ^0+$ ]]; then
+          echo "::warning::All-zero diff base: committed source changes cannot be audited; only uncommitted source changes are covered by the HEAD fallback."
           source_diff_base=HEAD
         fi
         mkdir -p "$ACTION_QUALITY_REPORT_DIR"
