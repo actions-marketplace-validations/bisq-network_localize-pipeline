@@ -6,6 +6,7 @@ import json
 import pytest
 
 from localize.guardian.codex import CodexUsage
+from localize.guardian.diagnostics import failure_audit
 from localize.guardian.models import GuardianMode, RecurrenceCandidate
 from localize.guardian.prevention_runtime import PreventionAuthorResult
 from localize.guardian.project_policy import PolicyProposalError
@@ -210,6 +211,30 @@ def test_unknown_feedback_binding_cannot_spend_model_budget(tmp_path):
         candidate, = kwargs.pop('recurrence_candidates')
         with pytest.raises(PolicyProposalError, match='^Policy feedback binding is unavailable\\.$'):
             coordinator._propose_project_policy(candidate=candidate, **kwargs)
+
+
+def test_private_policy_author_failure_keeps_redacted_contextual_audit(tmp_path):
+    def fail_author(workspace):
+        raise RuntimeError('private-author-output-and-secret')
+
+    with GuardianState(tmp_path / 'state.sqlite3') as state:
+        coordinator, author, kwargs, checks, data = setup(tmp_path, state, mutate=fail_author)
+        with failure_audit(state):
+            result = coordinator.propose(**kwargs)
+        assert result.failures == ('RuntimeError',)
+        assert result.policy_proposals == ()
+        assert author.calls == 1
+        assert state.model_calls_committed_for_day(NOW.date()) == 1
+        failure = state.latest_health('guardian-failure')
+        assert failure is not None
+        assert failure.status == 'failed'
+        assert failure.details['exception'] == 'RuntimeError'
+        assert failure.details['repository'] == kwargs['policy'].base_repo
+        assert failure.details['run_id'] == kwargs['run_id']
+        assert any(':_propose_project_policy:' in location for location in failure.details['locations'])
+        assert 'private-author-output-and-secret' not in json.dumps(failure.details)
+        assert state._connection.execute("SELECT count(*) FROM health WHERE component='guardian-failure'").fetchone()[0] == 1
+        assert not (tmp_path / 'policy-proposals').exists()
 
 
 @pytest.mark.parametrize('malformation', [

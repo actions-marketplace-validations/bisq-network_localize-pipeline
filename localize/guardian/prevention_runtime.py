@@ -4979,6 +4979,8 @@ class PreventionCoordinator:
                     PreventionLeaseLostError, PollDeadlineExceeded):
                 raise
             except Exception as exc:
+                record_failure(exc, repository=getattr(kwargs.get('policy'), 'base_repo', None),
+                               run_id=kwargs.get('run_id'))
                 failures.append(type(exc).__name__)
         remaining = tuple(candidate for candidate in recurrence_candidates if candidate.scope != 'project_config')
         # A project-only batch cannot instantiate a publication broker, check out code,
