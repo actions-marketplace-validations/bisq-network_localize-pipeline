@@ -8949,20 +8949,21 @@ class GuardianState:
         if evidence_status not in {"needs_operator_review", "evidence_incomplete", "declined"}:
             raise ValueError("Project-policy proposal evidence status is invalid.")
         with self._connection:
-            existing = self._connection.execute(
-                """SELECT 1 FROM actions WHERE event_revision_id = ?
-                   AND action = 'project_policy_proposal'
-                   AND json_extract(details_json, '$.proposal_id') = ? LIMIT 1""",
-                (event_revision_id, proposal_id),
-            ).fetchone()
-            if existing is None:
-                self.record_action(
-                    run_id=run_id, event_revision_id=event_revision_id,
-                    action="project_policy_proposal", status="pending",
-                    details={"proposal_id": proposal_id, "path": path,
-                             "outcome": evidence_status, "decision_required": True},
-                    occurred_at=occurred_at,
-                )
+            self._connection.execute(
+                """INSERT INTO actions (
+                       run_id, event_revision_id, action, status, details_json, occurred_at
+                   )
+                   SELECT ?, ?, 'project_policy_proposal', 'pending', ?, ?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM actions WHERE event_revision_id = ?
+                       AND action = 'project_policy_proposal'
+                       AND json_extract(details_json, '$.proposal_id') = ?
+                   )""",
+                (run_id, event_revision_id,
+                 _canonical_json({"proposal_id": proposal_id, "path": path,
+                                  "outcome": evidence_status, "decision_required": True}),
+                 _serialize_datetime(occurred_at), event_revision_id, proposal_id),
+            )
 
     def latest_feedback_report(
         self,

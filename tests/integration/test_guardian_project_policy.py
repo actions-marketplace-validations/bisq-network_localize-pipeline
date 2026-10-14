@@ -8,6 +8,7 @@ import pytest
 from localize.guardian.codex import CodexUsage
 from localize.guardian.models import GuardianMode, RecurrenceCandidate
 from localize.guardian.prevention_runtime import PreventionAuthorResult
+from localize.guardian.project_policy import PolicyProposalError
 from localize.guardian.state import GuardianState
 from tests.unit.test_guardian_project_policy import corpus, manifest
 from tests.unit.test_guardian_prevention_runtime import (
@@ -203,9 +204,41 @@ def test_unknown_feedback_binding_cannot_spend_model_budget(tmp_path):
         kwargs['recurrence_candidates'] = (replace(kwargs['recurrence_candidates'][0],
                                                    evidence_feedback_ids=('review_comment:99',)),)
         result = coordinator.propose(**kwargs)
-        assert result.failures
+        assert result.failures == ('PolicyProposalError',)
         assert author.calls == 0
         assert state.model_calls_committed_for_day(NOW.date()) == 0
+        candidate, = kwargs.pop('recurrence_candidates')
+        with pytest.raises(PolicyProposalError, match='^Policy feedback binding is unavailable\\.$'):
+            coordinator._propose_project_policy(candidate=candidate, **kwargs)
+
+
+@pytest.mark.parametrize('malformation', [
+    'list', 'null', 'string', 'missing_status', 'unknown_status', 'list_status', 'dict_status',
+])
+def test_malformed_existing_policy_artifact_cannot_recover_audit(tmp_path, malformation):
+    with GuardianState(tmp_path / 'state.sqlite3') as state:
+        coordinator, author, kwargs, checks, data = setup(tmp_path, state)
+        assert coordinator.propose(**kwargs).failures == ()
+        proposal = next((tmp_path / 'policy-proposals').glob('*/proposal.json'))
+        payload = json.loads(proposal.read_text())
+        if malformation == 'missing_status':
+            del payload['status']
+        elif malformation.endswith('_status'):
+            payload['status'] = {'unknown_status': 'approved', 'list_status': [], 'dict_status': {}}[malformation]
+        else:
+            payload = {'list': [], 'null': None, 'string': 'not an artifact'}[malformation]
+        proposal.write_text(json.dumps(payload))
+        state._connection.execute("DELETE FROM actions WHERE action='project_policy_proposal'")
+        state._connection.execute("DELETE FROM health WHERE component='project-policy'")
+        state._connection.commit()
+
+        replay = coordinator.propose(**kwargs)
+        assert replay.failures == ('PolicyProposalError',)
+        assert replay.policy_proposals == ()
+        assert author.calls == 1
+        assert state.model_calls_committed_for_day(NOW.date()) == 1
+        assert state.latest_health('project-policy') is None
+        assert state._connection.execute("SELECT count(*) FROM actions WHERE action='project_policy_proposal'").fetchone()[0] == 0
 
 
 @pytest.fixture

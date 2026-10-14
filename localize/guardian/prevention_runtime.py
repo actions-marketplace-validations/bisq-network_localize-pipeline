@@ -4850,7 +4850,10 @@ class PreventionCoordinator:
         feedback_ids = candidate.evidence_feedback_ids
         if not 1 <= len(feedback_ids) <= _MAX_EVIDENCE_IDS_PER_CANDIDATE or len(set(feedback_ids)) != len(feedback_ids):
             raise PolicyProposalError('Policy evidence exceeds its bounded workset.')
-        bindings = tuple((feedback_id, evidence_revision_ids[feedback_id]) for feedback_id in feedback_ids)
+        try:
+            bindings = tuple((feedback_id, evidence_revision_ids[feedback_id]) for feedback_id in feedback_ids)
+        except KeyError as exc:
+            raise PolicyProposalError('Policy feedback binding is unavailable.') from exc
         if any(revision not in source_ids for _, revision in bindings):
             raise PolicyProposalError('Policy evidence is outside source authority.')
         self.state.validate_prevention_evidence_bindings(
@@ -4883,6 +4886,9 @@ class PreventionCoordinator:
             raise PolicyProposalError('Policy proposal destination is unsafe.')
         if destination.exists():
             prior = loads_bounded_json(_read_regular(destination / 'proposal.json', 1024 * 1024))
+            if (not isinstance(prior, dict)
+                    or prior.get('status') not in ('needs_operator_review', 'evidence_incomplete', 'declined')):
+                raise PolicyProposalError('Existing policy proposal has an invalid status or structure.')
             if prior.get('identity') != identity:
                 raise PolicyProposalError('Existing policy proposal has a different identity.')
             verify_policy_config(context)
