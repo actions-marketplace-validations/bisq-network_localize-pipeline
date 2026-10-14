@@ -879,6 +879,7 @@ stage_and_submit_batch() {
         --validation-summary "$VALIDATION_SUMMARY"
         --output-json "$QUALITY_REPORT_JSON"
         --output-markdown "$QUALITY_REPORT_MD"
+        --source-diff-base "${TRANSLATION_DIFF_BASE:-HEAD}"
     )
     if [ -n "$QUALITY_AUDIT_SCOPE" ]; then
         QUALITY_GATE_CMD+=(--audit-scope "$QUALITY_AUDIT_SCOPE")
@@ -1215,6 +1216,20 @@ if [ -n "$TRANSLATION_CHANGES" ]; then
         fi
     fi
 else
+    if [ -n "${TRANSLATION_DIFF_BASE:-}" ]; then
+        # Committed source edits may leave every target unchanged. Audit the
+        # existing targets before allowing this run to advance its source base.
+        (
+            cd "$app_root" && python3 -m localize.translation_quality_gate \
+                --repo-root "$TARGET_PROJECT_ROOT" \
+                --input-folder "$ABSOLUTE_INPUT_FOLDER" \
+                --config "$CONFIG_FILE" \
+                --validation-summary "$app_root/logs/translation_validation_summary.json" \
+                --output-json "$app_root/logs/translation_quality_report-source-changes.json" \
+                --output-markdown "$app_root/logs/translation_quality_report-source-changes.md" \
+                --source-diff-base "$TRANSLATION_DIFF_BASE"
+        ) || return 1
+    fi
     log "No git-scoped translation file changes detected; nothing to commit"
 fi
 }

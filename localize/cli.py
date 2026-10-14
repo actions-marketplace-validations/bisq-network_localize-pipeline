@@ -372,8 +372,11 @@ def _cmd_quality_gate(args: argparse.Namespace) -> int:
     ]
     if args.audit_scope:
         quality_args.extend(["--audit-scope", args.audit_scope])
-    quality_args.append("--changed-files")
-    quality_args.extend(args.changed_files)
+    if args.source_diff_base:
+        quality_args.extend(["--source-diff-base", args.source_diff_base])
+    if args.changed_files:
+        quality_args.append("--changed-files")
+        quality_args.extend(args.changed_files)
     return int(translation_quality_gate_main(quality_args))
 
 
@@ -653,7 +656,8 @@ def _build_parser() -> argparse.ArgumentParser:
     quality_parser.add_argument("--validation-summary", required=True)
     quality_parser.add_argument("--output-json", required=True)
     quality_parser.add_argument("--output-markdown", required=True)
-    quality_parser.add_argument("--changed-files", nargs="+", required=True)
+    quality_parser.add_argument("--changed-files", nargs="+", default=[])
+    quality_parser.add_argument("--source-diff-base", help="Trusted Git baseline for configured rules on source-affected targets.")
     quality_parser.add_argument("--audit-scope", choices=["changed", "all"], default=None)
     quality_parser.set_defaults(func=_cmd_quality_gate)
 

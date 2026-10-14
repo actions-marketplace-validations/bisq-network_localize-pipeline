@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import (
@@ -24,6 +25,7 @@ from typing import (
 import yaml
 
 from localize.ignore_keys import compile_ignore_key_patterns, is_ignored_key
+from localize.localization_adapters import get_localization_adapter
 from localize.localization_formats import (
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,
@@ -45,6 +47,8 @@ from localize.semantic_quality import (
     SemanticRule,
     TranslationChange,
     analyze_translation_changes,
+    evaluate_retained_source_words,
+    evaluate_semantic_rules,
     iter_all_translation_entries,
     iter_translation_changes_from_diff,
     load_semantic_rules,
@@ -416,6 +420,7 @@ def analyze_semantic_qa_changes_for_profiles(
     localization_profiles: Sequence[LocalizationProfile] = (),
     examples_limit: int = 10,
     ignore_key_patterns: Sequence[Pattern[str]] = (),
+    source_affected_changes: Sequence[TranslationChange] = (),
 ) -> SemanticQAStats:
     """Scan changed translations across all configured format/layout profiles."""
     changes = _deduplicate_translation_changes(
@@ -427,13 +432,99 @@ def analyze_semantic_qa_changes_for_profiles(
             localization_profiles=localization_profiles,
         )
     )
-    return analyze_translation_changes(
-        changes=list(_filter_ignored_changes(changes, ignore_key_patterns)),
-        semantic_rules=semantic_rules,
-        brand_glossary=brand_glossary,
-        retained_source_word_allowlist=retained_source_word_allowlist,
-        examples_limit=examples_limit,
+    changes = list(_filter_ignored_changes(changes, ignore_key_patterns))
+    rule_changes = _deduplicate_translation_changes(
+        _filter_ignored_changes([*changes, *source_affected_changes], ignore_key_patterns)
     )
+    findings = evaluate_semantic_rules(rule_changes, semantic_rules)
+    findings.extend(evaluate_retained_source_words(
+        changes, brand_glossary,
+        retained_source_word_allowlist=retained_source_word_allowlist,
+    ))
+    return SemanticQAStats.from_findings(findings, examples_limit=examples_limit)
+
+
+def source_affected_translation_entries(
+    repo_root: str,
+    input_folder: str,
+    locale_codes: Sequence[str],
+    localization_profiles: Sequence[LocalizationProfile],
+    source_diff_base: str,
+) -> List[TranslationChange]:
+    """Map source-value changes since a trusted Git baseline to current targets.
+
+    Compare parsed complete files, rather than added diff lines, so continuation
+    edits and nested JSON changes retain their actual entry identities.
+    """
+    root = Path(repo_root).resolve()
+    folder = Path(input_folder).resolve()
+    relative = folder.relative_to(root).as_posix()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=root, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Source-change audit Git context is unavailable: {result.stderr.strip()}")
+        return result.stdout
+
+    base = git("rev-parse", "--verify", "--end-of-options", f"{source_diff_base}^{{commit}}").strip()
+    base = git("merge-base", base, "HEAD").strip()
+    changed_paths = git(
+        "diff", "--name-only", "-z", "--diff-filter=ACMRT", "--no-ext-diff",
+        base, "--", relative,
+    ).split("\0")
+    if not any(changed_paths):
+        return []
+    base_paths = set(git("ls-tree", "-r", "--name-only", "-z", base, "--", relative).split("\0"))
+    affected: List[TranslationChange] = []
+    with tempfile.TemporaryDirectory(prefix="localize-source-audit-") as temporary:
+        for profile in dict.fromkeys(localization_profiles):
+            fmt, layout = profile.localization_format, profile.localization_layout
+            adapter = get_localization_adapter(fmt)
+            source_changes: Dict[str, Dict[str, str]] = {}
+            for path in changed_paths:
+                if not path:
+                    continue
+                source = root / path
+                source_rel = source.relative_to(folder)
+                if "archive" in source_rel.parts or not layout.is_source_file(source_rel.as_posix(), locale_codes, fmt):
+                    continue
+                _, current_values = adapter.parse_file(str(source))
+                previous_values: Dict[str, str] = {}
+                if path in base_paths:
+                    snapshot = Path(temporary) / f"source{fmt.file_extension}"
+                    blob = subprocess.run(
+                        ["git", "show", f"{base}:{path}"], cwd=root, text=False,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                    )
+                    if blob.returncode:
+                        detail = blob.stderr.decode("utf-8", errors="replace").strip()
+                        raise RuntimeError(f"Source-change audit baseline blob is unavailable: {detail}")
+                    snapshot.write_bytes(blob.stdout)
+                    _, previous_values = adapter.parse_file(str(snapshot))
+                changed_values = {key: value for key, value in current_values.items()
+                                  if previous_values.get(key) != value}
+                if changed_values:
+                    source_changes[source_rel.as_posix()] = changed_values
+            if not source_changes:
+                continue
+            for target in sorted(folder.rglob(f"*{fmt.file_extension}")):
+                target_rel = target.relative_to(folder)
+                if "archive" in target_rel.parts or not layout.is_target_file(target_rel.as_posix(), locale_codes, fmt):
+                    continue
+                source_rel = layout.source_path_for_target(target_rel.as_posix(), locale_codes, fmt)
+                changed_values = source_changes.get(source_rel)
+                if not changed_values:
+                    continue
+                _, targets = adapter.parse_file(str(target))
+                locale = layout.extract_locale(target_rel.as_posix(), locale_codes, fmt) or ""
+                affected.extend(TranslationChange(
+                    file=target_rel.as_posix(), locale_code=locale, key=key,
+                    source_value=value, old_value=None, new_value=targets[key],
+                ) for key, value in changed_values.items() if key in targets)
+    return _deduplicate_translation_changes(affected)
 
 
 def analyze_all_translation_entries_for_profiles(
@@ -1049,6 +1140,8 @@ def render_quality_gate_markdown(report: Dict[str, Any]) -> str:
 
 
 def get_staged_diff(repo_root: str, changed_files: Sequence[str]) -> str:
+    if not changed_files:
+        return ""
     result = subprocess.run(
         [
             "git",
@@ -1094,9 +1187,13 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument("--validation-summary", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-markdown", required=True)
-    parser.add_argument("--changed-files", nargs="+", required=True)
+    parser.add_argument("--changed-files", nargs="+", default=[])
+    parser.add_argument("--source-diff-base", help="Trusted Git baseline for configured rules on source-affected targets.")
     parser.add_argument("--audit-scope", choices=["changed", "all"], default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.changed_files and not args.source_diff_base:
+        parser.error("provide --changed-files or --source-diff-base")
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1131,6 +1228,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ignore_key_patterns=config.ignore_key_patterns,
         )
     else:
+        source_affected_changes = (
+            source_affected_translation_entries(
+                args.repo_root, args.input_folder, locale_codes,
+                localization_profiles, args.source_diff_base,
+            ) if semantic_rules and args.source_diff_base else []
+        )
         semantic_stats = analyze_semantic_qa_changes_for_profiles(
             diff_text=diff_text,
             repo_root=args.repo_root,
@@ -1141,6 +1244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             retained_source_word_allowlist=config.retained_source_word_allowlist,
             localization_profiles=localization_profiles,
             ignore_key_patterns=config.ignore_key_patterns,
+            source_affected_changes=source_affected_changes,
         )
     report = build_quality_gate_report(
         source_stats=source_stats,
