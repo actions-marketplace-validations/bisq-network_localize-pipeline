@@ -1021,6 +1021,88 @@ instead of cutting through a Unicode character or Markdown item.
 Do not use prevention PRs for project terminology or locale style that belongs
 in the consuming project's own config or glossary.
 
+### Private installation-policy proposals
+
+In `propose-prevention` mode, a `project_config` recurrence candidate now uses a
+separate private proposal route. It never constructs the pipeline publication
+broker, checks out the pipeline repository, signs, pushes, opens a PR, or changes
+the active installation config. The existing prevention model/effort,
+credential-free author sandbox, per-poll authoring cap and shared daily model-call
+and API-cost reservations still apply. The configured prevention authoring policy
+and a trusted localization corpus are required; lower modes do not author policy.
+Observations are selected by the exact feedback locale/file before request limits.
+Exact keys or full source/target values mentioned in feedback narrow large files;
+if bounded evidence cannot identify a usable scope, authoring is held without
+silently truncating the corpus or spending a model call.
+
+The first supported policy is an exact known-bad translation denial: one configured
+locale, one exact key, one exact source value, and one complete forbidden target
+value. The model supplies only bounded literal JSON. Trusted code generates
+anchored escaped regexes for the existing `semantic_quality_rules` evaluator.
+Keys/locales containing glob metacharacters are currently unsupported and fail
+closed. Arbitrary regexes, Python, glossary updates, deletions of existing rules,
+and changes to authentication, signing, Guardian authority or publication policy
+are outside this route. Source changes revoke a rule's match.
+
+Review artifacts live below `.guardian/policy-proposals/<digest>/` beside the
+Guardian state database. `guardian status` shows the latest recorded proposal's
+path and evidence status. `proposal.yaml` is an **append-only fragment**, not a
+replacement configuration. `proposal.json` records repository identity, exact
+feedback revisions and source SHAs, the trusted configuration bundle and byte
+digests, selected model, and controller-computed fixture results. `README.md`
+explains the review/apply handoff. Files remain private (`0600` inside `0700`
+directories). Repeated identical evidence/configuration reuses its existing
+proposal without spending another model call. The audit action remains pending;
+it cannot resolve a maintainer terminology decision or terminalize feedback.
+
+`needs_operator_review` means the literal rule rejects an independently captured
+original target and passes an explicit operator-accepted source-identical control
+from `accepted_source_identical_translations`. It does not establish linguistic
+correctness or approve deployment. Current text is never assumed correct merely
+because it is current. Missing original or accepted-control evidence yields
+`evidence_incomplete`, with the missing evidence visible in fixture results;
+reviewers must supply independent original/corrected controls before approval.
+An author may also produce a recorded `declined` proposal without policy rules.
+Historical assessment uses current-base observations, so an already-fixed
+historical defect may correctly lack original-case evidence.
+
+Before applying any fragment, the operator must compare its recorded configuration
+bundle and byte digests with the currently selected installation config; a changed
+configuration makes the draft stale and requires regeneration. `config_digest`
+hashes the exact captured YAML bytes: the corpus copies them unchanged from the
+trusted operator/base snapshot. `bundle_digest` additionally binds the resolved
+glossary and its relative path. A read-only check using the installed venv is:
+
+```bash
+# ROOT is the private Guardian YAML directory in operator mode, or a freshly
+# verified exact trusted base checkout in base mode. PROPOSAL is proposal.json.
+/path/to/venv/bin/python - "$ROOT" "$PROPOSAL" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+from localize.guardian.controller import _base_pipeline_config_bundle_digest, _trusted_file
+root, proposal = map(Path, sys.argv[1:])
+record = json.loads(proposal.read_text())
+config_path = _trusted_file(root, record["config_path"])
+assert hashlib.sha256(config_path.read_bytes()).hexdigest() == record["identity"]["config_digest"], "stale config"
+assert _base_pipeline_config_bundle_digest(config_root=root, config_relative_path=record["config_path"]) == record["identity"]["bundle_digest"], "stale bundle"
+print("Config bytes and bundle match; operator approval and source review still required.")
+PY
+```
+
+The controller revalidates source authority and its immutable config snapshot before saving a
+draft; it does not claim that a later active installation is unchanged. Apply
+approved rules through the consuming project's existing profile/config deployment
+path and separately verify the effective translator and Guardian config snapshots.
+There is no automatic apply command or new GitHub publication authority.
+
+Classification remains model-assessed. A repeated project label or spelling choice
+is `project_config`, not a generic engine defect merely because several keys repeat
+it. The generic author is instructed to explain reusable engine behavior and
+replay the original case plus independently accepted corrected controls; its own
+synthetic red/green tests alone cannot establish semantic acceptance. Existing
+code-patch, sandbox, regression, real-data and publication gates remain in force;
+these instructions do not claim a deterministic proof of semantic genericness.
+
 An ordinary prevention-draft failure or exhausted draft slot does not block an
 otherwise authorized correction on an open translation PR. The signed
 correction and pending prevention work are recorded separately; later polls

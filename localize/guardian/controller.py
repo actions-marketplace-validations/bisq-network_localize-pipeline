@@ -469,6 +469,8 @@ class PreventionRunner(Protocol):
             [Sequence[HistoricalPullReference], Sequence[int]], None
         ]
         | None = None,
+        real_data: RealDataCorpus | None = None,
+        policy_config_digest: str | None = None,
     ) -> PreventionBatchOutcome: ...
 
 
@@ -558,6 +560,7 @@ class PollOutcome:
     prevention_items_skipped: int = 0
     prevention_items_deferred: int = 0
     prevention_failures: tuple[str, ...] = ()
+    project_policy_proposals: tuple[str, ...] = ()
     remediation_drafts_created: int = 0
     remediation_items_deferred: int = 0
     remediation_failures: tuple[str, ...] = ()
@@ -590,6 +593,7 @@ class _PollAccumulator:
     prevention_items_skipped: int = 0
     prevention_items_deferred: int = 0
     prevention_failures: list[str] = field(default_factory=list)
+    project_policy_proposals: list[str] = field(default_factory=list)
     remediation_drafts_created: int = 0
     remediation_items_deferred: int = 0
     remediation_failures: list[str] = field(default_factory=list)
@@ -623,6 +627,7 @@ class _PollAccumulator:
             prevention_items_skipped=self.prevention_items_skipped,
             prevention_items_deferred=self.prevention_items_deferred,
             prevention_failures=tuple(self.prevention_failures),
+            project_policy_proposals=tuple(self.project_policy_proposals),
             remediation_drafts_created=self.remediation_drafts_created,
             remediation_items_deferred=self.remediation_items_deferred,
             remediation_failures=tuple(self.remediation_failures),
@@ -4894,6 +4899,7 @@ class GuardianController:
                         require_exact_sources_still_closed
                     ),
                     real_data=real_data,
+                    policy_config_digest=impact_scope.config_bundle_digest,
                 )
         except CodexAuthenticationError:
             raise _AuthenticationCircuit from None
@@ -6836,6 +6842,7 @@ class GuardianController:
                                 )
                             ),
                             real_data=real_data,
+                            policy_config_digest=scope.config_bundle_digest,
                         )
                 except CodexAuthenticationError:
                     self._fail_actions(
@@ -7059,6 +7066,7 @@ class GuardianController:
         outcome.prevention_items_skipped += result.skipped
         outcome.prevention_items_deferred += result.deferred
         outcome.prevention_failures.extend(result.failures)
+        outcome.project_policy_proposals.extend(result.policy_proposals)
 
     def _require_live_lease(self, owner: str) -> None:
         if self.deadline is not None:

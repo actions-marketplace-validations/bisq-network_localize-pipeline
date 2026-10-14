@@ -1761,6 +1761,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             snapshot = None if state is None else state.status_snapshot(mode=config.mode)
             reporting = (0, 0) if state is None else state.feedback_reporting_counts()
             diagnostic = None if state is None else state.latest_health("guardian-failure")
+            policy_proposal = None if state is None else state.latest_health("project-policy")
     except Exception:
         print("error: Guardian state is unavailable or invalid.", file=sys.stderr)
         return 1
@@ -1773,6 +1774,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if diagnostic is not None:
         print(f"last failure diagnostic: #{diagnostic.health_id} at {diagnostic.checked_at.isoformat()}")
         print(json.dumps(diagnostic.details, sort_keys=True))
+    if policy_proposal is not None:
+        print(f"latest private project-policy proposal: {policy_proposal.details.get('path', 'unavailable')}")
+        print(f"proposal evidence: {policy_proposal.details.get('status', 'unknown')}; operator review required")
     print(f"pending feedback revisions: {snapshot.pending_revisions}")
     print(f"pending explanation acknowledgements: {reporting[0]}")
     print(f"recorded maintainer decisions: {reporting[1]}")

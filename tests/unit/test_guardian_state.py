@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -807,6 +809,52 @@ def _event(
             f"https://github.test/{repository}/pull/{pr_number}#discussion_r{event_id}"
         ),
     )
+
+
+def test_project_policy_proposal_concurrent_recovery_is_atomic(tmp_path, monkeypatch):
+    database = tmp_path / 'guardian.sqlite3'
+    occurred_at = datetime(2026, 8, 30, 12, tzinfo=timezone(timedelta(hours=2)))
+    with GuardianState(database) as state:
+        revision_id = state.record_feedback_event(_event()).revision_id
+        run_id = state.start_run(repository='acme/widgets', locale='ru',
+                                 mode=GuardianMode.PROPOSE_PREVENTION)
+    ready = Barrier(2)
+    split_insert = Barrier(2)
+    original_record_action = GuardianState.record_action
+
+    def synchronize_split_insert(self, **kwargs):
+        # Expose the old SELECT/record_action race deterministically. Atomic SQL
+        # never enters this split insertion path.
+        split_insert.wait(timeout=10)
+        return original_record_action(self, **kwargs)
+
+    monkeypatch.setattr(GuardianState, 'record_action', synchronize_split_insert)
+
+    def recover():
+        with GuardianState(database) as state:
+            ready.wait(timeout=10)
+            state.record_project_policy_proposal(
+                run_id=run_id, event_revision_id=revision_id, proposal_id='a' * 64,
+                path='/private/policy/café', evidence_status='needs_operator_review',
+                occurred_at=occurred_at,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(recover) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=20)
+    with GuardianState(database) as state:
+        rows = state._connection.execute(
+            "SELECT run_id,event_revision_id,status,details_json,occurred_at FROM actions "
+            "WHERE action='project_policy_proposal'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert tuple(rows[0]) == (
+            run_id, revision_id, 'pending',
+            '{"decision_required":true,"outcome":"needs_operator_review",'
+            '"path":"/private/policy/café","proposal_id":"' + 'a' * 64 + '"}',
+            '2026-08-30T10:00:00.000000Z',
+        )
 
 
 def test_policy_rejections_only_resolve_the_same_effective_policy(
