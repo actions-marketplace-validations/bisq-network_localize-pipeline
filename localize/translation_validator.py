@@ -94,10 +94,23 @@ def _glossary_term_pattern(term: str) -> re.Pattern[str]:
     return re.compile(prefix + re.escape(term) + suffix, re.IGNORECASE)
 
 
+def _normalize_glossary_whitespace(value: str) -> str:
+    """Treat Java whitespace escapes as separators, preserving literal slashes."""
+    whitespace = {"n": "\n", "r": "\r", "t": "\t"}
+
+    def replace(match: re.Match[str]) -> str:
+        slashes = match.group(1)
+        return slashes[:-1] + whitespace[match.group(2)] if len(slashes) % 2 else match.group(0)
+
+    return re.sub(r"(\\+)([nrt])", replace, value)
+
+
 def find_glossary_mismatches(
     source_value: str,
     target_value: str,
     glossary: Mapping[str, str],
+    *,
+    decode_properties_whitespace: bool = False,
 ) -> List[Tuple[str, str]]:
     """Return applicable EN→target mappings missing from ``target_value``.
 
@@ -105,7 +118,13 @@ def find_glossary_mismatches(
     source terms overlap, the longest term wins so a phrase such as
     ``AI functionality`` does not also require the standalone ``functionality``
     mapping.
+
+    Opt in to whitespace escape decoding only for raw Java Properties values.
+    Decoded formats such as JSON can contain literal backslash+n text.
     """
+    if decode_properties_whitespace:
+        source_value = _normalize_glossary_whitespace(source_value)
+        target_value = _normalize_glossary_whitespace(target_value)
     candidates: List[Tuple[int, int, str, str]] = []
     for source_term, target_term in glossary.items():
         if not source_term or not target_term:
