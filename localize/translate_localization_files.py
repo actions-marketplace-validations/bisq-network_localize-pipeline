@@ -43,7 +43,7 @@ from localize.localization_adapters import (
     get_localization_adapter,
     lint_properties_file as lint_properties_file,
 )
-from localize.localization_formats import LocalizationFormat
+from localize.localization_formats import JAVA_PROPERTIES_FORMAT, LocalizationFormat
 from localize.localization_layouts import LocalizationLayout
 from localize.localization_profiles import LocalizationProfile
 from localize.model_provider import OpenAICompatibleProvider
@@ -1283,6 +1283,7 @@ def run_post_translation_validation(
                     source_value,
                     target_value,
                     translation_glossary,
+                    decode_properties_whitespace=effective_format.id == JAVA_PROPERTIES_FORMAT.id,
                 )
                 if glossary_mismatches:
                     required = ", ".join(
@@ -1338,6 +1339,7 @@ def run_per_key_validation_with_summary(
         selected_keys: Optional[Set[str]] = None,
         locale: str = "",
         accepted_source_identical_translations: Optional[Mapping[str, Mapping[str, str]]] = None,
+        decode_properties_whitespace: bool = False,
 ) -> Tuple[Dict[str, str], Dict[str, object]]:
     """
     Validates each translation key individually and selectively reverts failed keys.
@@ -1357,6 +1359,8 @@ def run_per_key_validation_with_summary(
             previous target are unchanged.
         selected_keys: Keys translated in this run. Source echoes for these
             keys stay failed even if the original target was also the source.
+        decode_properties_whitespace: Treat raw Java Properties whitespace
+            escapes as separators in glossary checks; leave false for decoded formats.
 
     Returns:
         Tuple containing:
@@ -1439,6 +1443,7 @@ def run_per_key_validation_with_summary(
             source_value,
             target_value,
             translation_glossary,
+            decode_properties_whitespace=decode_properties_whitespace,
         )
         if glossary_mismatches:
             failed_keys.append(key)
@@ -1754,11 +1759,19 @@ def _prefer_glossary_compliant_draft(
     draft_value: str,
     reviewed_value: str,
     translation_glossary: Mapping[str, str],
+    *,
+    decode_properties_whitespace: bool = False,
 ) -> str:
     """Keep a compliant draft when holistic review breaks a required mapping."""
     if (
-        find_glossary_mismatches(source_value, reviewed_value, translation_glossary)
-        and not find_glossary_mismatches(source_value, draft_value, translation_glossary)
+        find_glossary_mismatches(
+            source_value, reviewed_value, translation_glossary,
+            decode_properties_whitespace=decode_properties_whitespace,
+        )
+        and not find_glossary_mismatches(
+            source_value, draft_value, translation_glossary,
+            decode_properties_whitespace=decode_properties_whitespace,
+        )
     ):
         return draft_value
     return reviewed_value
@@ -3005,6 +3018,7 @@ async def process_translation_queue(
                                 draft_translations.get(key, ""),
                                 value,
                                 enforced_language_glossary,
+                                decode_properties_whitespace=localization_format.id == JAVA_PROPERTIES_FORMAT.id,
                             )
                             if selected_value != value:
                                 logger.warning(
@@ -3115,6 +3129,7 @@ async def process_translation_queue(
                 selected_keys=set(keys_to_translate),
                 locale=language_code,
                 accepted_source_identical_translations=ACCEPTED_SOURCE_IDENTICAL_TRANSLATIONS,
+                decode_properties_whitespace=localization_format.id == JAVA_PROPERTIES_FORMAT.id,
             )
             failed_keys = set(per_key_summary["failed_keys"]).union(model_failed_keys)
             increment_run_metric(run_metrics, "model_translation_failed_count", len(failed_keys))
