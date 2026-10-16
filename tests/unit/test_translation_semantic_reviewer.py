@@ -1290,3 +1290,24 @@ def test_semantic_calibration_allows_clean_results_without_dropping_real_errors(
     findings = normalize_review_response(json.dumps(response), changes)
     assert [row["key"] for row in findings] == [row["key"] for row in expected]
     assert all(row["severity"] == "error" for row in findings)
+
+
+def test_semantic_suggestion_representation_is_properties_only():
+    changes = [
+        TranslationChange("messages_de.properties", "de", "properties.key", r"First\nSecond", None, r"Erste\nZweite"),
+        TranslationChange("messages_de.json", "de", "/json.key", "First\nSecond", None, "Erste\nZweite"),
+    ]
+    messages = build_semantic_review_messages("German", changes, [], [])
+    payload = json.loads(messages[1]["content"])
+    assert payload["properties_suggestion_example"] == r"First line\nSecond line"
+    assert "never actual CR/LF" in messages[0]["content"]
+    assert "native value representation for other file formats" in messages[0]["content"]
+    assert payload["changes"][1]["new_target_value"] == "Erste\nZweite"
+    response = {"findings": [
+        {"file": change.file, "key": change.key, "severity": "error", "reason": "Changed meaning.",
+         "suggested_value": target}
+        for change, target in zip(changes, [r"Erste\nZweite", "Erste\nZweite"])
+    ]}
+    findings = normalize_review_response(json.dumps(response), changes)
+    assert findings[0]["suggested_value"] == r"Erste\nZweite"
+    assert findings[1]["suggested_value"] == "Erste\nZweite"

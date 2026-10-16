@@ -122,6 +122,10 @@ def build_semantic_review_messages(
         "every condition or threshold attached to that event. Report an error if the target "
         "omits or changes an action trigger, even when it preserves a numeric threshold. "
         "Do not flag a paraphrase that preserves both the trigger and its conditions. "
+        "For .properties files, keep suggested_value on one physical line: represent "
+        "value whitespace with literal backslash escapes such as \\n, \\r, or \\t, "
+        "never actual CR/LF characters. This rule applies only to .properties; preserve "
+        "the native value representation for other file formats. "
         f"Keep suggested_value under {SEMANTIC_REVIEW_SUGGESTED_VALUE_MAX_CHARS} characters."
     )
     user_payload = {
@@ -131,6 +135,7 @@ def build_semantic_review_messages(
         "brand_glossary": list(brand_glossary),
         "allowed_severities": ["error", "warning"],
         "no_issues_response": {"findings": []},
+        "properties_suggestion_example": r"First line\nSecond line",
         "response_schema": {
             "findings": [
                 {
