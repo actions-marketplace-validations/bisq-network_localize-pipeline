@@ -375,7 +375,8 @@ if [ "$(id -u)" -ne 0 ]; then
 
     log "Using remote: ${REMOTE}"
     log "Fetching latest changes from ${REMOTE}..."
-    git fetch --prune --tags "$REMOTE"
+    # Translation tracks branches; upstream release tags may be replaced.
+    git fetch --prune --no-tags "$REMOTE"
 
     DEFAULT_BRANCH="${TARGET_BRANCH_FOR_PR:-}"
     if [ -z "$DEFAULT_BRANCH" ]; then

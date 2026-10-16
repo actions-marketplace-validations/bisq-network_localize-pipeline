@@ -708,7 +708,7 @@ log "Using default branch: ${DEFAULT_BRANCH}"
 # Reset the repository to a clean state to avoid any conflicts or leftover files.
 log "Resetting local repository to a clean state against ${REMOTE}/${DEFAULT_BRANCH} in $TARGET_PROJECT_ROOT"
 # Fetch the latest from the determined remote to ensure our reference is current.
-git fetch "${REMOTE}"
+git fetch --no-tags "${REMOTE}"
 # Save current branch before switching to default
 ORIGINAL_BRANCH=$(git branch --show-current || true)
 log "Current branch: $ORIGINAL_BRANCH"
@@ -821,7 +821,7 @@ stage_and_submit_batch() {
         return 1
     fi
 
-    git fetch "$REMOTE" "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/${REMOTE}/${DEFAULT_BRANCH}" \
+    git fetch --no-tags "$REMOTE" "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/${REMOTE}/${DEFAULT_BRANCH}" \
       || log "Warning: failed to fetch $REMOTE/$DEFAULT_BRANCH before branch checkout." "WARNING"
     git checkout -B "$branch" "${REMOTE}/${DEFAULT_BRANCH}"
     if ! git reset -q; then
