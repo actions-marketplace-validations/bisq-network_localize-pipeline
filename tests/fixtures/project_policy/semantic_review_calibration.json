@@ -1,0 +1,61 @@
+{
+  "purpose": "Bounded semantic-review evaluation cases, not a deterministic language oracle. Synthetic cases are explicitly labelled; no production acceptance exceptions.",
+  "target_language": "German",
+  "locale": "de",
+  "brand_glossary": [
+    "Bisq",
+    "Bitcoin"
+  ],
+  "cases": [
+    {
+      "key": "faithful.forwarding",
+      "source": "This message was forwarded by the trader who requested mediation.\\nIts content has not been confirmed by the displayed sender.",
+      "target": "Diese Nachricht wurde vom Händler weitergeleitet, der Vermittlung angefordert hat.\\nIhr Inhalt wurde vom angezeigten Absender nicht bestätigt.",
+      "expected": "none",
+      "kind": "public_translation",
+      "provenance": "bisq-network/bisq2 PR5079 head f51b31f07c06dddbfedee4a77be7d5a0e35cf237; authorizedRole.mediator.unverifiedMessage.tooltip"
+    },
+    {
+      "key": "faithful.paraphrase",
+      "source": "If payment has already been sent, do not send it again.",
+      "target": "Senden Sie die Zahlung nicht erneut, wenn Sie bereits bezahlt haben.",
+      "expected": "none",
+      "kind": "synthetic_control"
+    },
+    {
+      "key": "faithful.cognate",
+      "source": "Problem",
+      "target": "Problem",
+      "expected": "none",
+      "kind": "synthetic_control"
+    },
+    {
+      "key": "invalid.negation",
+      "source": "If payment has already been sent, do not send it again.",
+      "target": "Wenn Sie bereits bezahlt haben, senden Sie die Zahlung erneut.",
+      "expected": "error",
+      "kind": "synthetic_control"
+    },
+    {
+      "key": "invalid.trigger",
+      "source": "If you sell Bitcoin, a minimum reputation score of {0} is required.",
+      "target": "Wenn Sie Bitcoin kaufen, ist eine Reputationspunktzahl von mindestens {0} erforderlich.",
+      "expected": "error",
+      "kind": "synthetic_control"
+    },
+    {
+      "key": "invalid.actor",
+      "source": "This message was forwarded by the trader who requested mediation.",
+      "target": "Diese Nachricht wurde vom Mediator weitergeleitet.",
+      "expected": "error",
+      "kind": "synthetic_control"
+    },
+    {
+      "key": "invalid.brand",
+      "source": "Open Bisq",
+      "target": "Marktplatz öffnen",
+      "expected": "error",
+      "kind": "synthetic_control"
+    }
+  ]
+}

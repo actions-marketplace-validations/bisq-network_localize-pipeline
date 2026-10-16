@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1248,3 +1249,44 @@ async def test_semantic_reviewer_fails_when_provider_configuration_is_invalid(
         "Translation pipeline warnings require manual resolution."
         not in report["blocking_reasons"]
     )
+
+
+@pytest.fixture
+def semantic_calibration():
+    fixture = Path(__file__).parents[1] / "fixtures/project_policy/semantic_review_calibration.json"
+    return json.loads(fixture.read_text(encoding="utf-8"))
+
+
+def calibration_changes(fixture):
+    return [TranslationChange("calibration_de.properties", fixture["locale"],
+                              case["key"], case["source"], None, case["target"])
+            for case in fixture["cases"]]
+
+
+def test_semantic_review_calibration_prompt_explains_clean_results_and_severity(semantic_calibration):
+    messages = build_semantic_review_messages(
+        semantic_calibration["target_language"], calibration_changes(semantic_calibration),
+        [], semantic_calibration["brand_glossary"],
+    )
+    payload = json.loads(messages[1]["content"])
+    assert payload["no_issues_response"] == {"findings": []}
+    assert [row["key"] for row in payload["changes"]] == [
+        row["key"] for row in semantic_calibration["cases"]]
+    system = messages[0]["content"]
+    assert "Correct translations must not receive a finding" in system
+    assert "material discrepancy supported by source_value" in system
+    assert "negation" in system and "brand identity" in system
+    assert "synonyms" in system and "stylistic preferences are not errors" in system
+
+
+def test_semantic_calibration_allows_clean_results_without_dropping_real_errors(semantic_calibration):
+    changes = calibration_changes(semantic_calibration)
+    assert normalize_review_response('{"findings": []}', changes) == []
+    expected = [row for row in semantic_calibration["cases"] if row["expected"] == "error"]
+    response = {"findings": [{"file": "calibration_de.properties", "key": row["key"],
+                              "severity": "error",
+                              "reason": "Other wording is accurate, but a source condition or actor is changed."}
+                             for row in expected]}
+    findings = normalize_review_response(json.dumps(response), changes)
+    assert [row["key"] for row in findings] == [row["key"] for row in expected]
+    assert all(row["severity"] == "error" for row in findings)
