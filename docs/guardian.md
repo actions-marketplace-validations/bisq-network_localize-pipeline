@@ -159,6 +159,23 @@ retain normal reporting. Previously delivered
 clean-only summaries are not recreated after operator cleanup; withdrawal notices
 for other feedback remain enabled.
 
+Known CodeRabbit acknowledgements of resolved findings also remain private after
+assessment. Repeated requests for the same outstanding maintainer decision keep
+the first confirmed public explanation and summary link. Reuse is limited to the
+same root finding, source/head revisions, configuration and material decision
+evidence. New or edited evidence, corrections, held or deferred edits, and unknown
+reply formats retain normal reporting. The original decision remains pending;
+silence does not approve a correction or policy change.
+
+The GitHub intake snapshot records CodeRabbit review coverage separately from
+check success. Acknowledgements and empty review records cannot establish
+coverage. `reviewed` requires substantive evidence bound to the current head;
+`skipped` includes incomplete coverage when files were skipped, `rate_limited`
+records the review limit, and `absent` also covers unknown or stale evidence.
+Ancillary checks such as skipped docstring coverage do not invalidate a completed
+code review. These labels describe reported coverage; they are not merge approval
+or authority to change translations.
+
 An interrupted older write can leave a public comment whose delivery was never
 confirmed locally. Quiet-report retirement preserves that attempt's payload for
 audit but does not remove the remote comment; operators must inspect and clean

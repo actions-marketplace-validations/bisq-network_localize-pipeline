@@ -49,7 +49,7 @@ from localize.guardian.codex import (
 )
 from localize.guardian.deadline import PollDeadline, PollDeadlineExceeded
 from localize.guardian.diagnostics import record_failure
-from localize.guardian.reporting import held_report_reason, quiet_clean_review, quiet_reviewer_reply, report_body, report_disposition, report_key, summary_body
+from localize.guardian.reporting import held_report_reason, quiet_clean_review, quiet_reviewer_reply, reviewer_followup_kind, report_body, report_disposition, report_key, summary_body
 from localize.guardian.evidence import EVIDENCE_CONTRACT_VERSION, EvidenceBundle, build_evidence_bundle
 from localize.guardian.real_data_impact import (
     RealDataCorpus,
@@ -7440,6 +7440,83 @@ class GuardianController:
             if head == open_source.head_sha
             else None
         )
+        source_feedback = {(item.kind.value, item.source_id): item for item in snapshot.feedback}
+        current_feedback = {(event.kind, event.event_id): (event, revision) for event, revision in current}
+        edited_feedback = {revision.revision_id for _event, revision in current
+                           if self.state.feedback_content_was_edited(revision)}
+        assessed_reports = {
+            revision.revision_id: self.state.latest_feedback_report(
+                revision.revision_id, repository_id=policy.base_repo_id,
+                actor_id=actor.id, actor_type=actor.type,
+            ) for _event, revision in current
+        }
+        thread_context = {}
+
+        def decision_signature(details):
+            return tuple(details.get(key) for key in (
+                "verdict", "outcome", "report_outcome", "report_reason", "decision_required",
+                "changed_keys", "commit_sha", "held_value_edits", "deferred_value_edits",
+                "report_policy_digest", "report_config_digest",
+            ))
+
+        def unchanged_followup(event, revision, root):
+            if (revision.revision_id in edited_feedback
+                    or reviewer_followup_kind(event, is_reply=True) != "insufficient_evidence"):
+                return False
+            # Inline masking recognizes grammar, never evidence equivalence.
+            literals = set(re.findall(r'(?<!`)`([^`\n]+)`(?!`)', event.body))
+            root_literals = set(re.findall(r'(?<!`)`([^`\n]+)`(?!`)', root.body))
+            languages = re.findall(r'\b([A-Z][a-z]+) reviewer', event.body)
+            return literals <= root_literals and all(language in root.body for language in languages)
+
+        def convergence_key(event, revision, details, source):
+            # Decisions remain visible. Only an unchanged insufficient-evidence
+            # reminder can reuse their first acknowledged public explanation.
+            if (source is None or event.author.casefold() != "coderabbitai[bot]"
+                    or event.author_type != "Bot" or event.kind != "review_comment"
+                    or revision.revision_id in edited_feedback
+                    or details.get("verdict") != "needs_human"
+                    or details.get("outcome") != "needs_human"
+                    or details.get("report_outcome", "needs_human") != "needs_human"
+                    or details.get("report_reason") != "insufficient_evidence"
+                    or not details.get("decision_required")
+                    or any(details.get(key) for key in (
+                        "changed_keys", "commit_sha", "held_value_edits", "deferred_value_edits",
+                    ))):
+                return None
+            root_id = str(source.in_reply_to_id) if source.in_reply_to_id else event.event_id
+            root_pair = current_feedback.get(("review_comment", root_id))
+            root_source = source_feedback.get(("review_comment", root_id))
+            if root_pair is None or root_source is None or root_source.in_reply_to_id is not None:
+                return None
+            root, root_revision = root_pair
+            if root.deleted or root.author_id != event.author_id or root.author_type != "Bot":
+                return None
+            if source.in_reply_to_id:
+                if not unchanged_followup(event, revision, root):
+                    return None
+            if root_id not in thread_context:
+                material = []
+                root_decision = decision_signature(assessed_reports[root_revision.revision_id] or {})
+                for other, other_revision in current:
+                    other_source = source_feedback.get((other.kind, other.event_id))
+                    if other_source is None or other_source.in_reply_to_id != int(root_id):
+                        continue
+                    other_decision = decision_signature(assessed_reports[other_revision.revision_id] or {})
+                    if (not unchanged_followup(other, other_revision, root)
+                            or other_decision != root_decision):
+                        material.append((other.feedback_id, other_revision.revision_hash, other_decision))
+                epoch = self.state.feedback_decision_epoch(
+                    root_revision.revision_id, assessed_reports[root_revision.revision_id] or {},
+                )
+                thread_context[root_id] = root_decision, sorted(material), epoch
+            root_decision, material, epoch = thread_context[root_id]
+            return hashlib.sha256(json.dumps([
+                policy.base_repo_id, event.pr_number, root.feedback_id, root_revision.revision_hash,
+                head, snapshot.pull_request.base_sha, details.get("report_policy_digest"),
+                details.get("report_config_digest"), details.get("verdict"),
+                details.get("report_reason"), details.get("decision_required"), root_decision, material, epoch,
+            ], sort_keys=True).encode()).hexdigest()
         self.state.supersede_unavailable_feedback_reports(
             policy.base_repo_id,
             snapshot.pull_request.number,
@@ -7463,12 +7540,7 @@ class GuardianController:
             for event, revision in current:
                 if event.deleted:
                     continue
-                details = self.state.latest_feedback_report(
-                    revision.revision_id,
-                    repository_id=policy.base_repo_id,
-                    actor_id=actor.id,
-                    actor_type=actor.type,
-                )
+                details = assessed_reports[revision.revision_id]
                 if details is None or details.get("report_outcome") == "failed":
                     held = self.state.held_feedback_report_for_revision(
                         revision.revision_id,
@@ -7520,7 +7592,8 @@ class GuardianController:
                 key = report_key(
                     repository_id=policy.base_repo_id,
                     pull_number=event.pr_number,
-                    feedback_id=event.feedback_id,
+                    feedback_id=(f"{event.feedback_id}:revision:{revision.revision_hash}"
+                                 if revision.revision_id in edited_feedback else event.feedback_id),
                     body=body,
                 )
                 payload = {
@@ -7529,12 +7602,10 @@ class GuardianController:
                     "pr_number": event.pr_number,
                     "feedback_id": event.feedback_id,
                 }
-                is_reply = any(
-                    item.kind.value == event.kind and item.source_id == event.event_id
-                    and item.body == event.body and item.in_reply_to_id is not None
-                    for item in snapshot.feedback
-                )
-                if quiet_clean_review(event, details) or quiet_reviewer_reply(event, details, is_reply=is_reply):
+                source = source_feedback.get((event.kind, event.event_id))
+                is_reply = source is not None and source.body == event.body and source.in_reply_to_id is not None
+                if (revision.revision_id not in edited_feedback and
+                        (quiet_clean_review(event, details) or quiet_reviewer_reply(event, details, is_reply=is_reply))):
                     quiet_feedback_ids.add(event.feedback_id)
                     delivery = self.state.feedback_report_delivery(key)
                     if delivery is not None and delivery["status"] == "posted":
@@ -7544,7 +7615,29 @@ class GuardianController:
                             "decision_required": False,
                         })
                     continue
-                self.state.queue_feedback_report(key, payload)
+                identity = convergence_key(event, revision, details, source)
+                existing = self.state.feedback_report_delivery(key)
+                convergent = self.state.posted_convergent_feedback_report(identity) if identity else None
+                if convergent is not None and is_reply and existing is None:
+                    result = json.loads(convergent["result_json"])
+                    # Retain an explicit delivery alias so an older unchanged
+                    # reminder cannot become fresh noise after later evidence.
+                    # Pending ambiguous writes always take the exact retry path.
+                    self.state.record_convergent_feedback_report(
+                        key, {**payload, "convergence_key": identity},
+                        converged_to=convergent["report_key"],
+                    )
+                    entry = {"url": result["url"], "disposition": report_disposition(details),
+                             "decision_required": True}
+                    if entry not in reports:
+                        reports.append(entry)
+                    quiet_feedback_ids.add(event.feedback_id)
+                    continue
+                # An existing payload may predate convergence metadata. Its
+                # exact bytes are retained for ambiguous-write reconciliation.
+                if identity and existing is None:
+                    payload["convergence_key"] = identity
+                self.state.queue_feedback_report(key, json.loads(existing["payload_json"]) if existing else payload)
                 delivery = self.state.feedback_report_delivery(key)
                 assert delivery is not None
                 if delivery["status"] == "posted":
@@ -7567,13 +7660,13 @@ class GuardianController:
                     self._require_live_lease(lease_owner)
                     self.state.finish_feedback_report(key, result=result)
                     posted += 1
-                reports.append(
-                    {
-                        "url": result["url"],
-                        "disposition": report_disposition(details),
-                        "decision_required": bool(details.get("decision_required")),
-                    }
-                )
+                entry = {
+                    "url": result["url"],
+                    "disposition": report_disposition(details),
+                    "decision_required": bool(details.get("decision_required")),
+                }
+                if entry not in reports:
+                    reports.append(entry)
             if quiet_feedback_ids:
                 # Retire delivery retries, preserving the assessments and all
                 # prior publication acknowledgements as audit evidence.

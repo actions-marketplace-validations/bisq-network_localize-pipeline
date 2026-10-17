@@ -179,3 +179,32 @@ def test_5059_withdrawal_replay_and_actionable_controls():
     # Editing a formerly actionable reply is evaluated using its current body.
     actionable = replace(event, body="Please change this label.")
     assert not quiet_reviewer_reply(actionable, _clean_review_details(), is_reply=True)
+
+
+def observed_followups():
+    """Public observed replies, with the operator handle anonymized."""
+    import json
+    from pathlib import Path
+
+    return json.loads((Path(__file__).parent / "fixtures/guardian_5085_5086_5088_followups.json").read_text())
+
+
+@pytest.mark.parametrize("reply", observed_followups(), ids=lambda item: item["id"])
+def test_observed_followups_and_mixed_evidence_controls(reply):
+    from dataclasses import replace
+    from localize.guardian.reporting import quiet_reviewer_reply, reviewer_followup_kind
+
+    event = _clean_review_event(kind="review_comment", body=reply["body"])
+    expected = "resolved" if reply["resolved"] else "insufficient_evidence"
+    assert reviewer_followup_kind(event, is_reply=True) == expected
+    assert reviewer_followup_kind(event, is_reply=False) is None
+    assert quiet_reviewer_reply(event, _clean_review_details(), is_reply=True) == reply["resolved"]
+    for changes in ({"decision_required": True}, {"held_value_edits": 1},
+                    {"deferred_value_edits": 1}, {"changed_keys": 1}):
+        assert not quiet_reviewer_reply(event, _clean_review_details(**changes), is_reply=True)
+    for extra in ("Please replace the other label.", "The other placeholder is missing.",
+                  "Also, change `umetumwa` to `new wording`.", "```suggestion\nnew wording\n```"):
+        for body in (event.body + "\n" + extra, event.body.replace("\n\n", " " + extra + "\n\n", 1)):
+            mixed = replace(event, body=body)
+            assert reviewer_followup_kind(mixed, is_reply=True) is None
+            assert not quiet_reviewer_reply(mixed, _clean_review_details(), is_reply=True)

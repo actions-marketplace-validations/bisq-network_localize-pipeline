@@ -704,22 +704,100 @@ def _latest_by_object(
     return latest
 
 
-def _coderabbit_coverage(feedback: Iterable[FeedbackRevision]) -> CodeRabbitCoverage:
-    bot_feedback = [
-        revision
-        for revision in feedback
-        if not revision.deleted and revision.author_login.lower() in _CODERABBIT_LOGINS
-    ]
-    if not bot_feedback:
+def _coderabbit_coverage(
+    feedback: Iterable[FeedbackRevision], *, head_sha: str
+) -> CodeRabbitCoverage:
+    """Describe reported review coverage, never infer it from conversation.
+
+    Only substantive review records or recognizable summary/limit notices can
+    replace coverage. A reply acknowledging one finding proves nothing about
+    the rest of the diff. REVIEWED requires a current-head binding and no
+    reported file skips; ABSENT includes unknown or stale coverage evidence.
+    This is informational metadata, not review approval or edit authority.
+    """
+    candidates: list[tuple[FeedbackRevision, CodeRabbitCoverageStatus]] = []
+    for revision in _latest_by_object(feedback).values():
+        if (revision.deleted or revision.author_type != "Bot"
+                or revision.author_login.lower() not in _CODERABBIT_LOGINS
+                or revision.kind is FeedbackKind.REVIEW_COMMENT
+                or not revision.body.strip()):
+            continue
+        body = revision.body.strip()
+        summary = revision.kind is FeedbackKind.ISSUE_COMMENT and (
+            body.startswith("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->")
+            or body.startswith("## Walkthrough")
+        )
+        # Evidence quoted in examples is not a coverage declaration.
+        proof_lines = []
+        fence = ""
+        for line in body.splitlines():
+            match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+            if match:
+                marker, rest = match.groups()
+                if not fence:
+                    fence = marker
+                elif marker[0] == fence[0] and len(marker) >= len(fence) and not rest.strip():
+                    fence = ""
+                continue
+            if not fence and not line.lstrip().startswith(">"):
+                proof_lines.append(line)
+        proof = "\n".join(proof_lines)
+        normalized = proof.casefold()
+        limited = any(marker in normalized for marker in _RATE_LIMIT_MARKERS)
+        skipped = any(marker in normalized for marker in _SKIP_MARKERS)
+        substantive = bool(re.search(
+            r"actionable comments posted:\s*\d+|"
+            r"No actionable comments were generated in the recent review\.",
+            proof, re.IGNORECASE,
+        ))
+        if not (summary or limited or skipped or
+                revision.kind is FeedbackKind.REVIEW and substantive):
+            continue
+        status = CodeRabbitCoverageStatus.ABSENT
+        if limited:
+            status = CodeRabbitCoverageStatus.RATE_LIMITED
+        elif skipped:
+            status = CodeRabbitCoverageStatus.SKIPPED
+        else:
+            # Ignore ancillary checks such as unsupported docstring coverage.
+            file_skips = re.findall(
+                r"Files skipped from review[^\n<:(]*(?::\s*|\(\s*)(\d+)", proof,
+            )
+            selected = re.findall(
+                r"Files selected for processing\s*(?::\s*|\(\s*)(\d+)", proof,
+            )
+            if any(int(count) for count in file_skips) or selected == ["0"]:
+                status = CodeRabbitCoverageStatus.SKIPPED
+            else:
+                current_review = (
+                    revision.kind is FeedbackKind.REVIEW and substantive
+                    and revision.commit_id == head_sha
+                )
+                markers = re.findall(r"^<!-- final_review_risk_coverage:(.{1,2048}?) -->[ \t]*$", proof, re.MULTILINE)
+                if summary and len(markers) == 1:
+                    try:
+                        coverage = json.loads(markers[0])
+                    except (ValueError, RecursionError):
+                        coverage = None
+                    current_review = isinstance(coverage, dict) and (
+                        coverage.get("kind") == "reviewed"
+                        and coverage.get("sourceCommitId") == head_sha
+                        and coverage.get("coveredCommitId") == head_sha
+                    )
+                if current_review:
+                    status = CodeRabbitCoverageStatus.REVIEWED
+        candidates.append((revision, status))
+    if not candidates:
         return CodeRabbitCoverage(CodeRabbitCoverageStatus.ABSENT)
-    latest = max(bot_feedback, key=lambda item: (item.updated_at, item.revision_id))
-    normalized = latest.body.casefold()
-    if any(marker in normalized for marker in _RATE_LIMIT_MARKERS):
-        status = CodeRabbitCoverageStatus.RATE_LIMITED
-    elif any(marker in normalized for marker in _SKIP_MARKERS):
-        status = CodeRabbitCoverageStatus.SKIPPED
-    else:
-        status = CodeRabbitCoverageStatus.REVIEWED
+    priority = {
+        CodeRabbitCoverageStatus.REVIEWED: 0,
+        CodeRabbitCoverageStatus.ABSENT: 1,
+        CodeRabbitCoverageStatus.SKIPPED: 2,
+        CodeRabbitCoverageStatus.RATE_LIMITED: 3,
+    }
+    latest, status = max(candidates, key=lambda item: (
+        item[0].updated_at, priority[item[1]], item[0].revision_id,
+    ))
     return CodeRabbitCoverage(status, latest.revision_id)
 
 
@@ -2009,7 +2087,7 @@ class GitHubReader:
             repository_identity=repository_identity,
             pull_request=pull,
             feedback=tuple(current),
-            coderabbit=_coderabbit_coverage(visible),
+            coderabbit=_coderabbit_coverage(visible, head_sha=pull.head_sha),
             changed_files=changed_files,
         )
 
