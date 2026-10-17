@@ -5803,6 +5803,45 @@ class GuardianState:
                 OR json_extract(a.details_json, '$.patch_validation_version') IS ?
             )"""
             parameters.append(patch_validation_version)
+        # Human-owned thread evidence is terminal only while its exact root
+        # decision remains current. Policy/config changes reopen it normally.
+        policy_filter += """ AND (
+            json_extract(a.details_json, '$.outcome') IS NOT 'thread_human_review'
+            OR (
+                a.action_id = (SELECT MAX(latest.action_id) FROM actions latest
+                               WHERE latest.event_revision_id = a.event_revision_id)
+                AND json_extract(a.details_json, '$.thread_hold.root_action_id') = (
+                    SELECT MAX(root_action.action_id) FROM actions root_action
+                    WHERE root_action.event_revision_id =
+                        json_extract(a.details_json, '$.thread_hold.root_revision_id'))
+                AND json_extract(a.details_json, '$.thread_hold.root_revision_id') = (
+                    SELECT new_root.event_revision_id FROM event_revisions root
+                    JOIN event_current_observations new_root ON new_root.repository = root.repository
+                        AND new_root.pr_number = root.pr_number AND new_root.kind = root.kind
+                        AND new_root.event_id = root.event_id
+                    WHERE root.revision_id =
+                        json_extract(a.details_json, '$.thread_hold.root_revision_id')
+                    ORDER BY new_root.observation_id DESC LIMIT 1)
+                AND (json_extract(a.details_json, '$.thread_hold.classification') != 'unchanged_reminder'
+                     OR NOT EXISTS (SELECT 1 FROM event_revisions edited
+                         WHERE edited.repository = e.repository AND edited.pr_number = e.pr_number
+                           AND edited.kind = e.kind AND edited.event_id = e.event_id
+                           AND edited.body_hash != e.body_hash))
+            )
+        )"""
+        # A temporarily superseded held revision may become current again
+        # (A→B→A). Its administrative skip did not assess that human evidence.
+        policy_filter += """ AND (
+            json_extract(a.details_json, '$.outcome') IS NOT 'superseded_revision'
+            OR NOT EXISTS (SELECT 1 FROM actions held
+                WHERE held.event_revision_id = a.event_revision_id
+                  AND json_extract(held.details_json, '$.outcome') = 'thread_human_review')
+            OR a.event_revision_id != (SELECT observation.event_revision_id
+                FROM event_current_observations observation
+                WHERE observation.repository = e.repository AND observation.pr_number = e.pr_number
+                  AND observation.kind = e.kind AND observation.event_id = e.event_id
+                ORDER BY observation.observation_id DESC LIMIT 1)
+        )"""
         filters = [
             f"""NOT EXISTS (
                 SELECT 1 FROM actions AS a
@@ -9006,6 +9045,88 @@ class GuardianState:
             ).fetchone()
         return json.loads(row["details_json"]) if row else None
 
+    def thread_hold_seed(
+        self, revision_id: int, *, policy_digest: str, config_digest: str,
+        mode: GuardianMode,
+    ) -> Mapping[str, Any] | None:
+        """Read only the latest completed decision for this exact root revision."""
+        if not re.fullmatch(r"[0-9a-f]{64}", config_digest):
+            return None
+        row = self._connection.execute(
+            """SELECT a.*, r.status AS run_status, r.mode AS run_mode FROM actions a
+               JOIN runs r ON r.run_id = a.run_id WHERE a.event_revision_id = ?
+               ORDER BY a.action_id DESC LIMIT 1""", (revision_id,),
+        ).fetchone()
+        if row is None or row["status"] != "completed" or row["run_status"] != "completed" or row["run_mode"] != mode.value:
+            return None
+        details = json.loads(row["details_json"])
+        if (any(details.get(key) != value for key, value in {
+            "outcome": "needs_human", "verdict": "needs_human",
+            "report_reason": "insufficient_evidence", "decision_required": True,
+            "report_policy_digest": policy_digest, "report_config_digest": config_digest,
+            "changed_keys": 0, "held_value_edits": 0, "recurrence_candidates": 0,
+        }.items()) or details.get("report_outcome", "needs_human") != "needs_human"
+                or details.get("commit_sha") or details.get("deferred_value_edits")):
+            return None
+        return {"root_revision_id": revision_id, "root_action_id": row["action_id"],
+                "decision_epoch": self.feedback_decision_epoch(revision_id, details)}
+
+    def thread_hold_for_revision(
+        self, revision_id: int, *, policy_digest: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        """Effective held intake supersedes report lookup, including old failures."""
+        row = self._connection.execute(
+            """SELECT details_json FROM actions WHERE event_revision_id = ?
+               ORDER BY action_id DESC LIMIT 1""", (revision_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        details = json.loads(row[0])
+        if details.get("outcome") != "thread_human_review" or (policy_digest is not None and details.get("report_policy_digest") != policy_digest):
+            return None
+        hold = details["thread_hold"]
+        current = self._connection.execute(
+            """SELECT (SELECT MAX(a.action_id) FROM actions a WHERE a.event_revision_id = root.revision_id),
+                      (SELECT e.event_revision_id FROM event_current_observations e WHERE e.repository = root.repository
+                        AND e.pr_number = root.pr_number AND e.kind = root.kind AND e.event_id = root.event_id
+                        ORDER BY e.observation_id DESC LIMIT 1)
+               FROM event_revisions root WHERE root.revision_id = ?""", (hold["root_revision_id"],),
+        ).fetchone()
+        if current is None or tuple(current) != (hold["root_action_id"], hold["root_revision_id"]):
+            return None
+        revision = self.get_event_revision(revision_id)
+        if hold["classification"] == "unchanged_reminder" and revision is not None and self.feedback_content_was_edited(revision):
+            return None
+        return details
+
+    def thread_hold_evidence_for_operator(
+        self, *, limit: int = 20, after_revision_id: int = 0,
+    ) -> tuple[int, tuple[Mapping[str, Any], ...]]:
+        """Bounded current human-owned evidence; bodies stay in the private audit."""
+        if type(limit) is not int or not 1 <= limit <= 100 or type(after_revision_id) is not int or after_revision_id < 0:
+            raise ValueError("Invalid human evidence page.")
+        query = """WITH current AS (
+                SELECT e.*, a.details_json,
+                    ROW_NUMBER() OVER (PARTITION BY e.repository, e.pr_number, e.kind, e.event_id
+                                       ORDER BY o.observation_id DESC, a.action_id DESC) AS position
+                FROM event_current_observations o JOIN event_revisions e ON e.revision_id = o.event_revision_id
+                LEFT JOIN actions a ON a.event_revision_id = e.revision_id
+            ) SELECT revision_id, repository, pr_number, event_id, details_json
+              FROM current WHERE position = 1 AND deleted = 0
+                AND json_extract(details_json, '$.outcome') = 'thread_human_review'
+        """
+        total = self._connection.execute("SELECT COUNT(*) FROM (" + query + ")").fetchone()[0]
+        rows = self._connection.execute(
+            query + " AND revision_id > ? ORDER BY revision_id LIMIT ?", (after_revision_id, limit),
+        ).fetchall()
+        # This view intentionally retains invalidated decisions as awaiting
+        # review until intake records the governed reassessment/release.
+        entries = tuple({"revision_id": row["revision_id"], "repository": row["repository"],
+                         "pr_number": row["pr_number"], "event_id": row["event_id"],
+                         **json.loads(row["details_json"])["thread_hold"]}
+                        for row in rows)
+        return int(total), entries
+
     def held_feedback_decision(
         self,
         *,
@@ -9022,6 +9143,7 @@ class GuardianState:
                WHERE e.repository = ? AND e.pr_number = ? AND e.kind = ? AND e.event_id = ?
                AND json_extract(a.details_json, '$.decision_required') = 1
                AND json_extract(a.details_json, '$.report_config_digest') = ?
+               AND json_extract(a.details_json, '$.outcome') IS NOT 'thread_human_review'
                ORDER BY a.action_id DESC LIMIT 1""",
             (repository, pr_number, kind, event_id, config_digest),
         ).fetchone()

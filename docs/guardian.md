@@ -159,13 +159,27 @@ retain normal reporting. Previously delivered
 clean-only summaries are not recreated after operator cleanup; withdrawal notices
 for other feedback remain enabled.
 
-Known CodeRabbit acknowledgements of resolved findings also remain private after
-assessment. Repeated requests for the same outstanding maintainer decision keep
-the first confirmed public explanation and summary link. Reuse is limited to the
-same root finding, source/head revisions, configuration and material decision
-evidence. New or edited evidence, corrections, held or deferred edits, and unknown
-reply formats retain normal reporting. The original decision remains pending;
-silence does not approve a correction or policy change.
+Known CodeRabbit acknowledgements of resolved findings remain private after
+assessment. A different rule applies when the exact current root already has a
+completed insufficient-evidence human decision: further authorized CodeRabbit
+replies belong to that human review before any model proposal is generated.
+Every reply revision and source link remain in the private audit; full content
+follows the existing raw-body retention policy. Recognized unchanged reminders
+are labelled as such; unknown, mixed,
+edited or materially different replies are explicitly **new evidence awaiting
+human review**, not newly assessed or equivalent evidence. Neither kind generates
+a model correction, prevention proposal or separate public explanation. The root
+decision retains its public explanation and summary link. Existing failed actions
+and ambiguous delivery records remain intact; a held revision does not create a
+delivery acknowledgement. Historical public comments, receipts and summary links
+remain; this rule prevents new duplicate explanations rather than rewriting history.
+
+This thread hold requires the latest completed root assessment at the exact
+current root revision, repository, head/base, mode, policy and trusted configuration
+digest, with no pending correction publication or held/deferred edits. Missing or
+changed authority resumes the ordinary workflow; it never invents an old decision.
+Other findings and trusted human feedback remain actionable in the same poll.
+The original human decision remains pending; silence does not approve a correction.
 
 The GitHub intake snapshot records CodeRabbit review coverage separately from
 check success. Acknowledgements and empty review records cannot establish
@@ -235,6 +249,24 @@ translation edits and last successful poll. A successful correction or poll does
 not imply every decision has been settled. Model/session limits, subscription
 authentication, retry bounds, signing, and existing repository authority remain
 unchanged. Rendering and delivering reports use no additional model session.
+
+Status separately lists **thread evidence awaiting human review**, including
+revision IDs, public evidence/root links, root action/decision provenance and
+context hashes, without printing review bodies or private model output. Use
+`guardian status --human-evidence-limit 20 --human-evidence-after <revision-id>`
+to page through the current evidence. Superseded/deleted revisions stay auditable
+but leave this current view. After a maintainer chooses policy, the operator must
+deliberately update the actual governed trusted configuration bundle before
+reconsideration; the next intake reopens held evidence and ordinary validation
+applies. Human comments, thread resolution, merges and bot prose are not release
+commands. Head/base/root or latest-root-decision changes also invalidate reuse;
+they do not prove that a human decision was resolved.
+
+The `thread_human_review` action outcome and `thread_hold` JSON metadata introduce
+a state *semantic* compatibility boundary without changing the SQLite schema.
+Do not downgrade to a writer that does not understand these records once either
+marker exists, even on a failed or skipped action: an older writer can mistake
+unassessed human evidence for completed work and cannot display its review queue.
 
 Assessment explicitly considers recurring failures, including untranslated
 source-identical text and lost safety warnings, as well as individual corrections.

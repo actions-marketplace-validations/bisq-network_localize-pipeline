@@ -1760,6 +1760,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
         with _locked_existing_state(config_path) as state:
             snapshot = None if state is None else state.status_snapshot(mode=config.mode)
             reporting = (0, 0) if state is None else state.feedback_reporting_counts()
+            human_total, human_evidence = (0, ()) if state is None else state.thread_hold_evidence_for_operator(
+                limit=getattr(args, "human_evidence_limit", 20),
+                after_revision_id=getattr(args, "human_evidence_after", 0),
+            )
             diagnostic = None if state is None else state.latest_health("guardian-failure")
             policy_proposal = None if state is None else state.latest_health("project-policy")
     except Exception:
@@ -1780,6 +1784,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"pending feedback revisions: {snapshot.pending_revisions}")
     print(f"pending explanation acknowledgements: {reporting[0]}")
     print(f"recorded maintainer decisions: {reporting[1]}")
+    print(f"thread evidence awaiting human review: {human_total}")
+    for evidence in human_evidence:
+        print(json.dumps(evidence, sort_keys=True))
+    if human_evidence:
+        print(f"human evidence page ends at revision {human_evidence[-1]['revision_id']}; "
+              "use --human-evidence-after for the next page")
     actions = ", ".join(f"{status}={count}" for status, count in snapshot.actions)
     print(f"actions: {actions or 'none'}")
     health = ", ".join(f"{component}={status}" for component, status in snapshot.health)
@@ -2253,6 +2263,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config", required=True, help="Operator-owned Guardian YAML path."
     )
     status_parser.set_defaults(func=_cmd_status)
+    status_parser.add_argument("--human-evidence-limit", type=int, default=20,
+                               help="Show 1–100 pending human evidence records (default: 20).")
+    status_parser.add_argument("--human-evidence-after", type=int, default=0,
+                               help="Page human evidence after this revision ID.")
 
     remediation_parser = subparsers.add_parser(
         "remediation",
