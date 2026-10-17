@@ -20,7 +20,7 @@ from tests.unit.test_guardian_controller import (
 from tests.unit.test_guardian_controller import runtime as _runtime_fixture
 from tests.unit.test_guardian_controller import _policy
 from localize.guardian.models import TrustedActor
-from tests.unit.test_guardian_reporting import observed_followups
+from tests.unit.test_guardian_reporting import observed_followups, recent_followups
 
 runtime = _runtime_fixture
 
@@ -283,6 +283,28 @@ def test_return_to_previous_decision_is_a_new_public_context(convergence_reporti
     assert f"review_comment:{ctx.replies[1].source_id}" in _posted_feedback_ids(ctx.state)
     ctx.flush((ctx.root, *ctx.replies[1:3]))
     assert len(ctx.broker.feedback_reports) == previous + 1
+
+
+@pytest.mark.parametrize("change", [None, "literal", "language", "mixed"])
+def test_fresh_swahili_hold_variant_keeps_material_feedback_visible(convergence_reporting, change):
+    ctx = convergence_reporting
+    ctx.flush((ctx.root, ctx.replies[0]))
+    assert len(ctx.broker.feedback_reports) == 1
+    actual = next(item for item in recent_followups() if item["id"] == "4302441045")
+    body = actual["body"]
+    if change == "literal":
+        body = body.replace("a translation defect.", "a translation defect in `new wording`.")
+    elif change == "language":
+        body = body.replace("Swahili", "Hungarian")
+    elif change == "mixed":
+        body = body.replace("Keep the translation", "Please change the other label. Keep the translation")
+    reply = replace(ctx.replies[1], source_id=actual["id"], body=body)
+    current = ctx.flush((ctx.root, ctx.replies[0], reply))
+    assert len(ctx.broker.feedback_reports) == (1 if change is None else 2)
+    revision = next(revision for event, revision in current if event.event_id == actual["id"])
+    assessment = ctx.state.latest_feedback_report(revision.revision_id)
+    assert assessment["verdict"] == "needs_human" and assessment["decision_required"] is True
+    assert "maintainer decision still required" in ctx.broker.feedback_summary.body
 
 
 @pytest.mark.parametrize(

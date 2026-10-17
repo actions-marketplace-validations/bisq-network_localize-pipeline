@@ -1,0 +1,23 @@
+[
+  {
+    "id": "4302257423",
+    "pr": 5085,
+    "root_id": "4295207601",
+    "resolved": true,
+    "body": "@translation-operator The supplied `unreadableStoreFiles.headline` contains no Cyrillic letters. I withdraw the finding. No correction is needed.\n\n<!-- <review_comment_withdrawn> -->\n\n✅ Review thread resolved.\n\n_You are interacting with an AI system._\n\n<!-- This is an auto-generated reply by CodeRabbit -->"
+  },
+  {
+    "id": "4302441045",
+    "pr": 5086,
+    "root_id": "4295241584",
+    "resolved": false,
+    "body": "@translation-operator The evidence does not confirm a translation defect. Keep the translation and configuration unchanged on the basis of this finding alone.\n\nThe finding remains unconfirmed pending a maintainer decision informed by a Swahili reviewer’s assessment.\n\n_You are interacting with an AI system._\n\n<!-- This is an auto-generated reply by CodeRabbit -->"
+  },
+  {
+    "id": "4302291831",
+    "pr": 5086,
+    "root_id": "4295241600",
+    "resolved": true,
+    "body": "@translation-operator The supplied value uses `ügylethez`, without the extra `t`. I withdraw the finding for the assessed revision. No correction is needed.\n\n<!-- <review_comment_withdrawn> -->\n\n✅ Review thread resolved.\n\n_You are interacting with an AI system._\n\n<!-- This is an auto-generated reply by CodeRabbit -->"
+  }
+]
