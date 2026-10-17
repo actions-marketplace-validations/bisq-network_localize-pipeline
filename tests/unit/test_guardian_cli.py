@@ -2197,6 +2197,38 @@ def test_run_refuses_a_group_writable_authority_config(
     assert "GuardianCLIError" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("option,value", [
+    ("--human-evidence-limit", "0"), ("--human-evidence-limit", "-1"),
+    ("--human-evidence-limit", "101"), ("--human-evidence-limit", "not-an-integer"),
+    ("--human-evidence-after", "-1"), ("--human-evidence-after", "not-an-integer"),
+    ("--human-evidence-after", "9223372036854775808"),
+])
+def test_status_rejects_invalid_human_evidence_pages_before_state_access(monkeypatch, capsys, option, value):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Invalid pagination must be rejected before config or state access")
+
+    monkeypatch.setattr(cli, "_load_config_or_raise", forbidden)
+    monkeypatch.setattr(cli, "_locked_existing_state", forbidden)
+    with pytest.raises(SystemExit) as error:
+        cli.main(["status", "--config", "/unused/policy.yaml", option, value])
+    assert error.value.code == 2
+    output = capsys.readouterr()
+    assert "usage:" in output.err and option in output.err
+    assert "state is unavailable" not in output.err
+
+
+@pytest.mark.parametrize("limit,cursor", [(1, 0), (100, 7), (20, 9223372036854775807)])
+def test_status_accepts_human_evidence_page_boundaries(limit, cursor):
+    args = cli._build_parser().parse_args(["status", "--config", "/unused/policy.yaml",
+        "--human-evidence-limit", str(limit), "--human-evidence-after", str(cursor)])
+    assert (args.human_evidence_limit, args.human_evidence_after) == (limit, cursor)
+
+
+def test_status_preserves_default_human_evidence_page():
+    args = cli._build_parser().parse_args(["status", "--config", "/unused/policy.yaml"])
+    assert (args.human_evidence_limit, args.human_evidence_after) == (20, 0)
+
+
 def test_status_summarizes_audit_metadata_without_raw_bodies_or_messages(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -9103,7 +9103,8 @@ class GuardianState:
         self, *, limit: int = 20, after_revision_id: int = 0,
     ) -> tuple[int, tuple[Mapping[str, Any], ...]]:
         """Bounded current human-owned evidence; bodies stay in the private audit."""
-        if type(limit) is not int or not 1 <= limit <= 100 or type(after_revision_id) is not int or after_revision_id < 0:
+        if (type(limit) is not int or not 1 <= limit <= 100
+                or type(after_revision_id) is not int or not 0 <= after_revision_id <= 9223372036854775807):
             raise ValueError("Invalid human evidence page.")
         query = """WITH current AS (
                 SELECT e.*, a.details_json,

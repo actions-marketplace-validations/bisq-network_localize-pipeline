@@ -2217,6 +2217,16 @@ def _operator_list_limit(raw_value: str) -> int:
     return value
 
 
+def _operator_revision_cursor(raw_value: str) -> int:
+    try:
+        value = int(raw_value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a non-negative 64-bit integer") from None
+    if not 0 <= value <= 9223372036854775807:
+        raise argparse.ArgumentTypeError("must be between 0 and 9223372036854775807")
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="localize guardian",
@@ -2263,9 +2273,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config", required=True, help="Operator-owned Guardian YAML path."
     )
     status_parser.set_defaults(func=_cmd_status)
-    status_parser.add_argument("--human-evidence-limit", type=int, default=20,
+    status_parser.add_argument("--human-evidence-limit", type=_operator_list_limit, default=20,
                                help="Show 1–100 pending human evidence records (default: 20).")
-    status_parser.add_argument("--human-evidence-after", type=int, default=0,
+    status_parser.add_argument("--human-evidence-after", type=_operator_revision_cursor, default=0,
                                help="Page human evidence after this revision ID.")
 
     remediation_parser = subparsers.add_parser(

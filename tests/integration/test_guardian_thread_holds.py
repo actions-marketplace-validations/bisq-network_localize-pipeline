@@ -294,7 +294,9 @@ def test_operator_evidence_pagination_and_edited_deleted_revisions(held_thread):
     total, current = ctx.state.thread_hold_evidence_for_operator()
     assert total == 2 and {item["event_id"] for item in current} == {"80", "82"}
     assert all(item["classification"] == "new_evidence" for item in current)
-    for args in ({"limit": 0}, {"limit": 101}, {"after_revision_id": -1}):
+    assert ctx.state.thread_hold_evidence_for_operator(after_revision_id=9223372036854775807)[1] == ()
+    for args in ({"limit": 0}, {"limit": 101}, {"after_revision_id": -1},
+                 {"after_revision_id": 9223372036854775808}):
         with pytest.raises(ValueError):
             ctx.state.thread_hold_evidence_for_operator(**args)
 
