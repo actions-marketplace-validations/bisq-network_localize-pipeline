@@ -1,5 +1,5 @@
 {
-  "reviewed": "## Walkthrough\nI reviewed the changed localization values and left two findings.",
+  "reviewed": "## Walkthrough\nI reviewed the changed localization values and left two findings.\n<!-- final_review_risk_coverage:{\"sourceCommitId\":\"1111111111111111111111111111111111111111\",\"coveredCommitId\":\"1111111111111111111111111111111111111111\",\"kind\":\"reviewed\"} -->",
   "skipped": "## Review skipped\nToo many files! This pull request is over the review limit.",
   "rate_limited": "## Review skipped\nReview limit reached; this review was rate limited."
 }

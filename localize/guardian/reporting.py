@@ -77,6 +77,92 @@ def quiet_clean_review(event: FeedbackEvent, details: Mapping[str, object]) -> b
         body, re.IGNORECASE,
     )
 
+def reviewer_followup_kind(event: FeedbackEvent, *, is_reply: bool) -> str | None:
+    """Recognize acknowledgements, never arbitrary resolved or bot feedback.
+
+    Match whole sentences after masking inline literals, rather than one old
+    paragraph layout. Unknown sentences, mixed requests, and unknown wrappers
+    stay visible. This classification grants no intake or assessment authority.
+    """
+    if (not is_reply or event.kind != "review_comment"
+            or event.author.casefold() != "coderabbitai[bot]" or event.author_type != "Bot"):
+        return None
+    suffix = "\n\n_You are interacting with an AI system._\n\n<!-- This is an auto-generated reply by CodeRabbit -->"
+    if not event.body.endswith(suffix):
+        return None
+    text = event.body[:-len(suffix)].strip()
+    resolved = text.endswith("✅ Review thread resolved.")
+    if resolved:
+        text = text[:-len("✅ Review thread resolved.")].rstrip()
+        text = text.removesuffix("<!-- <review_comment_withdrawn> -->").rstrip()
+    # Learnings are ancillary only in their known wrapper, with a bounded
+    # explanatory learning. A new instruction or finding there stays visible.
+    if "\n---\n" in text:
+        text, learning = text.split("\n---\n", 1)
+        match = re.fullmatch(
+            r'\s*<details>\s*<summary>(?:✏️ Learnings added|🧠 Learnings used)</summary>'
+            r'\s*```\nLearnt from: [A-Za-z0-9_-]+\nRepo: [A-Za-z0-9_./-]+ PR: [0-9]+\n'
+            r'File: [A-Za-z0-9_./:-]+\nTimestamp: [0-9T:.Z-]+\nLearning: ([^\n]+)\n```'
+            r'(?:\s*> Note: Learnings are effective only in the context of similar code segments\. '
+            r'To apply general coding guidelines, please configure \[review instructions\]'
+            r'\(https://docs\.coderabbit\.ai/guides/review-instructions\)\. '
+            r'You can manage existing learnings in the \[app\]\(https://app\.coderabbit\.ai/learnings\)\.)?'
+            r'\s*</details>\s*', learning,
+        )
+        if not match or not re.fullmatch(
+            r'In [A-Za-z0-9_./-]+, the Java properties key [A-Za-z0-9_.]+ distinguishes '
+            r'the Tor version in \{[0-9]+\} from the Tor Browser version in \{[0-9]+\}\. '
+            r'Labels such as “Tor-Version” in [A-Za-z0-9_./-]+ are valid; '
+            r'omitting “binary” does not by itself constitute a correctness issue\.', match[1],
+        ):
+            return None
+    text = re.sub(r'^`?@[A-Za-z0-9_-]+`? ', '', text.strip())
+    text = re.sub(r'`[^`\n]+`', 'CODE', text)
+    if any(marker in text for marker in ('`', '<', '>', '```')):
+        return None
+    sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?]”)\s+', text)
+    patterns = (
+        r'Agreed\.', r'Thanks for the clarification\.',
+        r'The (?:supplied revision|assessed revision|current value|supplied value) (?:already )?uses CODE(?:, (?:with no|without) (?:CODE(?: in the label)?|the extra CODE))?\.',
+        r'The supplied file content shows CODE, with no Cyrillic letters\.',
+        r'The supplied CODE contains no Cyrillic letters\.',
+        r'(?:The|This) (?:mixed-script )?finding (?:no longer applies|does not apply(?: to the assessed revision)?|remains withdrawn)\.',
+        r'The finding does not apply, so I withdraw it\.',
+        r'I withdraw (?:it|(?:this |the )?(?:finding|suggestion))(?: for (?:that|the assessed) revision)?[.;](?: no correction is needed\.)?',
+        r'No (?:code change|further change|correction|further action|correction or translation regeneration) is needed\.',
+        r'No configuration change or translation regeneration is needed for this finding\.',
+        r'My original finding overstated a wording preference as a correctness issue\.',
+        r'The supplied template distinguishes CODE from CODE\.',
+        r'“Tor version” is a valid label for the Tor binary version\.',
+        r'Adding “binary” is optional, not a functional correction\.',
+        r'The supplied template and existing learning confirm that CODE is valid\.',
+    ) if resolved else (
+        r'The (?:supplied|available) evidence does not establish (?:a translation defect|that CODE is incorrect in this context)\.',
+        r'The script confirms the wording, but it does not establish whether CODE adequately conveys “forwarded” in this context\.',
+        r'Do not change the translation or configuration based on this finding alone\.',
+        r'A [A-Z][a-z]+ reviewer should confirm whether the wording preserves the distinction between the forwarding trader and the displayed sender\.',
+        r'The finding remains unconfirmed pending that review\.',
+        r'No correction is authorized by this reply\.',
+        r'The evidence remains insufficient to confirm a translation defect\.',
+        r'Keep the translation and configuration unchanged on the basis of this finding alone\.',
+        r'A maintainer should obtain a [A-Z][a-z]+ reviewer’s assessment of whether CODE preserves the intended meaning of “forwarded\.”',
+        r'The finding remains unconfirmed pending that assessment\.',
+        r'No new evidence confirms a translation defect\.',
+        r'This finding remains unconfirmed and does not justify a translation or configuration change\.',
+        r'A maintainer decision is still (?:needed|pending)\.',
+        r'If a [A-Z][a-z]+ reviewer confirms that CODE loses the intended meaning of “forwarded,” provide that assessment and the recommended wording\.',
+        r'The finding remains unconfirmed\.',
+        r'No translation or configuration change is justified by this finding alone\.',
+        r'Leave both unchanged pending a maintainer decision supported by a [A-Z][a-z]+ reviewer’s assessment\.',
+        r'The translation concern remains unconfirmed\.',
+        r'This finding alone does not justify a translation or configuration change\.',
+        r'A [A-Z][a-z]+ reviewer’s assessment is needed to determine whether CODE preserves the intended meaning of “forwarded\.”',
+    )
+    if sentences and all(any(re.fullmatch(pattern, sentence) for pattern in patterns) for sentence in sentences):
+        return "resolved" if resolved else "insufficient_evidence"
+    return None
+
+
 def quiet_reviewer_reply(event: FeedbackEvent, details: Mapping[str, object], *, is_reply: bool) -> bool:
     """Keep resolved CodeRabbit acknowledgements private after assessment.
 
@@ -94,20 +180,7 @@ def quiet_reviewer_reply(event: FeedbackEvent, details: Mapping[str, object], *,
                 "deferred_value_edits",
             ))):
         return False
-    suffix = "\n\n✅ Review thread resolved.\n\n_You are interacting with an AI system._\n\n<!-- This is an auto-generated reply by CodeRabbit -->"
-    if not event.body.endswith(suffix):
-        return False
-    text = event.body[:-len(suffix)]
-    # The entire reply must be the known acknowledgement paragraph. Extra
-    # sections, suggestions, questions, or requests remain publicly reportable.
-    return bool(re.fullmatch(
-        r"`@[A-Za-z0-9_-]+` (?:Agreed\. )?The supplied revision (?:already )?uses "
-        r"`[^`\n]+`(?:, (?:with no|without) `threshold`(?: in the label)?)?\. "
-        r"(?:(?:This finding no longer applies|The finding does not apply)\. |"
-        r"The finding does not apply, so I withdraw it\. )?"
-        r"(?:I withdraw (?:it|(?:this |the )?finding)\. )?"
-        r"No (?:code change|further change) is needed\.", text,
-    ))
+    return reviewer_followup_kind(event, is_reply=is_reply) == "resolved"
 
 
 REASONS = {

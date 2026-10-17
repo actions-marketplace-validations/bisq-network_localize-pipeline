@@ -9066,6 +9066,72 @@ class GuardianState:
         ).fetchone()
         return dict(row) if row else None
 
+    def feedback_content_was_edited(self, revision: EventRevision) -> bool:
+        """Head movement alone is not a comment edit; changed bytes are evidence."""
+        return self._connection.execute(
+            """SELECT 1 FROM event_revisions WHERE repository = ? AND pr_number = ?
+               AND kind = ? AND event_id = ? AND body_hash != ? LIMIT 1""",
+            (revision.repository, revision.pr_number, revision.kind,
+             revision.event_id, revision.body_hash),
+        ).fetchone() is not None
+
+    def feedback_decision_epoch(self, revision_id: int, details: Mapping[str, Any]) -> int:
+        """A restored earlier decision follows a new transition, not an old receipt."""
+        row = self._connection.execute(
+            """SELECT action_id FROM actions WHERE event_revision_id = ?
+               AND json_extract(details_json, '$.report_reason') IS NOT NULL
+               AND NOT (json_extract(details_json, '$.verdict') IS ?
+                    AND json_extract(details_json, '$.outcome') IS ?
+                    AND json_extract(details_json, '$.report_reason') IS ?
+                    AND json_extract(details_json, '$.decision_required') IS ?)
+               ORDER BY action_id DESC LIMIT 1""",
+            (revision_id, details.get("verdict"), details.get("outcome"),
+             details.get("report_reason"), details.get("decision_required")),
+        ).fetchone()
+        return int(row["action_id"]) if row else 0
+
+    def posted_convergent_feedback_report(self, convergence_key: str) -> Mapping[str, Any] | None:
+        """Only acknowledged delivery can stand in for an unchanged followup.
+
+        Legacy payloads remain byte-for-byte intact. Without a context-bound
+        acknowledgement, the next followup publishes once and seeds convergence.
+        """
+        row = self._connection.execute(
+            """SELECT * FROM feedback_report_deliveries WHERE status = 'posted'
+               AND json_extract(payload_json, '$.convergence_key') = ?
+               ORDER BY rowid LIMIT 1""", (convergence_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_convergent_feedback_report(
+        self, report_key: str, payload: Mapping[str, Any], *, converged_to: str,
+    ) -> None:
+        """Atomically retain an alias of an already acknowledged explanation.
+
+        Never leave a pending alias that a restarted process could mistake for
+        a new GitHub write. Existing pending deliveries must use exact retries.
+        """
+        with self._connection:
+            original = self.feedback_report_delivery(converged_to)
+            if (original is None or original["status"] != "posted"
+                    or not payload.get("convergence_key")
+                    or json.loads(original["payload_json"]).get("convergence_key") != payload["convergence_key"]
+                    or self.feedback_report_delivery(report_key) is not None):
+                raise ValueError("Convergent reporting requires an exact posted receipt and a new alias.")
+            self._connection.execute(
+                """UPDATE feedback_report_deliveries SET status = 'superseded'
+                   WHERE status = 'pending'
+                   AND json_extract(payload_json, '$.repository_id') = ?
+                   AND json_extract(payload_json, '$.pr_number') = ?
+                   AND json_extract(payload_json, '$.feedback_id') = ?""",
+                (payload["repository_id"], payload["pr_number"], payload["feedback_id"]),
+            )
+            self._connection.execute(
+                """INSERT INTO feedback_report_deliveries
+                   (report_key, payload_json, status, result_json) VALUES (?, ?, 'posted', ?)""",
+                (report_key, _canonical_json({**payload, "converged_to": converged_to}), original["result_json"]),
+            )
+
     def feedback_summary_bodies(
         self, repository_id: int, pr_number: int
     ) -> tuple[str, ...]:
