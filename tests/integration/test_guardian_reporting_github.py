@@ -34,20 +34,29 @@ def boundary(monkeypatch):
         "actor": _user_payload(),
         "patch_error": None,
         "parent_pull": "https://api.github.test/repos/acme/app/pulls/1",
+        "repository": _repo_payload(),
+        "read_hook": None,
     }
 
     def handler(request):
         path, method = request.url.path, request.method
+        if method == "GET" and state["read_hook"]:
+            response = state["read_hook"](request, state)
+            if response is not None:
+                return response
         if path == "/user":
             return _json_response(request, state["actor"])
         if path == "/repos/acme/app":
-            return _json_response(request, _repo_payload())
+            return _json_response(request, state["repository"])
         if path == "/repos/acme/app/pulls/1":
             return _json_response(request, state["pull"])
         if path == "/repos/acme/app/pulls/comments/12":
             return _json_response(
                 request, {"id": 12, "pull_request_url": state["parent_pull"]}
             )
+        if path.startswith("/repos/acme/app/pulls/comments/") and method == "GET":
+            comment = next(c for c in state["comments"] if c["id"] == int(path.rsplit("/", 1)[1]))
+            return _json_response(request, dict(comment))
         collections = {
             "/repos/acme/app/pulls/1/comments",
             "/repos/acme/app/issues/1/comments",
@@ -120,6 +129,7 @@ def arguments():
         expected_base_sha=BASE_SHA,
         expected_actor=EXPECTED_ACTOR,
         before_create=lambda: None,
+        before_recover=lambda: None,
     )
 
 
@@ -146,6 +156,137 @@ def test_thread_reply_recovers_lost_response_without_duplicate(boundary):
     assert len(state["writes"]) == 1
     assert "glossary" in result.body and "maintainer decision" in result.body
     assert "#discussion_r12" in result.body
+
+
+@pytest.mark.parametrize("kind", ["report", "legacy", "summary"])
+def test_exact_receipt_recovery_never_calls_source_checkout(boundary, kind):
+    broker, state = boundary
+
+    def post(callback):
+        if kind == "summary":
+            return broker.post_feedback_summary(**{**arguments(), "before_create": callback}, reports=[], previous_body=None)
+        return broker.post_feedback_report(**{**report_arguments(), "before_create": callback})
+
+    original = post(lambda: None)
+    if kind == "legacy":
+        from localize.guardian.reporting import legacy_report_body
+        state["comments"][0]["body"] = ("<!-- localize-guardian:feedback:" + "f" * 64 + " -->\n"
+            + legacy_report_body(report_arguments()["details"], repository="acme/app",
+                                 feedback_id="review_comment:12", pull_number=1, web_base_url=broker.web_base_url))
+
+    def forbidden_checkout():
+        raise AssertionError("Read-only receipt recovery must not materialize source checkouts")
+
+    recovered = post(forbidden_checkout)
+    assert recovered.comment_id == original.comment_id and not recovered.created
+    assert len(state["writes"]) == 1
+
+
+@pytest.mark.parametrize("change", ["closed", "head", "base", "actor", "repository", "body", "writer", "type", "parent", "url", "identity", "deleted"])
+def test_receipt_recovery_rechecks_after_collection_reads(boundary, change):
+    """A matching list entry cannot bypass final authority or direct reread."""
+    broker, state = boundary
+    broker.post_feedback_report(**report_arguments())
+    original_writes = list(state["writes"])
+
+    def race(request, remote):
+        if request.url.path == "/repos/acme/app/pulls/1/comments":
+            page = json.loads(json.dumps(remote["comments"]))
+            if change == "closed":
+                remote["pull"]["state"] = "closed"
+            elif change in {"head", "base"}:
+                remote["pull"][change]["sha"] = "f" * 40
+            elif change == "actor":
+                remote["actor"] = _user_payload(actor_id=999)
+            elif change == "repository":
+                remote["repository"]["id"] = 999
+            elif change == "body":
+                remote["comments"][0]["body"] += " external annotation"
+            elif change in {"writer", "type"}:
+                remote["comments"][0]["user"].update({"id": 999} if change == "writer" else {"type": "Bot"})
+            elif change == "parent":
+                remote["comments"][0]["in_reply_to_id"] = 99
+            elif change == "url":
+                remote["comments"][0]["html_url"] = "https://evil.test/comment"
+            return _json_response(request, page)
+        if request.url.path == "/repos/acme/app/pulls/comments/100":
+            if change == "deleted":
+                return _json_response(request, {}, status=404)
+            if change == "identity":
+                return _json_response(request, {**remote["comments"][0], "id": 101,
+                    "html_url": "https://github.test/acme/app/pull/1#discussion_r101"})
+
+    state["read_hook"] = race
+    def no_write():
+        raise AssertionError("Receipt conflicts must not enter publication fallback")
+    with pytest.raises((PolicyViolation, GitHubAuthenticationError, GitHubAPIError)):
+        broker.post_feedback_report(**{**report_arguments(), "before_create": no_write})
+    assert state["writes"] == original_writes
+
+
+@pytest.mark.parametrize("failure", ["duplicate_later_page", "unsafe_link", "repeated_link", "page_bound", "page_http_error"])
+def test_receipt_recovery_requires_complete_safe_pagination(boundary, monkeypatch, failure):
+    broker, state = boundary
+    broker.post_feedback_report(**report_arguments())
+    if failure == "page_bound":
+        monkeypatch.setattr("localize.guardian.github._MAX_PAGINATION_PAGES", 1)
+
+    def pages(request, remote):
+        if request.url.path != "/repos/acme/app/pulls/1/comments":
+            return None
+        if request.url.params.get("page") == "2":
+            if failure == "page_http_error":
+                return _json_response(request, {}, status=503)
+            return _json_response(request, [{**remote["comments"][0], "id": 101,
+                "html_url": "https://github.test/acme/app/pull/1#discussion_r101"}])
+        link = "https://api.github.test/repos/acme/app/pulls/1/comments?page=2"
+        if failure == "unsafe_link":
+            link = "https://evil.test/comments?page=2"
+        elif failure == "repeated_link":
+            link = "https://api.github.test/repos/acme/app/pulls/1/comments"
+        return _json_response(request, remote["comments"], headers={"Link": f'<{link}>; rel="next"'})
+
+    state["read_hook"] = pages
+    with pytest.raises((PolicyViolation, GitHubAPIError)):
+        broker.post_feedback_report(**report_arguments())
+    assert len(state["writes"]) == 1
+
+
+@pytest.mark.parametrize("kind", ["report", "legacy", "summary"])
+def test_receipt_recovery_requires_local_intent_and_lease_callback(boundary, kind):
+    broker, state = boundary
+    def post(**overrides):
+        if kind == "summary":
+            return broker.post_feedback_summary(**{**arguments(), **overrides}, reports=[], previous_body=None)
+        return broker.post_feedback_report(**{**report_arguments(), **overrides})
+    post()
+    if kind == "legacy":
+        from localize.guardian.reporting import legacy_report_body
+        state["comments"][0]["body"] = ("<!-- localize-guardian:feedback:" + "f" * 64 + " -->\n"
+            + legacy_report_body(report_arguments()["details"], repository="acme/app", feedback_id="review_comment:12", pull_number=1, web_base_url=broker.web_base_url))
+    def invalid_intent():
+        raise PolicyViolation("Durable local source or lease is no longer valid")
+    with pytest.raises(PolicyViolation):
+        post(before_recover=invalid_intent)
+    assert len(state["writes"]) == 1
+
+
+@pytest.mark.parametrize("route", ["post", "patch"])
+def test_receipt_fast_path_preserves_full_write_callback_protocol(boundary, route):
+    broker, state = boundary
+    if route == "patch":
+        prior = broker.post_feedback_summary(**arguments(), reports=[], previous_body=None)
+        reports = [{"url": "https://github.test/acme/app/pull/1#discussion_r1", "disposition": "needs_human", "decision_required": True}]
+    calls = []
+    def full_source():
+        calls.append(len(state["writes"]))
+    if route == "post":
+        broker.post_feedback_report(**{**report_arguments(), "before_create": full_source})
+        assert calls == [0, 0]
+    else:
+        broker.post_feedback_summary(**{**arguments(), "before_create": full_source}, reports=reports, previous_body=prior.body)
+        assert calls == [1, 1, 1]
+    assert state["writes"][-1][0] == ("POST" if route == "post" else "PATCH")
 
 
 @pytest.mark.parametrize("change", ["closed", "head", "base", "actor", "thread"])
@@ -281,7 +422,8 @@ def test_summary_retries_known_exact_versions_after_ambiguous_patch(boundary, fa
 
 
 def commit_arguments():
-    return {**arguments(), "commit_sha": HEAD_SHA, "action_id": "private-action-123",
+    return {**{key: value for key, value in arguments().items() if key != "before_recover"},
+            "commit_sha": HEAD_SHA, "action_id": "private-action-123",
             "event_revision_id": "private-event-456"}
 
 
