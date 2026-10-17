@@ -126,3 +126,33 @@ def test_same_second_contradictory_coverage_is_conservative():
         limit = replace(feedback(notice), source_id="2")
         for items in [[reviewed, limit], [limit, reviewed]]:
             assert _coderabbit_coverage(items, head_sha=HEAD).status is expected
+
+
+@pytest.mark.parametrize("phrase", ["rate limited", "over the limit", "review skipped"])
+def test_quoted_limit_examples_do_not_downgrade_review(phrase):
+    for example in [f"```text\n{phrase}\n```", f"> {phrase}", f"~~~\n{phrase}\n~~~"]:
+        item = feedback(summary() + "\n" + example)
+        assert _coderabbit_coverage([item], head_sha=HEAD).status is Status.REVIEWED
+
+
+@pytest.mark.parametrize("selected,skipped,expected", [
+    (2, 2, Status.SKIPPED), (90, 1, Status.SKIPPED),
+    (0, 0, Status.SKIPPED), (90, 0, Status.REVIEWED),
+])
+def test_parenthesized_file_counts(selected, skipped, expected):
+    body = summary(selected=selected, skipped=skipped)
+    body = body.replace(f"processing: {selected}", f"processing ({selected})")
+    body = body.replace(f"changes: {skipped}", f"changes ({skipped})")
+    assert _coderabbit_coverage([feedback(body)], head_sha=HEAD).status is expected
+
+
+def test_provider_rate_limit_wrapper_survives_quoted_notice():
+    # PR 5089 puts the visible warning in a blockquote, but its provider marker
+    # is outside it. Preserve the notice without treating quoted prose as proof.
+    body = (
+        "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n"
+        "<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n"
+        "> [!WARNING]\n> ## Review limit reached\n"
+        "<!-- end of auto-generated comment: rate limited by coderabbit.ai -->"
+    )
+    assert _coderabbit_coverage([feedback(body)], head_sha=HEAD).status is Status.RATE_LIMITED

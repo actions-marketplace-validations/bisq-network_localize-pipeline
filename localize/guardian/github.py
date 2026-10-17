@@ -723,9 +723,6 @@ def _coderabbit_coverage(
                 or not revision.body.strip()):
             continue
         body = revision.body.strip()
-        normalized = body.casefold()
-        limited = any(marker in normalized for marker in _RATE_LIMIT_MARKERS)
-        skipped = any(marker in normalized for marker in _SKIP_MARKERS)
         summary = revision.kind is FeedbackKind.ISSUE_COMMENT and (
             body.startswith("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->")
             or body.startswith("## Walkthrough")
@@ -745,6 +742,9 @@ def _coderabbit_coverage(
             if not fence and not line.lstrip().startswith(">"):
                 proof_lines.append(line)
         proof = "\n".join(proof_lines)
+        normalized = proof.casefold()
+        limited = any(marker in normalized for marker in _RATE_LIMIT_MARKERS)
+        skipped = any(marker in normalized for marker in _SKIP_MARKERS)
         substantive = bool(re.search(
             r"actionable comments posted:\s*\d+|"
             r"No actionable comments were generated in the recent review\.",
@@ -760,8 +760,12 @@ def _coderabbit_coverage(
             status = CodeRabbitCoverageStatus.SKIPPED
         else:
             # Ignore ancillary checks such as unsupported docstring coverage.
-            file_skips = re.findall(r"Files skipped from review[^\n<]*:\s*(\d+)", proof)
-            selected = re.findall(r"Files selected for processing:\s*(\d+)", proof)
+            file_skips = re.findall(
+                r"Files skipped from review[^\n<:(]*(?::\s*|\(\s*)(\d+)", proof,
+            )
+            selected = re.findall(
+                r"Files selected for processing\s*(?::\s*|\(\s*)(\d+)", proof,
+            )
             if any(int(count) for count in file_skips) or selected == ["0"]:
                 status = CodeRabbitCoverageStatus.SKIPPED
             else:
