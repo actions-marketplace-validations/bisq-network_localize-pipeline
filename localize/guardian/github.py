@@ -2458,6 +2458,7 @@ class GitHubWriteBroker:
         self, *, pull_number: int, expected_head_sha: str, expected_base_sha: str,
         expected_actor: TrustedActor, report_id: str, feedback_id: str,
         details: Mapping[str, Any], before_create: Callable[[], None],
+        before_recover: Callable[[], None],
     ) -> ReplyResult:
         """Explain a disposition at its review thread, never resolving it.
 
@@ -2499,16 +2500,101 @@ class GitHubWriteBroker:
         return self._post_explanation(
             pull_number=pull_number, expected_head_sha=expected_head_sha,
             expected_base_sha=expected_base_sha, expected_actor=expected_actor,
-            body=body, marker=title, before_create=before_create,
+            body=body, marker=title, before_create=before_create, before_recover=before_recover,
             identity_parts=(f"[Source feedback]({source_url})", assessed_link),
             legacy_markers=legacy_markers, legacy_bodies=legacy_bodies,
             review_id=review_id,
         )
 
+    def _explanation_matches(
+        self, http: _GitHubHTTP, *, pull_number: int, review_id: int | None,
+        expected_actor: TrustedActor, marker: str, identity_parts: Sequence[str],
+        legacy_markers: Sequence[str],
+    ) -> tuple[int | None, list[Mapping[str, Any]]]:
+        """Read the complete bounded collection and identify one exact route."""
+        prefix = f"/repos/{self.policy.repository}"
+        parent_id = None
+        if review_id is not None:
+            parent = _as_mapping(http.request_json("GET", f"{prefix}/pulls/comments/{review_id}"), label="review comment")
+            if parent.get("pull_request_url") != f"{self.base_url.rstrip('/')}{prefix}/pulls/{pull_number}":
+                raise PolicyViolation("Review comment belongs to a different pull request.")
+            parent_id = _as_int(parent.get("in_reply_to_id") or parent.get("id"), label="review parent id")
+        collection = f"{prefix}/pulls/{pull_number}/comments" if parent_id else f"{prefix}/issues/{pull_number}/comments"
+        matches = [
+            item for item in http.paginate(collection)
+            if isinstance(item.get("user"), Mapping)
+            and (item["user"].get("id"), item["user"].get("type")) == (expected_actor.id, expected_actor.type)
+            and item.get("in_reply_to_id") == parent_id
+            and (((bool(identity_parts) or str(item.get("body") or "").startswith(marker))
+                  and all(part in str(item.get("body") or "") for part in identity_parts))
+                 or any(old in str(item.get("body") or "") for old in legacy_markers))
+        ]
+        if len(matches) > 1:
+            raise PolicyViolation("Ambiguous Guardian explanation markers.")
+        return parent_id, matches
+
+    def _validate_explanation(
+        self, item: Mapping[str, Any], *, expected_body: str, expected_actor: TrustedActor,
+        pull_number: int, parent_id: int | None, created: bool,
+    ) -> ReplyResult:
+        actor = _trusted_actor_from_payload(item.get("user"), label="explanation author")
+        comment_id = _as_int(item.get("id"), label="explanation id")
+        anchor = f"discussion_r{comment_id}" if parent_id else f"issuecomment-{comment_id}"
+        url = f"{self.web_base_url}/{self.policy.repository}/pull/{pull_number}#{anchor}"
+        if ((actor.id, actor.type) != (expected_actor.id, expected_actor.type)
+                or item.get("body") != expected_body or item.get("html_url") != url
+                or item.get("in_reply_to_id") != parent_id):
+            raise PolicyViolation("Guardian explanation actor, content, or route changed.")
+        return ReplyResult(comment_id=comment_id, html_url=url, body=expected_body, created=created)
+
+    def _recover_exact_explanation(
+        self, http: _GitHubHTTP, *, pull_number: int, expected_head_sha: str,
+        expected_base_sha: str, expected_actor: TrustedActor, body: str, marker: str,
+        before_recover: Callable[[], None], review_id: int | None,
+        identity_parts: Sequence[str], legacy_markers: Sequence[str], legacy_bodies: Sequence[str],
+        previous_body: str | Sequence[str] | None,
+    ) -> ReplyResult | None:
+        """A zero-write receipt lookup; failures never become publication fallback.
+
+        Durable intent and lease checks are separate from materializing source
+        checkouts. This branch only acknowledges content already on GitHub.
+        """
+        before_recover()
+        self._require_expected_actor(http, expected_actor=expected_actor)
+        self._fresh_pull(http, pull_number=pull_number, expected_head_sha=expected_head_sha,
+                         expected_base_sha=expected_base_sha)
+        parent_id, matches = self._explanation_matches(
+            http, pull_number=pull_number, review_id=review_id, expected_actor=expected_actor,
+            marker=marker, identity_parts=identity_parts, legacy_markers=legacy_markers,
+        )
+        if not matches:
+            return None
+        candidate = matches[0]
+        candidate_body = candidate.get("body")
+        if candidate_body != body and candidate_body not in legacy_bodies:
+            known = (previous_body,) if isinstance(previous_body, str) else tuple(previous_body or ())
+            if parent_id or not known or len(known) > 100 or candidate_body not in known:
+                raise PolicyViolation("Guardian explanation was edited externally.")
+            self._validate_explanation(candidate, expected_body=candidate_body, expected_actor=expected_actor,
+                                       pull_number=pull_number, parent_id=parent_id, created=False)
+            return None  # A known older summary still requires the full PATCH protocol.
+        receipt = self._validate_explanation(candidate, expected_body=candidate_body, expected_actor=expected_actor,
+                                             pull_number=pull_number, parent_id=parent_id, created=False)
+        before_recover()
+        self._require_expected_actor(http, expected_actor=expected_actor)
+        self._fresh_pull(http, pull_number=pull_number, expected_head_sha=expected_head_sha,
+                         expected_base_sha=expected_base_sha)
+        route = "pulls/comments" if parent_id else "issues/comments"
+        current = _as_mapping(http.request_json("GET", f"/repos/{self.policy.repository}/{route}/{receipt.comment_id}"), label="explanation")
+        if current.get("id") != receipt.comment_id:
+            raise PolicyViolation("Guardian explanation identity changed.")
+        return self._validate_explanation(current, expected_body=candidate_body, expected_actor=expected_actor,
+                                          pull_number=pull_number, parent_id=parent_id, created=False)
+
     def _post_explanation(
         self, *, pull_number: int, expected_head_sha: str, expected_base_sha: str,
         expected_actor: TrustedActor, body: str, marker: str,
-        before_create: Callable[[], None], review_id: int | None = None,
+        before_create: Callable[[], None], before_recover: Callable[[], None], review_id: int | None = None,
         previous_body: str | Sequence[str] | None = None,
         identity_parts: Sequence[str] = (), legacy_markers: Sequence[str] = (),
         legacy_bodies: Sequence[str] = (),
@@ -2518,6 +2604,15 @@ class GitHubWriteBroker:
         self._validate_sha(expected_base_sha, label="expected_base_sha")
         with self._client(self._mint_token()) as client:
             http = _GitHubHTTP(client, deadline=self.deadline)
+            recovered = self._recover_exact_explanation(
+                http, pull_number=pull_number, expected_head_sha=expected_head_sha,
+                expected_base_sha=expected_base_sha, expected_actor=expected_actor,
+                body=body, marker=marker, before_recover=before_recover, review_id=review_id,
+                identity_parts=identity_parts, legacy_markers=legacy_markers,
+                legacy_bodies=legacy_bodies, previous_body=previous_body,
+            )
+            if recovered is not None:
+                return recovered
 
             def fresh() -> None:
                 self._require_expected_actor(http, expected_actor=expected_actor)
@@ -2529,38 +2624,15 @@ class GitHubWriteBroker:
             fresh()
             repo = self.policy.repository
             prefix = f"/repos/{repo}"
-            parent_id = None
-            if review_id is not None:
-                parent = _as_mapping(http.request_json("GET", f"{prefix}/pulls/comments/{review_id}"), label="review comment")
-                if parent.get("pull_request_url") != f"{self.base_url.rstrip('/')}{prefix}/pulls/{pull_number}":
-                    raise PolicyViolation("Review comment belongs to a different pull request.")
-                parent_id = _as_int(parent.get("in_reply_to_id") or parent.get("id"), label="review parent id")
+            parent_id, matches = self._explanation_matches(
+                http, pull_number=pull_number, review_id=review_id, expected_actor=expected_actor,
+                marker=marker, identity_parts=identity_parts, legacy_markers=legacy_markers,
+            )
             collection = f"{prefix}/pulls/{pull_number}/comments" if parent_id else f"{prefix}/issues/{pull_number}/comments"
-            matches = [
-                item for item in http.paginate(collection)
-                if isinstance(item.get("user"), Mapping)
-                and (item["user"].get("id"), item["user"].get("type"))
-                == (expected_actor.id, expected_actor.type)
-                and item.get("in_reply_to_id") == parent_id
-                and (
-                    ((bool(identity_parts) or str(item.get("body") or "").startswith(marker))
-                     and all(part in str(item.get("body") or "") for part in identity_parts))
-                    or any(old in str(item.get("body") or "") for old in legacy_markers)
-                )
-            ]
-            if len(matches) > 1:
-                raise PolicyViolation("Ambiguous Guardian explanation markers.")
 
             def validate(item: Mapping[str, Any], expected_body: str, created: bool) -> ReplyResult:
-                actor = _trusted_actor_from_payload(item.get("user"), label="explanation author")
-                comment_id = _as_int(item.get("id"), label="explanation id")
-                anchor = f"discussion_r{comment_id}" if parent_id else f"issuecomment-{comment_id}"
-                url = f"{self.web_base_url}/{repo}/pull/{pull_number}#{anchor}"
-                if ((actor.id, actor.type) != (expected_actor.id, expected_actor.type)
-                    or item.get("body") != expected_body or item.get("html_url") != url
-                    or (parent_id and item.get("in_reply_to_id") != parent_id)):
-                    raise PolicyViolation("Guardian explanation actor, content, or route changed.")
-                return ReplyResult(comment_id=comment_id, html_url=url, body=expected_body, created=created)
+                return self._validate_explanation(item, expected_body=expected_body, expected_actor=expected_actor,
+                                                   pull_number=pull_number, parent_id=parent_id, created=created)
 
             if matches and matches[0].get("body") == body:
                 return validate(matches[0], body, False)
@@ -2591,6 +2663,7 @@ class GitHubWriteBroker:
         self, *, pull_number: int, expected_head_sha: str, expected_base_sha: str,
         expected_actor: TrustedActor, reports: Sequence[Mapping[str, Any]],
         previous_body: str | Sequence[str] | None, before_create: Callable[[], None],
+        before_recover: Callable[[], None],
     ) -> ReplyResult:
         """Use one managed comment; never weaken PR description recovery checks."""
         from localize.guardian.reporting import summary_body
@@ -2601,7 +2674,7 @@ class GitHubWriteBroker:
             expected_base_sha=expected_base_sha, expected_actor=expected_actor,
             body=summary_body(reports, repository=self.policy.repository,
                               pull_number=pull_number, web_base_url=self.web_base_url),
-            marker=marker, before_create=before_create,
+            marker=marker, before_create=before_create, before_recover=before_recover,
             legacy_markers=("<!-- localize-guardian:feedback-summary:v1 -->",),
             previous_body=previous_body,
         )

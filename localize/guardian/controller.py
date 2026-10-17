@@ -3058,18 +3058,12 @@ class GuardianController:
             ),
         )
 
-    def _require_exact_open_source_authority(
-        self,
-        *,
-        policy: RepositoryPolicy,
-        source: OpenPullAuthorityReference,
-        event_revision_ids: Sequence[int],
-        require_live_lease: Callable[[], None],
-        expected_current_head_sha: str | None = None,
+    def _require_local_open_source_authority(
+        self, *, policy: RepositoryPolicy, source: OpenPullAuthorityReference,
+        event_revision_ids: Sequence[int], expected_current_head_sha: str | None = None,
         allow_empty_feedback: bool = False,
-        reporting_non_feedback_digest: str | None = None,
     ) -> None:
-        """Rehydrate and reauthorize one complete open source before mutation."""
+        """Validate durable source intent without hydrating or checking out code."""
 
         try:
             if source.repository_id != policy.base_repo_id:
@@ -3108,6 +3102,25 @@ class GuardianController:
             raise PreventionSourceAuthorityError(
                 "Durable open prevention evidence is no longer exact."
             ) from exc
+
+    def _require_exact_open_source_authority(
+        self,
+        *,
+        policy: RepositoryPolicy,
+        source: OpenPullAuthorityReference,
+        event_revision_ids: Sequence[int],
+        require_live_lease: Callable[[], None],
+        expected_current_head_sha: str | None = None,
+        allow_empty_feedback: bool = False,
+        reporting_non_feedback_digest: str | None = None,
+    ) -> None:
+        """Rehydrate and reauthorize one complete open source before mutation."""
+
+        self._require_local_open_source_authority(
+            policy=policy, source=source, event_revision_ids=event_revision_ids,
+            expected_current_head_sha=expected_current_head_sha,
+            allow_empty_feedback=allow_empty_feedback,
+        )
 
         revalidate = getattr(
             self.snapshot_provider,
@@ -7536,6 +7549,13 @@ class GuardianController:
                 reporting_non_feedback_digest=reporting_non_feedback_digest,
             )
 
+        def validate_receipt_intent() -> None:
+            self._require_live_lease(lease_owner)
+            self._require_local_open_source_authority(
+                policy=policy, source=open_source, event_revision_ids=revision_ids,
+                expected_current_head_sha=head, allow_empty_feedback=not revision_ids,
+            )
+
         try:
             for event, revision in current:
                 if event.deleted:
@@ -7655,6 +7675,7 @@ class GuardianController:
                         feedback_id=event.feedback_id,
                         details=details,
                         before_create=revalidate,
+                        before_recover=validate_receipt_intent,
                     )
                     result = {"url": response.html_url, "body": response.body}
                     self._require_live_lease(lease_owner)
@@ -7737,6 +7758,7 @@ class GuardianController:
                     reports=reports,
                     previous_body=previous,
                     before_create=revalidate,
+                    before_recover=validate_receipt_intent,
                 )
                 self._require_live_lease(lease_owner)
                 self.state.finish_feedback_report(

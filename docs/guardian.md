@@ -200,6 +200,12 @@ call or correction. Changed feedback must be revalidated/reassessed before any
 new post, and closed PRs cannot receive these open-PR reports. `observe` and
 `prepare` never publish explanations.
 
+Recovering an exact existing explanation checks durable local intent, the live
+lease, writer/repository identity, open PR revisions, and the complete comment
+collection, then rereads the matched comment. This read-only acknowledgement
+does not materialize source checkouts or process new feedback. Every new post
+and summary edit still requires full current-source revalidation.
+
 When actionable corrections are pending, Guardian assesses and attempts them
 before sending old status explanations. A reviewer bot can react immediately to
 a status reply and change the trusted snapshot; such replies must not repeatedly
