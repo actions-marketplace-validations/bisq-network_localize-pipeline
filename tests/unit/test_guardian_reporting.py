@@ -189,7 +189,15 @@ def observed_followups():
     return json.loads((Path(__file__).parent / "fixtures/guardian_5085_5086_5088_followups.json").read_text())
 
 
-@pytest.mark.parametrize("reply", observed_followups(), ids=lambda item: item["id"])
+def recent_followups():
+    """Three fresh replies observed after the original frozen26-ID corpus."""
+    import json
+    from pathlib import Path
+
+    return json.loads((Path(__file__).parent / "fixtures/guardian_20261017_followups.json").read_text())
+
+
+@pytest.mark.parametrize("reply", observed_followups() + recent_followups(), ids=lambda item: item["id"])
 def test_observed_followups_and_mixed_evidence_controls(reply):
     from dataclasses import replace
     from localize.guardian.reporting import quiet_reviewer_reply, reviewer_followup_kind
