@@ -5874,6 +5874,70 @@ class GuardianController:
             )
         return AuthorizedFeedback(events=(*authorized.events, *events), skipped=authorized.skipped)
 
+    def _hold_thread_replies(
+        self, *, policy: RepositoryPolicy, snapshot: PullRequestFeedbackSnapshot,
+        current: Sequence[tuple[FeedbackEvent, EventRevision]],
+        actionable: Sequence[tuple[FeedbackEvent, EventRevision]], scope: _TargetScope,
+        run_id: str, observed_at: datetime, lease_owner: str,
+    ) -> frozenset[int]:
+        """Retain bot evidence under an exact completed human decision before proposals.
+
+        Unknown or edited evidence is not an assessment or evidence equivalence.
+        It is owned by the existing human review until governed context changes.
+        """
+        if (scope.config_bundle_digest is None
+                or not re.fullmatch(r"[0-9a-f]{64}", scope.config_bundle_digest)
+                or self.state.pending_publications(repository=policy.base_repo, repository_id=policy.base_repo_id)):
+            return frozenset()
+        sources = {(item.kind.value, item.source_id): item for item in snapshot.feedback}
+        by_id = {(event.kind, event.event_id): (event, revision) for event, revision in current}
+        digest = _patch_policy_digest(self.config, policy, scope)
+        held = set()
+        for event, revision in actionable:
+            source = sources.get((event.kind, event.event_id))
+            if (source is None or event.deleted or event.kind != "review_comment"
+                    or event.author_type != "Bot" or event.author.casefold() != "coderabbitai[bot]"
+                    or not source.in_reply_to_id):
+                continue
+            root_pair = by_id.get(("review_comment", str(source.in_reply_to_id)))
+            root_source = sources.get(("review_comment", str(source.in_reply_to_id)))
+            if root_pair is None or root_source is None or root_source.in_reply_to_id is not None:
+                continue
+            root, root_revision = root_pair
+            if (root.deleted or root.author_type != "Bot" or root.author_id != event.author_id
+                    or (root.head_sha, root.base_sha) != (event.head_sha, event.base_sha)):
+                continue
+            seed = self.state.thread_hold_seed(
+                root_revision.revision_id, policy_digest=digest,
+                config_digest=scope.config_bundle_digest or "unbound", mode=self.config.mode,
+            )
+            if seed is None:
+                continue
+            literals = set(re.findall(r'(?<!`)`([^`\n]+)`(?!`)', event.body))
+            root_literals = set(re.findall(r'(?<!`)`([^`\n]+)`(?!`)', root.body))
+            unchanged = (not self.state.feedback_content_was_edited(revision)
+                         and reviewer_followup_kind(event, is_reply=True) == "insufficient_evidence"
+                         and literals <= root_literals
+                         and all(language in root.body for language in re.findall(r'\b([A-Z][a-z]+) reviewer', event.body)))
+            self._require_live_lease(lease_owner)
+            self.state.record_action(
+                run_id=run_id, event_revision_id=revision.revision_id,
+                action=self.config.mode.value, status="skipped", occurred_at=observed_at,
+                details={"outcome": "thread_human_review", "decision_required": True,
+                         "report_policy_digest": digest,
+                         "report_config_digest": scope.config_bundle_digest or "unbound",
+                         "thread_hold": {**seed, "classification": "unchanged_reminder" if unchanged else "new_evidence",
+                                         "reason": "awaiting_human_review", "root_event_id": root.event_id,
+                                         "url": f"https://{self.github_host}/{policy.base_repo}/pull/{event.pr_number}#discussion_r{event.event_id}",
+                                         "root_url": f"https://{self.github_host}/{policy.base_repo}/pull/{event.pr_number}#discussion_r{root.event_id}",
+                                         "repository_id": policy.base_repo_id,
+                                         "head_sha": event.head_sha, "base_sha": event.base_sha,
+                                         "policy_digest": digest,
+                                         "config_digest": scope.config_bundle_digest or "unbound"}},
+            )
+            held.add(revision.revision_id)
+        return frozenset(held)
+
     def _process_snapshot(
         self,
         *,
@@ -6132,6 +6196,12 @@ class GuardianController:
                 and revision.revision_id
                 not in {item[1].revision_id for item in already_addressed}
             )
+            held_replies = self._hold_thread_replies(
+                policy=policy, snapshot=snapshot, current=tuple(current.values()),
+                actionable=actionable, scope=scope, run_id=run_id,
+                observed_at=observed_at, lease_owner=lease_owner,
+            )
+            actionable = tuple(item for item in actionable if item[1].revision_id not in held_replies)
             translation_suppressed_feedback_ids = frozenset(
                 event.feedback_id
                 for event, revision in actionable
@@ -6165,8 +6235,7 @@ class GuardianController:
                     run_id,
                     status="completed",
                     summary=(
-                        "Resolved only superseded, deleted, or already-applied "
-                        "feedback revisions."
+                        "Recorded non-actionable revisions and human-owned thread evidence."
                     ),
                     finished_at=observed_at,
                 )
@@ -7559,6 +7628,11 @@ class GuardianController:
         try:
             for event, revision in current:
                 if event.deleted:
+                    continue
+                # This revision is retained human evidence, not a fresh public
+                # explanation intent. In particular an earlier failed action
+                # must not leak through latest_feedback_report's reason filter.
+                if self.state.thread_hold_for_revision(revision.revision_id, policy_digest=policy_digest) is not None:
                     continue
                 details = assessed_reports[revision.revision_id]
                 if details is None or details.get("report_outcome") == "failed":

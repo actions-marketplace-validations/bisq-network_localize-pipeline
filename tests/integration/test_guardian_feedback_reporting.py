@@ -47,8 +47,8 @@ class InsufficientEvidenceDriver(FakeCodexDriver):
         return decisions(super().run(task, success_observer=completed, **kwargs))
 
 
-def test_unchanged_evidence_followups_converge_after_assessment(tmp_path, runtime):
-    """Five natural followups keep one published decision and its summary link."""
+def test_unchanged_evidence_followups_remain_under_thread_hold(tmp_path, runtime):
+    """Five natural followups retain the completed root decision without proposals."""
     _, _, checkout, provider, broker, _ = runtime
     policy = replace(_policy(), trusted_bots={"ru": (TrustedActor("coderabbitai[bot]", 999, "Bot"),)})
     root = replace(_feedback(body="A Swahili reviewer should assess `umetumwa`."),
@@ -73,29 +73,29 @@ def test_unchanged_evidence_followups_converge_after_assessment(tmp_path, runtim
             assert outcome.failures == () and outcome.applied_commits == ()
             assert len(broker.feedback_reports) == 1
             assert broker.feedback_summary.body == original_summary
-        assert len(driver.calls) == 6
+        assert len(driver.calls) == 1
         assert len(state.latest_event_revisions()) == 6
-        assert all(state.latest_feedback_report(revision.revision_id) is not None
-                   for revision in state.latest_event_revisions())
+        assert state.thread_hold_evidence_for_operator()[0] == 5
         # A fresh controller and SQLite connection retain the publication
-        # aliases; process memory is not the convergence mechanism.
+        # human-hold actions; process memory is not the convergence mechanism.
         with GuardianState(tmp_path / "state.sqlite3") as restarted_state:
             restarted = _controller(tmp_path=tmp_path, state=restarted_state, config=config,
                                     checkout=checkout, provider=provider, driver=driver, broker=broker)
             assert restarted.poll_once().failures == ()
-            assert len(driver.calls) == 6 and len(broker.feedback_reports) == 1
+            assert len(driver.calls) == 1 and len(broker.feedback_reports) == 1
         # A new literal is material evidence, even inside the same known grammar.
         feedback.append(replace(feedback[-1], source_id="9991", body=feedback[-1].body.replace("umetumwa", "another-word")))
         provider.snapshots = (_snapshot(feedback=tuple(feedback)),)
         assert controller.poll_once().failures == ()
-        assert len(broker.feedback_reports) == 2
-        # An edited repeat also remains publicly accountable.
+        assert len(broker.feedback_reports) == 1
+        assert state.thread_hold_evidence_for_operator()[0] == 6
+        # An edited repeat is new human evidence, never an inherited assessment.
         feedback[-2] = replace(feedback[-2], updated_at="2026-08-30T11:00:00Z",
                                body=feedback[-2].body.replace("translation concern", "finding"))
         provider.snapshots = (_snapshot(feedback=tuple(feedback)),)
         assert controller.poll_once().failures == ()
-        assert f"review_comment:{feedback[-2].source_id}" in _posted_feedback_ids(state)
-        assert len(broker.feedback_reports) <= 4
+        assert len(driver.calls) == 1 and len(broker.feedback_reports) == 1
+        assert state.thread_hold_evidence_for_operator()[0] == 6
 
 
 def test_edited_resolved_acknowledgement_is_reported(convergence_reporting):
