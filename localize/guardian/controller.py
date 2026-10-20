@@ -560,6 +560,7 @@ class PollOutcome:
     prevention_items_skipped: int = 0
     prevention_items_deferred: int = 0
     prevention_failures: tuple[str, ...] = ()
+    prevention_items_declined: int = 0
     project_policy_proposals: tuple[str, ...] = ()
     remediation_drafts_created: int = 0
     remediation_items_deferred: int = 0
@@ -593,6 +594,7 @@ class _PollAccumulator:
     prevention_items_skipped: int = 0
     prevention_items_deferred: int = 0
     prevention_failures: list[str] = field(default_factory=list)
+    prevention_items_declined: int = 0
     project_policy_proposals: list[str] = field(default_factory=list)
     remediation_drafts_created: int = 0
     remediation_items_deferred: int = 0
@@ -627,6 +629,7 @@ class _PollAccumulator:
             prevention_items_skipped=self.prevention_items_skipped,
             prevention_items_deferred=self.prevention_items_deferred,
             prevention_failures=tuple(self.prevention_failures),
+            prevention_items_declined=self.prevention_items_declined,
             project_policy_proposals=tuple(self.project_policy_proposals),
             remediation_drafts_created=self.remediation_drafts_created,
             remediation_items_deferred=self.remediation_items_deferred,
@@ -2808,6 +2811,7 @@ class GuardianController:
                                 outcome.prevention_items_deferred
                             ),
                             "prevention_failures": tuple(outcome.prevention_failures),
+                            "prevention_items_declined": outcome.prevention_items_declined,
                             "remediation_drafts_created": (
                                 outcome.remediation_drafts_created
                             ),
@@ -7146,6 +7150,7 @@ class GuardianController:
             1 for draft in result.drafts if draft.created
         )
         outcome.prevention_items_skipped += result.skipped
+        outcome.prevention_items_declined += result.declined
         outcome.prevention_items_deferred += result.deferred
         outcome.prevention_failures.extend(result.failures)
         outcome.project_policy_proposals.extend(result.policy_proposals)

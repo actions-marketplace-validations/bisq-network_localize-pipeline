@@ -10540,3 +10540,27 @@ def test_private_quality_publication_passes_separate_evidence_to_workspace(
         assert outcome.applied_commits == (COMMIT_SHA,)
         assert state.pending_publications() == ()
     assert len(commit_calls) == 1
+
+
+@pytest.mark.parametrize("decline", [True, False])
+def test_prevention_disposition_controls_whole_poll_health(tmp_path, runtime, decline):
+    base, head, checkout, provider, broker, sequence = runtime
+    policy = replace(_historical_policy(remediation=True), prevention=_prevention_policy())
+    prevention = FakePreventionRunner(result=PreventionBatchOutcome(
+        declined=1 if decline else 0, failures=() if decline else ("PreventionPolicyError",)))
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        controller = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.PROPOSE_PREVENTION, policies=(policy,)),
+            checkout=checkout, provider=FakeSnapshotProvider(()), driver=RecurrenceCodexDriver(),
+            broker=broker, prevention_runner=prevention,
+            historical_snapshot_provider=FakeHistoricalSnapshotProvider((_snapshot(pull=_pull(state="closed")),)),
+            historical_checkout_factory=FakeHistoricalCheckoutFactory(base, head, tmp_path),
+            current_base_provider=FakeCurrentBaseProvider(), remediation_runner=FakeRemediationRunner(),
+        )
+        result = controller.poll_once()
+        audit = state.latest_health("guardian")
+        assert audit.status == ("ok" if decline else "failed")
+        assert result.prevention_items_declined == int(decline)
+        assert audit.details['prevention_items_declined'] == int(decline)
+        assert bool(result.prevention_failures) is not decline

@@ -1421,3 +1421,21 @@ and public comment counts. Rerunning with the same findings at the same revision
 does not duplicate the comment. An unchanged English value is a candidate for
 review, not proof of a mistranslation; product names and shared-language terms
 may correctly remain unchanged.
+
+### Prevention author declines
+
+Pipeline prevention authoring returns a structured `patch` or `declined` result.
+A decline must identify `project_policy`, `no_generic_defect`, or `already_covered`,
+provide a bounded explanation, and reference existing regular files it inspected.
+The controller independently requires the candidate tree to be unchanged before
+recording the disposition in the private `prevention-author` health ledger. This
+records a model assessment; it does not prove the translation issue is resolved
+or authorize a code or project-policy change.
+
+A missing or malformed result, an unexplained empty patch, a nonexistent inspected
+file, or edits accompanying a decline still fail the poll. Valid declines are
+counted separately from failed and deferred work. `guardian status` shows the
+latest private decline reference without printing its untrusted rationale.
+Repeated authoring is suppressed only for the same pipeline base, repository
+policy, source authority and evidence revisions. Changed inputs require a fresh
+assessment. Historical failure diagnostics remain available.

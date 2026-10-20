@@ -63,11 +63,17 @@ from localize.guardian.models import (
     RepositoryPolicy,
     TrustedActor,
 )
+from localize.guardian.prevention_decision import (
+    PreventionDecision,
+    SCHEMA_PATH as DECISION_SCHEMA_PATH,
+    read_decision,
+)
 from localize.guardian.prevention import (
     PreventionPolicyError,
     TestCommandResult,
     TestOutcome,
     inspect_prevention_patch,
+    inspect_prevention_decline,
     plan_prevention_draft,
     prevention_evidence_hash,
 )
@@ -165,6 +171,14 @@ plus independently accepted corrected controls; author-invented red/green tests
 alone do not establish that the reported original case is fixed. If this is only
 project policy, decline code changes and explain the classification; never force
 a terminology rule into code merely to satisfy the pipeline_code scope.
+Your final response must be the required structured disposition. Use outcome=patch
+and reason="" only after making a code and regression-test change. Otherwise leave
+the entire checkout unchanged and use outcome=declined with reason=project_policy,
+no_generic_defect, or already_covered. Explain the specific inspected behavior and
+why a generic patch is unjustified. Name existing repository-relative regular files
+in inspected_paths. A decline records your assessment for operator review; it does
+not establish that the translation issue is resolved. Never report a decline to hide
+a tool failure, incomplete work, uncertainty, or inability to inspect the code.
 Change only files matching the explicit code and test path allowlists. Do not change
 project-specific localization config, glossaries, workflows, credentials, Git metadata,
 or generated artifacts. Do not commit, sign, push, open a pull request, or use network
@@ -392,6 +406,7 @@ class PreventionAuthorResult:
 
     attempts: int
     usage: CodexUsage | None
+    decision: PreventionDecision | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +418,7 @@ class PreventionBatchOutcome:
     deferred: int = 0
     failures: tuple[str, ...] = ()
     policy_proposals: tuple[str, ...] = ()
+    declined: int = 0
 
 
 class PreventionCheckoutFactory(Protocol):
@@ -1985,7 +2001,7 @@ class PreventionCodexAuthor:
         self.deadline = deadline
         self.max_new_real_data_findings = max_new_real_data_findings
 
-    def _argv(self, workspace: Path) -> list[str]:
+    def _argv(self, workspace: Path, output_path: Path | None = None) -> list[str]:
         config_arguments = [
             argument
             for setting in (
@@ -2012,6 +2028,10 @@ class PreventionCodexAuthor:
             self.model,
             "-C",
             str(workspace),
+            *(
+                ["--output-schema", str(DECISION_SCHEMA_PATH.resolve()), "-o", str(output_path)]
+                if output_path is not None else []
+            ),
             "-",
         ]
 
@@ -2075,7 +2095,8 @@ class PreventionCodexAuthor:
             )
             if api_key is not None:
                 environment["CODEX_API_KEY"] = api_key
-            argv = self._argv(workspace)
+            output_path = temporary / "decision.json" if scope == "pipeline_code" else None
+            argv = self._argv(workspace, output_path)
             file_limit = max(
                 8 * 1024 * 1024,
                 min(policy.max_changed_bytes * 4, 64 * 1024 * 1024),
@@ -2145,6 +2166,7 @@ class PreventionCodexAuthor:
                     api_key in output
                     for output in (completed.stdout or "", completed.stderr or "")
                 )
+                secrets = (api_key,) if api_key else ()
                 environment.pop("CODEX_API_KEY", None)
                 api_key = None
                 if unsafe_diagnostic:
@@ -2154,6 +2176,9 @@ class PreventionCodexAuthor:
                 return PreventionAuthorResult(
                     attempts=1,
                     usage=_extract_usage(completed.stdout),
+                    decision=(
+                        read_decision(output_path, secrets=secrets) if output_path else None
+                    ),
                 )
             diagnostic = _diagnostic_detail(completed)
             environment.pop("CODEX_API_KEY", None)
@@ -4218,7 +4243,7 @@ class PreventionCoordinator:
         policy: PreventionPolicy,
         require_live_lease: Callable[[], None],
         require_cleanup_lease: Callable[[], None],
-    ) -> tuple[Path, tuple[str, ...]]:
+    ) -> tuple[Path, tuple[str, ...], PreventionDecision | None]:
         issued_credentials: list[str] = []
         for attempt in range(1, self.author.max_attempts + 1):
             attempt_workspace = workspace
@@ -4401,7 +4426,7 @@ class PreventionCoordinator:
                     marked_at=completed_at,
                 )
             self._require_remaining()
-            return attempt_workspace, tuple(issued_credentials)
+            return attempt_workspace, tuple(issued_credentials), result.decision
         raise CodexTransientError(  # pragma: no cover - bounded loop is non-empty
             "Prevention Codex author did not complete."
         )
@@ -4433,8 +4458,8 @@ class PreventionCoordinator:
         ]
         | None,
         real_data: RealDataCorpus | None = None,
-    ) -> PreventionDraftResult:
-        """Author, test, sign, and publish one bounded prevention candidate."""
+    ) -> PreventionDraftResult | PreventionDecision:
+        """Author, test, sign, and publish, or return a validated private decline."""
         if real_data is None:
             # Without real data the candidate's effect cannot be measured, so
             # fail closed before spending a model call on unpublishable work.
@@ -4467,7 +4492,7 @@ class PreventionCoordinator:
                     author_workspace,
                     **deadline_kwargs,
                 )
-                author_workspace, issued_credentials = self._reserve_and_author(
+                author_workspace, issued_credentials, decision = self._reserve_and_author(
                     run_id=run_id,
                     base_workspace=base_workspace.path,
                     workspace=author_workspace,
@@ -4477,6 +4502,14 @@ class PreventionCoordinator:
                     require_live_lease=require_live_lease,
                     require_cleanup_lease=require_cleanup_lease,
                 )
+                if decision is not None and decision.outcome == "declined":
+                    inspect_prevention_decline(
+                        base_workspace=base_workspace.path,
+                        candidate_workspace=author_workspace,
+                        inspected_paths=decision.inspected_paths,
+                        **deadline_kwargs,
+                    )
+                    return decision
                 patch = inspect_prevention_patch(
                     base_workspace=base_workspace.path,
                     candidate_workspace=author_workspace,
@@ -4916,7 +4949,7 @@ class PreventionCoordinator:
             (base / 'request.json').write_bytes(request)
             workspace = temporary / 'candidate'
             shutil.copytree(base, workspace)
-            selected, _credentials = self._reserve_and_author(
+            selected, _credentials, _decision = self._reserve_and_author(
                 run_id=run_id, base_workspace=base, workspace=workspace,
                 candidate=candidate, evidence_ids=tuple(feedback_ids), policy=policy.prevention,
                 require_live_lease=require_live_lease, require_cleanup_lease=cleanup,
@@ -4962,7 +4995,8 @@ class PreventionCoordinator:
         """Route project policy to private artifacts before any code publication adapter."""
         projects = tuple(candidate for candidate in recurrence_candidates if candidate.scope == 'project_config')
         if not projects:
-            return self._propose_pipeline(recurrence_candidates=recurrence_candidates, **kwargs)
+            return self._propose_pipeline(recurrence_candidates=recurrence_candidates,
+                                          policy_config_digest=policy_config_digest, **kwargs)
         if len(recurrence_candidates) > _MAX_RECURRENCE_CANDIDATES_PER_PROPOSAL:
             raise ValueError('recurrence_candidates exceeds the per-proposal bound')
         proposals = []
@@ -4985,11 +5019,12 @@ class PreventionCoordinator:
         remaining = tuple(candidate for candidate in recurrence_candidates if candidate.scope != 'project_config')
         # A project-only batch cannot instantiate a publication broker, check out code,
         # sign, recover a public draft, or spend a publication slot.
-        other = (self._propose_pipeline(recurrence_candidates=remaining, **kwargs)
+        other = (self._propose_pipeline(recurrence_candidates=remaining,
+                                         policy_config_digest=policy_config_digest, **kwargs)
                  if remaining else PreventionBatchOutcome())
         return PreventionBatchOutcome(drafts=other.drafts, skipped=skipped + other.skipped,
                                       deferred=other.deferred, failures=tuple(failures) + other.failures,
-                                      policy_proposals=tuple(proposals))
+                                      policy_proposals=tuple(proposals), declined=other.declined)
 
     def _propose_pipeline(
         self,
@@ -5014,6 +5049,7 @@ class PreventionCoordinator:
         ]
         | None = None,
         real_data: RealDataCorpus | None = None,
+        policy_config_digest: str | None = None,
     ) -> PreventionBatchOutcome:
         """Handle pipeline-code recurrences within one explicit repository policy."""
 
@@ -5031,6 +5067,7 @@ class PreventionCoordinator:
         broker = self.broker_factory(prevention) if prevention is not None else None
         drafts: list[PreventionDraftResult] = []
         deferred = 0
+        declined = 0
         failures: list[str] = []
         if self._claim_recovery_pass(policy.base_repo_id):
             drafts, deferred, failures = self._recover(
@@ -5293,9 +5330,25 @@ class PreventionCoordinator:
                 continue
             # Do not refund this slot after a deterministic validation failure:
             # every candidate may consume the configured model-attempt budget.
-            self._authoring_slots_used += 1
             if base is None:  # pragma: no cover - guarded by capacity check above
                 raise RuntimeError("Prevention base was not captured for authoring.")
+            decline_key = hashlib.sha256(
+                _canonical_attestation_json({
+                    "version": 1,
+                    "base_sha": base.revision.sha,
+                    "policy": _source_policy_attestation(policy)[1],
+                    "pipeline_config_digest": policy_config_digest,
+                    "evidence_hash": _evidence_hash,
+                    "open_source": open_source,
+                    "source_pulls": normalized_sources,
+                    "source_revisions": normalized_source_revision_ids,
+                }).encode("ascii")
+            ).hexdigest()
+            prior = self.state.prevention_decline(decline_key)
+            if prior is not None:
+                declined += 1
+                continue
+            self._authoring_slots_used += 1
             try:
                 draft = self._create_one(
                     source_policy=policy,
@@ -5335,6 +5388,34 @@ class PreventionCoordinator:
                 record_failure(exc, repository=policy.base_repo, run_id=run_id)
                 failures.append(type(exc).__name__)
                 continue
+            if isinstance(draft, PreventionDecision):
+                # This is private model evidence, never publication or repair proof.
+                _require_live_prevention_lease(require_live_lease)
+                require_current_base_unchanged()
+                if open_source is not None:
+                    require_exact_open_source_authority(
+                        open_source, normalized_source_revision_ids
+                    )
+                else:
+                    require_exact_sources_still_closed(
+                        normalized_sources, normalized_source_revision_ids
+                    )
+                self.state.record_health(
+                    component="prevention-author",
+                    status="declined",
+                    message="Prevention author declined a generic patch; private assessment retained.",
+                    details={
+                        "schema_version": 1, "decline_key": decline_key,
+                        "repository": policy.base_repo, "run_id": run_id,
+                        "base_sha": base.revision.sha, "evidence_hash": _evidence_hash,
+                        "evidence_ids": evidence_ids, "outcome": draft.outcome,
+                        "reason": draft.reason, "explanation": draft.explanation,
+                        "inspected_paths": draft.inspected_paths,
+                    },
+                    checked_at=_as_utc(self.now()),
+                )
+                declined += 1
+                continue
             drafts.append(draft)
             known_hashes = known_hashes | {
                 prevention_evidence_hash(
@@ -5347,6 +5428,7 @@ class PreventionCoordinator:
             skipped=skipped,
             deferred=deferred,
             failures=tuple(failures),
+            declined=declined,
         )
 
 

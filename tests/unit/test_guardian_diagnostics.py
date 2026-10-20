@@ -90,3 +90,12 @@ def test_unknown_cause_chain_is_bounded_redacted_and_cycle_safe():
     assert all(item == {"exception": "Exception", "reason": "unclassified"}
                for item in details["causes"])
     assert "secret-" not in str(details)
+
+
+def test_empty_prevention_patch_retains_a_safe_reason(tmp_path):
+    from localize.guardian.prevention import PreventionPolicyError
+    from localize.guardian.diagnostics import failure_audit, record_failure
+    from localize.guardian.state import GuardianState
+    with GuardianState(tmp_path / "state.sqlite3") as state, failure_audit(state):
+        record_failure(PreventionPolicyError("prevention draft contains no changed files"))
+        assert state.latest_health("guardian-failure").details['reason'] == "empty_prevention_patch"

@@ -597,6 +597,13 @@ def _recovery_broker(
     )
 
 
+def _write_author_decision(argv):
+    path = Path(argv[argv.index("-o") + 1])
+    path.write_text(json.dumps({"schema_version": 1, "outcome": "patch", "reason": "",
+                                "explanation": "Implemented the generic correction and regression test.",
+                                "inspected_paths": ["localize/rules.py"]}))
+
+
 def test_prevention_author_uses_workspace_write_stdin_and_scrubs_write_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -611,6 +618,7 @@ def test_prevention_author_uses_workspace_write_stdin_and_scrubs_write_credentia
         observed["argv"] = list(argv)
         observed["kwargs"] = kwargs
         observed["launch_environment"] = dict(kwargs["env"])
+        _write_author_decision(argv)
         return subprocess.CompletedProcess(
             argv,
             0,
@@ -689,6 +697,8 @@ def test_prevention_author_uses_workspace_write_stdin_and_scrubs_write_credentia
         "SSH_AUTH_SOCK",
     ):
         assert forbidden not in kwargs["env"]
+    assert result.decision.outcome == "patch"
+    assert "--output-schema" in argv
     assert result.usage == CodexUsage(input_tokens=12, output_tokens=3, cost_usd=0.02)
 
 
@@ -806,6 +816,7 @@ def test_prevention_author_never_inherits_a_host_model_credential(
 
     def fake_run(argv, **kwargs):
         observed_environment.update(kwargs["env"])
+        _write_author_decision(argv)
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(prevention_runtime, "run_bounded_process", fake_run)
@@ -846,6 +857,7 @@ def test_prevention_author_clamps_process_to_remaining_poll_deadline(
 
     def fake_run(argv, **kwargs):
         observed_timeout.append(kwargs["timeout"])
+        _write_author_decision(argv)
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(prevention_runtime, "run_bounded_process", fake_run)
@@ -9191,6 +9203,7 @@ def test_prevention_author_is_told_about_real_data_impact_gate(
 
     def fake_run(argv, **kwargs):
         observed["prompt"] = kwargs["input"]
+        _write_author_decision(argv)
         return subprocess.CompletedProcess(
             argv,
             0,
@@ -9295,3 +9308,114 @@ def test_narrow_candidate_adding_blocking_reason_within_bound_is_published(
     assert len(outcome.drafts) == 1
     assert outcome.failures == ()
     assert broker.open_calls == 1
+
+
+@pytest.mark.parametrize("kind", ["declined", "empty", "patch_empty", "changed_decline", "missing_reference"])
+def test_prevention_decline_requires_explicit_result_and_unchanged_tree(tmp_path, kind):
+    from localize.guardian.prevention_decision import PreventionDecision
+
+    class DecliningAuthor(_FakeAuthor):
+        def run(self, *, workspace, **kwargs):
+            self.calls += 1
+            if kind == "changed_decline":
+                (workspace / "localize/rules.py").write_text("changed = True\n")
+            decision = None if kind == "empty" else PreventionDecision(
+                outcome="patch" if kind == "patch_empty" else "declined",
+                reason="" if kind == "patch_empty" else "project_policy",
+                explanation="This is a project wording rule rather than a generic engine defect.",
+                inspected_paths=("missing.py" if kind == "missing_reference" else "localize/rules.py",),
+            )
+            return PreventionAuthorResult(attempts=1, usage=None, decision=decision)
+
+    now = datetime(2026, 8, 30, 12, tzinfo=UTC)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        run_id = state.start_run(repository="acme/translations", locale="ru",
+                                 mode=GuardianMode.PROPOSE_PREVENTION, started_at=now)
+        author = DecliningAuthor()
+        broker = _FakeBroker()
+        coordinator = _coordinator(state=state, tmp_path=tmp_path, broker=broker, author=author)
+        kwargs = dict(policy=_repository_policy(), recurrence_candidates=(_candidate(),),
+                      evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
+                      run_id=run_id, observed_at=now, require_live_lease=_live_lease,
+                      require_current_base_unchanged=_current_base, **_open_source_kwargs())
+        outcome = coordinator.propose(**kwargs)
+        assert not outcome.drafts and broker.open_calls == 0 and broker.verify_calls == 0
+        if kind == "declined":
+            assert outcome.failures == () and outcome.declined == 1
+            receipt = state.latest_health("prevention-author")
+            assert receipt.status == "declined"
+            assert receipt.details['reason'] == "project_policy"
+            assert receipt.details['base_sha'] == BASE_SHA
+            assert receipt.details['explanation'].startswith("This is a project")
+            coordinator.begin_poll()
+            again = coordinator.propose(**kwargs)
+            assert again.failures == () and again.declined == 1 and author.calls == 1
+            # New evidence must not reuse the old disposition.
+            coordinator.begin_poll()
+            changed = coordinator.propose(**dict(kwargs, recurrence_candidates=(_candidate("A different defect"),)))
+            assert changed.declined == 1 and author.calls == 2
+        else:
+            assert outcome.failures and outcome.declined == 0
+            assert state.latest_health("prevention-author") is None
+
+
+def test_real_author_requires_a_disposition_even_after_exit_zero(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(prevention_runtime, "run_bounded_process",
+                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
+    with pytest.raises(CodexOutputError, match="disposition"):
+        PreventionCodexAuthor(model="gpt-test", reasoning_effort="high").run(
+            workspace=workspace, scope="pipeline_code", summary="Possible defect",
+            evidence_feedback_ids=("review_comment:42",), policy=_prevention_policy(), api_key=None)
+
+
+def test_real_author_returns_structured_decline(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    def fake_run(argv, **kw):
+        Path(argv[argv.index("-o") + 1]).write_text(json.dumps({
+            "schema_version": 1, "outcome": "declined", "reason": "no_generic_defect",
+            "explanation": "The inspected engine already preserves the required source context.",
+            "inspected_paths": ["localize/rules.py"]}))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    monkeypatch.setattr(prevention_runtime, "run_bounded_process", fake_run)
+    result = PreventionCodexAuthor(model="gpt-test", reasoning_effort="high").run(
+        workspace=workspace, scope="pipeline_code", summary="Possible defect",
+        evidence_feedback_ids=("review_comment:42",), policy=_prevention_policy(), api_key=None)
+    assert result.decision.reason == "no_generic_defect"
+
+
+def test_decline_persistence_survives_restart_and_new_base_invalidates_it(tmp_path):
+    from localize.guardian.prevention_decision import PreventionDecision
+    class DecliningAuthor(_FakeAuthor):
+        def run(self, **kwargs):
+            self.calls += 1
+            return PreventionAuthorResult(attempts=1, usage=None, decision=PreventionDecision(
+                "declined", "already_covered", "The inspected implementation already handles this case.",
+                ("localize/rules.py",)))
+    now = datetime(2026, 8, 30, 12, tzinfo=UTC)
+    author = DecliningAuthor()
+    broker = _FakeBroker()
+    database = tmp_path / "state.sqlite3"
+    def execute(state, directory, policy=None):
+        coordinator = _coordinator(state=state, tmp_path=directory, broker=broker, author=author)
+        run_id = state.start_run(repository="acme/translations", locale="ru",
+                                 mode=GuardianMode.PROPOSE_PREVENTION, started_at=now)
+        return coordinator.propose(policy=policy or _repository_policy(), recurrence_candidates=(_candidate(),),
+            evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID}, run_id=run_id,
+            observed_at=now, require_live_lease=_live_lease, require_current_base_unchanged=_current_base,
+            **_open_source_kwargs())
+    with GuardianState(database) as state:
+        assert execute(state, tmp_path / "first").declined == 1
+    with GuardianState(database) as state:
+        assert execute(state, tmp_path / "restart").declined == 1
+        assert author.calls == 1
+        original = broker.capture_base
+        broker.capture_base = lambda: replace(original(), revision=replace(_base_revision(), sha="c" * 40))
+        assert execute(state, tmp_path / "new-base").declined == 1
+        assert author.calls == 2
+        policy = _repository_policy()
+        policy = replace(policy, prevention=replace(policy.prevention, max_changed_files=3))
+        assert execute(state, tmp_path / "new-policy", policy).declined == 1
+        assert author.calls == 3

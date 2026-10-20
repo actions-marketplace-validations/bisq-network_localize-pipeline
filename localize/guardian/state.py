@@ -9994,6 +9994,25 @@ class GuardianState:
             )
         return int(cursor.lastrowid)
 
+    def prevention_decline(self, decline_key: str) -> Mapping[str, Any] | None:
+        """Find a private disposition bound to exact code, policy and source evidence."""
+        if not re.fullmatch(r"[0-9a-f]{64}", decline_key):
+            raise ValueError("Invalid prevention decline key")
+        row = self._connection.execute(
+            "SELECT details_json FROM health WHERE component='prevention-author' "
+            "AND status='declined' AND json_extract(details_json, '$.decline_key')=? "
+            "ORDER BY health_id DESC LIMIT 1", (decline_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        from localize.guardian.prevention_decision import parse_decision
+        details = loads_bounded_json(row["details_json"])
+        parse_decision({key: details.get(key) for key in
+                        ("schema_version", "outcome", "reason", "explanation", "inspected_paths")})
+        if details["outcome"] != "declined":
+            raise RuntimeError("Invalid persisted prevention decline")
+        return details
+
     def latest_health(self, component: str) -> HealthRecord | None:
         """Return the latest health observation for a component."""
 
