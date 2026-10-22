@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from openai import OpenAIError
 
-from localize.openai_compat import create_chat_completion, create_chat_completion_with_fallback
+from localize.providers.openai_compat import create_chat_completion, create_chat_completion_with_fallback
 
 
 def _response(content="{}"):
@@ -93,7 +93,7 @@ async def test_retries_with_max_completion_tokens_when_max_tokens_is_rejected(ca
         OpenAIError("Unsupported parameter: 'max_tokens'"),
         _response(),
     )
-    caplog.set_level(logging.DEBUG, logger="localize.openai_compat")
+    caplog.set_level(logging.DEBUG, logger="localize.providers.openai_compat")
 
     await create_chat_completion(
         client,

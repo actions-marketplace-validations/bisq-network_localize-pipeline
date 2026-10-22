@@ -1,6 +1,6 @@
 """Public localization-format metadata API."""
 
-from localize.localization_adapters import (
+from localize.formats.adapters import (
     JSON_ADAPTER,
     JAVA_PROPERTIES_ADAPTER,
     LocalizationFileAdapter,
@@ -9,7 +9,7 @@ from localize.localization_adapters import (
     register_localization_adapter,
     unregister_localization_adapter,
 )
-from localize.localization_formats import (
+from localize.formats.metadata import (
     JSON_FORMAT,
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,
@@ -18,14 +18,14 @@ from localize.localization_formats import (
     register_localization_format,
     unregister_localization_format,
 )
-from localize.localization_layouts import (
+from localize.formats.layouts import (
     LOCALE_DIRECTORY_LAYOUT,
     LOCALE_FILENAME_LAYOUT,
     SUFFIX_LAYOUT,
     LocalizationLayout,
     load_localization_layout,
 )
-from localize.localization_profiles import (
+from localize.formats.profiles import (
     LocalizationProfile,
     load_localization_profiles,
 )

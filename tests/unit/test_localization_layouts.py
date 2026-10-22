@@ -1,7 +1,7 @@
 """Tests for localization file layout metadata."""
 
-from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-from localize.localization_layouts import (
+from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+from localize.formats.layouts import (
     LOCALE_DIRECTORY_LAYOUT,
     LOCALE_FILENAME_LAYOUT,
     SUFFIX_LAYOUT,

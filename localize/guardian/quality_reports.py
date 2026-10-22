@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from localize.semantic_quality import normalize_value
-from localize.translation_validator import find_disallowed_control_characters
+from localize.formats.validation import find_disallowed_control_characters
 
 MARKER = "<!-- localize-pipeline:quality:v1 -->\n"
 MAX_FINDINGS = 100

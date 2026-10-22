@@ -1,7 +1,7 @@
 """Unit tests for the pre-run cost estimator."""
 import pytest
 
-from localize.cost_estimator import estimate_run_cost, format_estimate
+from localize.providers.costs import estimate_run_cost, format_estimate
 
 
 class TestEstimateRunCost:

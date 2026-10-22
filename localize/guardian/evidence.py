@@ -17,7 +17,7 @@ from localize.formats import get_localization_adapter
 from localize.guardian.models import FeedbackEvent
 from localize.guardian.path_globs import matches_any_path_glob
 from localize.guardian.policy import PatchPolicyError, _load_glossary
-from localize.localization_profiles import LocalizationProfile, load_localization_profiles
+from localize.formats.profiles import LocalizationProfile, load_localization_profiles
 
 
 EVIDENCE_CONTRACT_VERSION = 4

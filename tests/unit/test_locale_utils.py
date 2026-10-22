@@ -1,5 +1,5 @@
 """Unit tests for the shared locale-filename helpers."""
-from localize.locale_utils import LOCALE_SUFFIX_RE, extract_locale_suffix, is_locale_file
+from localize.formats.locale_utils import LOCALE_SUFFIX_RE, extract_locale_suffix, is_locale_file
 
 
 class TestExtractLocaleSuffix:

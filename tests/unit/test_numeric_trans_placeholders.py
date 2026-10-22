@@ -4,14 +4,14 @@ from collections import Counter
 
 import pytest
 
-from localize.placeholder_rules import (
+from localize.formats.placeholders import (
     extract_placeholder_tokens,
     placeholder_profile,
     protect_placeholders,
     restore_placeholders,
     strip_placeholder_tokens,
 )
-from localize.translation_validator import check_placeholder_parity
+from localize.formats.validation import check_placeholder_parity
 
 
 @pytest.mark.parametrize("profile", ["standard", "java-indexed"])

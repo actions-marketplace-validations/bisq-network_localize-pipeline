@@ -181,8 +181,8 @@ def test_core_public_modules_do_not_import_bisq_profile_assumptions():
         PROJECT_ROOT / "localize" / "core" / "__init__.py",
         PROJECT_ROOT / "localize" / "formats" / "__init__.py",
         PROJECT_ROOT / "localize" / "providers" / "__init__.py",
-        PROJECT_ROOT / "localize" / "pipeline_core.py",
-        PROJECT_ROOT / "localize" / "connectors.py",
+        PROJECT_ROOT / "localize" / "core" / "pipeline.py",
+        PROJECT_ROOT / "localize" / "core" / "connectors.py",
     ]
 
     for path in public_modules:

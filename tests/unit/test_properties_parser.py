@@ -1,4 +1,4 @@
-from localize.properties_parser import parse_properties_file, reassemble_file
+from localize.formats.properties import parse_properties_file, reassemble_file
 
 
 def test_reassemble_preserves_escaped_key_separators(tmp_path):

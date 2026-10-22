@@ -55,7 +55,7 @@ def test_validation_writer_records_explicit_skips(tmp_path):
 def test_skipped_input_survives_stale_debug_output(tmp_path, monkeypatch, connector):
     """Retained debug output cannot destroy the skipped import's evidence."""
     from localize import translate_localization_files as translator
-    from localize.connectors import FilesystemSourceConnector
+    from localize.core.connectors import FilesystemSourceConnector
 
     source = tmp_path / "output"
     target = tmp_path / "input"

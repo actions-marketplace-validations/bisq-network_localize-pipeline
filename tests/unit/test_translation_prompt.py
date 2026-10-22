@@ -1,6 +1,6 @@
 """Unit tests for reusable translation prompt construction."""
 
-from localize.localization_formats import JAVA_PROPERTIES_FORMAT
+from localize.formats.metadata import JAVA_PROPERTIES_FORMAT
 from localize.translation_prompts import build_translation_system_prompt
 
 

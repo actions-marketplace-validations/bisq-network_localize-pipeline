@@ -38,10 +38,10 @@ class TestHelperFunctions(unittest.TestCase):
         # Force encoding_for_model to raise to trigger fallback
         with patch('localize.translate_localization_files.MODEL_PROVIDER', None):
             # Also patch get_encoding to provide predictable encode
-            with patch('localize.model_provider.tiktoken.encoding_for_model', side_effect=Exception()):
+            with patch('localize.providers.models.tiktoken.encoding_for_model', side_effect=Exception()):
                 fake_enc = MagicMock()
                 fake_enc.encode.side_effect = lambda s: list(s.split())
-                with patch('localize.model_provider.tiktoken.get_encoding', return_value=fake_enc):
+                with patch('localize.providers.models.tiktoken.get_encoding', return_value=fake_enc):
                     count = count_tokens('one two three')
         self.assertEqual(count, 3)
 

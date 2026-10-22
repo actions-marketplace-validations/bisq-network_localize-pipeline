@@ -1,4 +1,4 @@
-from localize.localization_formats import JAVA_PROPERTIES_FORMAT
+from localize.formats.metadata import JAVA_PROPERTIES_FORMAT
 from localize.translate_localization_files import (
     _select_holistic_review_context_keys,
 )

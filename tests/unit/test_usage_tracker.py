@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from localize.usage_tracker import DEFAULT_PRICES, UsageTracker, cost_for_tokens
+from localize.providers.usage import DEFAULT_PRICES, UsageTracker, cost_for_tokens
 
 
 PRICES = {

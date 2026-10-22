@@ -7,6 +7,14 @@ stable `1.0.0`, minor releases may still refine public APIs with migration notes
 
 ## Unreleased
 
+### Changed
+
+- Move orchestration, format handling, and model-provider implementations into
+  `localize.core`, `localize.formats`, and `localize.providers`. Their documented
+  public exports are unchanged. Direct imports of former root implementation
+  modules must use the new paths; see the
+  [import migration guide](docs/repository-structure.md#migrating-implementation-imports).
+
 ## [0.1.21] - 2026-09-15
 
 ### Fixed

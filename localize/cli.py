@@ -28,7 +28,7 @@ from localize.app_config import (
 from localize.bootstrap_pr import BootstrapPrOptions, create_bootstrap_pr
 from localize.formats import list_localization_adapters, list_localization_formats
 from localize.init_config import main as init_config_main
-from localize.localization_profiles import load_localization_profiles
+from localize.formats.profiles import load_localization_profiles
 from localize.plugins import load_plugins
 from localize.translation_quality_gate import main as translation_quality_gate_main
 from localize.translation_memory import (

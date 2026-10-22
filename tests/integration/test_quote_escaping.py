@@ -7,8 +7,8 @@ from unittest.mock import patch, MagicMock, AsyncMock
 # Set a dummy API key before importing the main script to prevent SystemExit.
 os.environ['OPENAI_API_KEY'] = 'DUMMY_KEY_FOR_TESTING'
 
-from localize.localization_formats import JAVA_PROPERTIES_FORMAT
-from localize.properties_parser import reassemble_file
+from localize.formats.metadata import JAVA_PROPERTIES_FORMAT
+from localize.formats.properties import reassemble_file
 
 
 class TestQuoteEscaping(unittest.IsolatedAsyncioTestCase):

@@ -1,7 +1,7 @@
 import json
 
-from localize.localization_profiles import load_localization_profiles
-from localize.placeholder_rules import placeholder_profile
+from localize.formats.profiles import load_localization_profiles
+from localize.formats.placeholders import placeholder_profile
 from localize.semantic_remediation import apply_semantic_review_suggestions
 
 

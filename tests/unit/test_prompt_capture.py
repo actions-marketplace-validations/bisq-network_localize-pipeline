@@ -3,12 +3,12 @@ import json
 
 import pytest
 
-from localize.placeholder_rules import (
+from localize.formats.placeholders import (
     capture_placeholder_tokens,
     protect_placeholders,
     restore_placeholders,
 )
-from localize.prompt_capture import PromptCaptureProvider
+from localize.providers.prompt_capture import PromptCaptureProvider
 
 
 def test_capture_tokens_are_deterministic_without_changing_production_tokens():

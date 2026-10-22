@@ -12,7 +12,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 from localize.semantic_quality import TranslationChange
 from localize.app_config import resolve_semantic_review_model
 from localize.formats import unregister_localization_adapter
-from localize.model_provider import ModelProviderConfigurationError
+from localize.providers.models import ModelProviderConfigurationError
 from localize.translation_semantic_reviewer import (
     _run,
     append_semantic_review_findings,

@@ -5,7 +5,7 @@ from typing import List
 
 import pytest
 
-from localize.connectors import (
+from localize.core.connectors import (
     FileReporterConnector,
     FilesystemSourceConnector,
     FunctionProcessorConnector,
@@ -13,7 +13,7 @@ from localize.connectors import (
     PipelinePublisher,
     PipelinePublishRequest,
 )
-from localize.pipeline_core import (
+from localize.core.pipeline import (
     RUN_METRIC_KEYS,
     TranslationPipelineOptions,
     TranslationPipelinePaths,
