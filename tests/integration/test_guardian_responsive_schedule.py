@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 
+import httpx
 import pytest
 
 from localize.guardian import runtime
@@ -17,7 +18,7 @@ from tests.unit.test_guardian_controller import (
     _historical_policy, _snapshot, runtime as _controller_runtime_fixture,
 )
 from tests.unit.test_guardian_runtime import (
-    NOW, _stub_runtime_authority_for_assembly_tests as _authority_fixture,
+    NOW, _Credential, _stub_runtime_authority_for_assembly_tests as _authority_fixture,
     _write_minimal_config,
 )
 
@@ -171,7 +172,8 @@ def test_credential_failure_circuit_survives_failed_manual_recovery(
     assert runtime.run_once(config_path, scheduled=True) == 0
 
 
-def test_only_successful_manual_recovery_clears_existing_model_circuit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("circuit", ["authentication_circuit_open", "model_circuit_open"])
+def test_only_successful_manual_recovery_clears_existing_circuit(tmp_path, monkeypatch, circuit):
     config_path = tmp_path / "guardian.yaml"
     _write_minimal_config(config_path)
     config_path.write_text(
@@ -179,7 +181,7 @@ def test_only_successful_manual_recovery_clears_existing_model_circuit(tmp_path,
     )
     clock = [NOW]
     outcomes = iter([
-        PollOutcome(lease_acquired=True, model_circuit_open=True),
+        PollOutcome(lease_acquired=True, **{circuit: True}),
         PollOutcome(lease_acquired=True, runs_failed=1),
         PollOutcome(lease_acquired=True), PollOutcome(lease_acquired=True),
     ])
@@ -226,3 +228,88 @@ def test_missing_subscription_login_stops_repeated_scheduled_auth_attempts(tmp_p
         runtime.run_once(config_path, scheduled=True)
     clock[0] += timedelta(minutes=15)
     assert runtime.run_once(config_path, scheduled=True) == 0
+
+
+@pytest.mark.parametrize("failure", ["connect", "timeout", "protocol", 502, 503, 429, "rate-limit"])
+def test_preflight_network_failure_retries_same_day_after_restart(
+    tmp_path, monkeypatch, controller_runtime, failure,
+):
+    """Real HTTP classification, controller and persisted hourly gate recover."""
+    config_path = tmp_path / "guardian.yaml"
+    _write_minimal_config(config_path)
+    config_path.write_text(
+        "schedule: {poll_interval_seconds: 3600, max_polls_per_day: 3}\n"
+        + config_path.read_text(), encoding="utf-8",
+    )
+    _base, _head, checkout, provider, broker, _sequence = controller_runtime
+    provider.snapshots = ()
+    clock = [NOW]
+    requests = []
+    driver = FakeCodexDriver()
+    policy = _config(GuardianMode.OBSERVE).repositories[0]
+
+    def handler(request):
+        assert request.method == "GET" and request.url.path == "/user"
+        requests.append(clock[0])
+        if len(requests) <= 2:
+            errors = {"connect": httpx.ConnectError, "timeout": httpx.ReadTimeout,
+                      "protocol": httpx.RemoteProtocolError}
+            if failure in errors:
+                raise errors[failure]("private transport detail", request=request)
+            if failure == "rate-limit":
+                return httpx.Response(403, headers={"Retry-After": "30"})
+            return httpx.Response(failure)
+        actor = policy.publication_actor
+        return httpx.Response(200, json={"login": actor.login, "id": actor.id, "type": actor.type})
+
+    actor_provider = runtime.AuthenticatedGitHubSnapshotProvider(
+        credential=_Credential("test-only-token"), transport=httpx.MockTransport(handler),
+    )
+
+    def build(**kwargs):
+        return _controller(
+            tmp_path=tmp_path, state=kwargs["state"],
+            config=replace(kwargs["config"], repositories=(policy,)),
+            checkout=checkout, provider=provider, broker=broker, driver=driver,
+            now=lambda: clock[0],
+            publication_actor_preflight=lambda: actor_provider.require_publication_actor(
+                policy, (policy.publication_actor,),
+            ),
+        )
+
+    @contextmanager
+    def credentials(*args, **kwargs):
+        yield lambda: {}
+
+    monkeypatch.setattr(runtime, "_local_now", lambda: clock[0])
+    monkeypatch.setattr(runtime, "git_credential_environment", credentials)
+    monkeypatch.setattr(runtime, "_build_controller", build)
+    # Every invocation reopens the persisted state, as a new scheduler process does.
+    for attempt in range(2):
+        assert runtime.run_once(config_path, scheduled=True) == 1
+        with GuardianState(tmp_path / ".guardian/state.sqlite3") as state:
+            health = state.latest_health("guardian")
+            checkpoint = state.latest_health("guardian-responsive-schedule")
+            assert health.status == "failed"
+            assert health.details["authentication_circuit_open"] is False
+            assert health.details["repositories_polled"] == 0
+            assert checkpoint.details["circuit_open"] is False
+            assert checkpoint.details["attempt_count"] == attempt + 1
+        assert provider.calls == []
+        assert driver.calls == []
+        assert broker.reply_calls == []
+        clock[0] += timedelta(minutes=59)
+        assert runtime.run_once(config_path, scheduled=True) == 0
+        assert len(requests) == attempt + 1
+        clock[0] += timedelta(minutes=1)
+    assert runtime.run_once(config_path, scheduled=True) == 0
+    assert len(requests) == 3
+    with GuardianState(tmp_path / ".guardian/state.sqlite3") as state:
+        assert state.latest_health("guardian").status == "ok"
+        checkpoint = state.latest_health("guardian-responsive-schedule")
+        assert checkpoint.details["circuit_open"] is False
+        assert checkpoint.details["attempt_count"] == 3
+    assert len(provider.calls) == 1
+    clock[0] += timedelta(hours=1)
+    assert runtime.run_once(config_path, scheduled=True) == 0
+    assert len(requests) == 3  # The existing daily attempt budget is still enforced.

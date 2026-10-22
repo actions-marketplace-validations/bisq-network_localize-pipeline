@@ -1306,7 +1306,12 @@ Each scheduled wake after the configured local start time can then poll GitHub,
 at least 900 seconds apart and at most 96 polls per local day. Failed attempts
 count too; a crash does not lose the checkpoint. Authentication or provider/model
 capacity circuit failures stop subsequent scheduled attempts for that day; diagnose
-the cause before an explicit manual retry. These are **poll** limits, not Codex
+the cause before an explicit manual retry. Non-authentication GitHub API failures
+(including connection errors, timeouts, server errors and rate limits) during
+publication identity verification stop all work in that poll, but do not open
+the daily authentication circuit. The next configured interval can retry, within
+the same daily attempt limit; failed polls never produce a success heartbeat.
+These are **poll** limits, not Codex
 session limits: unchanged completed feedback does not start another model session.
 The shared `limits.max_model_calls_per_day` budget still counts every model retry,
 and the existing per-run timeouts, bounded model retries, and no-fallback

@@ -65,6 +65,7 @@ from localize.guardian.github import (
     ClosedPullScanResult,
     FeedbackKind,
     FeedbackRevision,
+    GitHubAPIError,
     GitHubAuthenticationError,
     GitHubWriteBroker,
     OpenPullPathAuthority,
@@ -2351,6 +2352,7 @@ class GuardianController:
 
         outcome = _PollAccumulator()
         lease_lost = False
+        publication_preflight_failed = False
         open_poll_succeeded: set[str] = set()
         open_changed_paths: dict[str, frozenset[str]] = {}
         try:
@@ -2372,7 +2374,13 @@ class GuardianController:
                         checked_at=observed_at,
                     )
                 except Exception as exc:
-                    outcome.authentication_circuit_open = True
+                    # A failed identity check blocks this entire poll, but a
+                    # non-authentication API failure must not latch the daily
+                    # authentication circuit. The bounded scheduler can retry.
+                    publication_preflight_failed = True
+                    outcome.authentication_circuit_open = not isinstance(
+                        exc, GitHubAPIError
+                    )
                     outcome.failures.append(_safe_failure_name(exc))
                     self.state.record_health(
                         component="controller",
@@ -2389,6 +2397,7 @@ class GuardianController:
             if (
                 self.config.mode is GuardianMode.PROPOSE_PREVENTION
                 and not outcome.authentication_circuit_open
+                and not publication_preflight_failed
             ):
                 # Constructor enforces this dependency for the only mode that
                 # may use it.
@@ -2447,6 +2456,7 @@ class GuardianController:
             for policy in self.config.repositories:
                 if (
                     lease_lost
+                    or publication_preflight_failed
                     or outcome.authentication_circuit_open
                     or outcome.model_circuit_open
                 ):
@@ -2623,6 +2633,7 @@ class GuardianController:
             if (
                 include_history
                 and not lease_lost
+                and not publication_preflight_failed
                 and "PollDeadlineExceeded" not in outcome.failures
                 and not outcome.authentication_circuit_open
                 and not outcome.model_circuit_open

@@ -42,6 +42,7 @@ from localize.guardian.github import (
     CodeRabbitCoverageStatus,
     FeedbackKind,
     FeedbackRevision,
+    GitHubAPIError,
     GitHubAuthenticationError,
     GitHubRepositoryIdentity,
     OpenPullPathAuthority,
@@ -3694,16 +3695,18 @@ def test_github_authentication_failure_stops_later_repositories(
     assert outcome.repositories_polled == 0
 
 
+@pytest.mark.parametrize("failure_type", [GitHubAuthenticationError, GitHubAPIError, ValueError])
 def test_publication_actor_preflight_blocks_every_remote_write(
     tmp_path: Path,
     runtime,
+    failure_type,
 ) -> None:
     base, head, checkout, provider, broker, _sequence = runtime
     policy = _historical_policy(remediation=True)
     remediation = FakeRemediationRunner()
 
     def fail_actor() -> None:
-        raise GitHubAuthenticationError("wrong credential actor")
+        raise failure_type("private preflight failure")
 
     with GuardianState(tmp_path / "state.sqlite3") as state:
         outcome = _controller(
@@ -3731,7 +3734,9 @@ def test_publication_actor_preflight_blocks_every_remote_write(
             publication_actor_preflight=fail_actor,
         ).poll_once()
 
-    assert outcome.authentication_circuit_open is True
+    assert outcome.authentication_circuit_open is (failure_type is not GitHubAPIError)
+    if failure_type is GitHubAPIError:
+        assert outcome.failures == ("GitHubAPIError",)
     assert outcome.repositories_polled == 0
     assert provider.calls == []
     assert broker.verify_calls == []
@@ -3741,16 +3746,18 @@ def test_publication_actor_preflight_blocks_every_remote_write(
     assert remediation.publish_calls == []
 
 
+@pytest.mark.parametrize("failure_type", [GitHubAuthenticationError, GitHubAPIError, ValueError])
 def test_publication_actor_preflight_blocks_prevention_orphan_recovery(
     tmp_path: Path,
     runtime,
+    failure_type,
 ) -> None:
     _base, _head, checkout, provider, broker, _sequence = runtime
     policy = replace(_policy(), prevention=_prevention_policy())
     prevention = FakePreventionRunner()
 
     def fail_actor() -> None:
-        raise GitHubAuthenticationError("wrong credential actor")
+        raise failure_type("private preflight failure")
 
     with GuardianState(tmp_path / "state.sqlite3") as state:
         outcome = _controller(
@@ -3765,7 +3772,9 @@ def test_publication_actor_preflight_blocks_prevention_orphan_recovery(
             publication_actor_preflight=fail_actor,
         ).poll_once()
 
-    assert outcome.authentication_circuit_open is True
+    assert outcome.authentication_circuit_open is (failure_type is not GitHubAPIError)
+    if failure_type is GitHubAPIError:
+        assert outcome.failures == ("GitHubAPIError",)
     assert outcome.repositories_polled == 0
     assert provider.calls == []
     assert broker.verify_calls == []
