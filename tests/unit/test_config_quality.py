@@ -70,6 +70,7 @@ def test_runtime_requirements_are_hash_pinned():
 
 @pytest.mark.parametrize("name,vulnerable,fixed", [
     ("anyio", ("4.10.0", "4.14.1"), "4.14.2"),
+    ("certifi", ("2025.8.3", "2026.10.17"), "2026.10.19"),
     ("urllib3", ("2.6.0", "2.7.0"), "2.8.0"),
 ])
 def test_dependency_security_floors_cover_package_and_locks(name, vulnerable, fixed):
