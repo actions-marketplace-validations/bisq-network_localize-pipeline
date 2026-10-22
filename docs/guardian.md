@@ -1311,6 +1311,9 @@ the cause before an explicit manual retry. Non-authentication GitHub API failure
 publication identity verification stop all work in that poll, but do not open
 the daily authentication circuit. The next configured interval can retry, within
 the same daily attempt limit; failed polls never produce a success heartbeat.
+Reaching the per-poll project-policy authoring cap defers new candidates without
+failing the poll. Existing private proposals remain reusable at that cap;
+invalid evidence, malformed artifacts and authoring errors still fail closed.
 These are **poll** limits, not Codex
 session limits: unchanged completed feedback does not start another model session.
 The shared `limits.max_model_calls_per_day` budget still counts every model retry,

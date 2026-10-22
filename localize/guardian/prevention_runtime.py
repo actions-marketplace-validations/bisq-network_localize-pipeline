@@ -362,6 +362,10 @@ class _PublicationCapacityError(PreventionRuntimeError):
     """The bounded poll has no remote-mutation slot remaining."""
 
 
+class _ProjectPolicyAuthoringDeferred(PreventionRuntimeError):
+    """A validated new policy candidate must wait for the next poll's capacity."""
+
+
 def _operation_timeout(
     deadline: PollDeadline | None,
     operation_limit: float,
@@ -4939,7 +4943,7 @@ class PreventionCoordinator:
             )
             return str(destination), False
         if self._authoring_slots_used >= self.max_drafts:
-            raise PolicyProposalError('Project-policy authoring cap is exhausted.')
+            raise _ProjectPolicyAuthoringDeferred('Project-policy authoring cap is exhausted.')
         self._authoring_slots_used += 1
         request = policy_request(context, feedback=evidence)
         with tempfile.TemporaryDirectory(prefix='guardian-project-policy-', dir=self.temporary_root) as raw:
@@ -5002,6 +5006,7 @@ class PreventionCoordinator:
         proposals = []
         failures = []
         skipped = 0
+        deferred = 0
         for candidate in dict.fromkeys(projects):
             try:
                 path, created = self._propose_project_policy(
@@ -5009,6 +5014,8 @@ class PreventionCoordinator:
                 )
                 proposals.append(path)
                 skipped += not created
+            except _ProjectPolicyAuthoringDeferred:
+                deferred += 1
             except (CodexAuthenticationError, CodexCapacityError, GitHubAuthenticationError,
                     PreventionLeaseLostError, PollDeadlineExceeded):
                 raise
@@ -5023,7 +5030,7 @@ class PreventionCoordinator:
                                          policy_config_digest=policy_config_digest, **kwargs)
                  if remaining else PreventionBatchOutcome())
         return PreventionBatchOutcome(drafts=other.drafts, skipped=skipped + other.skipped,
-                                      deferred=other.deferred, failures=tuple(failures) + other.failures,
+                                      deferred=deferred + other.deferred, failures=tuple(failures) + other.failures,
                                       policy_proposals=tuple(proposals), declined=other.declined)
 
     def _propose_pipeline(
