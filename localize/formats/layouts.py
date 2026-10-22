@@ -15,6 +15,7 @@ from localize.formats.metadata import LocalizationFormat
 
 
 def _as_posix(path: str) -> str:
+    """Normalize either slash style to a POSIX path without accessing the filesystem."""
     return PurePath(path.replace("\\", "/")).as_posix()
 
 

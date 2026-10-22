@@ -8,6 +8,7 @@ from localize.formats.profiles import LocalizationProfile, load_localization_pro
 
 
 def test_load_localization_profiles_defaults_to_legacy_single_format():
+    """Use Java Properties with suffix-based locale names when no profile is configured."""
     profiles = load_localization_profiles({})
 
     assert profiles == (

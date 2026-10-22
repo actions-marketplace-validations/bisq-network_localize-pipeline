@@ -8,6 +8,7 @@ from localize.providers.openai_compat import create_chat_completion, create_chat
 
 
 def _response(content="{}"):
+    """Build the minimal completion response consumed by the compatibility tests."""
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
     )
@@ -89,6 +90,7 @@ async def test_default_models_keep_max_tokens_for_provider_compatibility():
 
 @pytest.mark.asyncio
 async def test_retries_with_max_completion_tokens_when_max_tokens_is_rejected(caplog):
+    """Retry with the alternate token-limit parameter and log the compatibility fallback."""
     client = _FakeClient(
         OpenAIError("Unsupported parameter: 'max_tokens'"),
         _response(),

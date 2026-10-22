@@ -2,6 +2,7 @@ from localize.formats.properties import parse_properties_file, reassemble_file
 
 
 def test_reassemble_preserves_escaped_key_separators(tmp_path):
+    """Decode escaped key separators while preserving their spelling on reassembly."""
     properties_file = tmp_path / "messages.properties"
     properties_file.write_text(r"a\:b\=c\ key=value" + "\n", encoding="utf-8")
 

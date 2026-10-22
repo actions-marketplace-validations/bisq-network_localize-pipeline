@@ -28,6 +28,7 @@ import pytest
     ],
 )
 def test_public_api_implementation_lives_in_owning_package(package_name, export_name):
+    """Require each public export's implementation to reside in its owning package."""
     package = importlib.import_module(f"localize.{package_name}")
     implementation = inspect.getmodule(getattr(package, export_name))
 
@@ -38,6 +39,7 @@ def test_public_api_implementation_lives_in_owning_package(package_name, export_
 
 @pytest.mark.parametrize("package_name", ["core", "formats", "providers"])
 def test_public_package_import_does_not_load_runtime_or_other_layers(package_name, tmp_path):
+    """Import each package in isolation without loading configuration or sibling layers."""
     # Run in a fresh interpreter so the global runtime fixtures cannot hide
     # circular imports, accidental config loading, or cross-layer dependencies.
     script = f"""

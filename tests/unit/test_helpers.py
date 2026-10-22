@@ -35,6 +35,7 @@ class TestHelperFunctions(unittest.TestCase):
         )
 
     def test_count_tokens_fallback(self):
+        """Count tokens with the fallback encoder when model-specific lookup fails."""
         # Force encoding_for_model to raise to trigger fallback
         with patch('localize.translate_localization_files.MODEL_PROVIDER', None):
             # Also patch get_encoding to provide predictable encode

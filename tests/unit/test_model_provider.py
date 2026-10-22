@@ -20,6 +20,7 @@ from localize.providers.usage import UsageTracker
 
 
 def _response(content="{}", prompt_tokens=11, completion_tokens=7):
+    """Build a completion response with configurable content and token usage."""
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
         usage=SimpleNamespace(
@@ -39,6 +40,7 @@ def _api_status_error(status_code):
 
 @pytest.mark.asyncio
 async def test_provider_delegates_chat_completion_and_records_usage():
+    """Forward completion arguments unchanged and record the returned token usage."""
     tracker = UsageTracker(prices={"custom-model": {"input": 1.0, "output": 2.0}})
     provider = OpenAICompatibleProvider(client=object(), usage_tracker=tracker)
     response = _response(prompt_tokens=123, completion_tokens=45)
@@ -68,6 +70,7 @@ async def test_provider_delegates_chat_completion_and_records_usage():
 
 
 def test_provider_count_tokens_uses_tiktoken_fallback():
+    """Use the fallback tokenizer when the model has no known encoding."""
     provider = OpenAICompatibleProvider(client=None)
     fake_encoding = MagicMock()
     fake_encoding.encode.side_effect = lambda text: text.split()
@@ -80,6 +83,7 @@ def test_provider_count_tokens_uses_tiktoken_fallback():
 
 
 def test_provider_count_tokens_strips_provider_prefix_for_tiktoken():
+    """Remove the routing prefix before looking up the model's token encoding."""
     provider = OpenAICompatibleProvider(client=None)
     fake_encoding = MagicMock()
     fake_encoding.encode.return_value = [1, 2, 3]
@@ -136,6 +140,7 @@ def test_provider_usage_summary_is_written_by_provider(tmp_path):
 
 
 def test_factory_builds_default_openai_client():
+    """Create the default OpenAI client with its key and reasoning capability enabled."""
     logger = logging.getLogger("test")
 
     with patch("localize.providers.models.AsyncOpenAI", return_value=object()) as openai:
@@ -153,6 +158,7 @@ def test_factory_builds_default_openai_client():
 
 
 def test_factory_builds_custom_endpoint_with_placeholder_key():
+    """Supply a placeholder key for a custom endpoint without assuming OpenAI capabilities."""
     logger = logging.getLogger("test")
 
     with patch("localize.providers.models.AsyncOpenAI", return_value=object()) as openai:
@@ -285,6 +291,7 @@ async def test_aisuite_provider_strips_openai_only_kwargs_for_non_openai_models(
 
 
 def test_aisuite_factory_imports_aisuite_lazily():
+    """Import aisuite on demand and construct its client with the supplied provider config."""
     logger = logging.getLogger("test")
     fake_client = object()
 
@@ -306,6 +313,7 @@ def test_aisuite_factory_imports_aisuite_lazily():
 
 
 def test_provider_factory_can_select_aisuite_backend():
+    """Select aisuite explicitly while retaining the default OpenAI reasoning capability."""
     logger = logging.getLogger("test")
 
     with patch("localize.providers.models.create_aisuite_provider") as create_aisuite:
@@ -326,6 +334,7 @@ def test_provider_factory_can_select_aisuite_backend():
 
 
 def test_provider_factory_defaults_to_aisuite_backend():
+    """Choose aisuite when the provider name is empty."""
     logger = logging.getLogger("test")
 
     with patch("localize.providers.models.create_aisuite_provider") as create_aisuite:
@@ -342,6 +351,7 @@ def test_provider_factory_defaults_to_aisuite_backend():
 
 
 def test_aisuite_factory_adds_openai_placeholder_for_custom_endpoint_without_key():
+    """Configure a custom aisuite endpoint with a placeholder key and no reasoning flag."""
     logger = logging.getLogger("test")
 
     with patch("localize.providers.models.create_aisuite_provider") as create_aisuite:
@@ -412,6 +422,7 @@ def test_openai_credential_requirement_validates_aisuite_openai_config_with_base
 
 
 def test_aisuite_factory_allows_non_openai_models_without_openai_key():
+    """Allow non-OpenAI models to use their provider credentials without an OpenAI key."""
     logger = logging.getLogger("test")
     provider_configs = {"anthropic": {"api_key": "secret-from-provider-config"}}
 
@@ -481,6 +492,7 @@ def test_aisuite_factory_rejects_invalid_openai_config_before_endpoint_merge():
 
 
 def test_aisuite_factory_preserves_configured_openai_api_key_with_endpoint():
+    """Keep the configured provider key when adding a custom OpenAI-compatible endpoint."""
     logger = logging.getLogger("test")
     provider_configs = {"openai": {"api_key": "real-config-key"}}
 

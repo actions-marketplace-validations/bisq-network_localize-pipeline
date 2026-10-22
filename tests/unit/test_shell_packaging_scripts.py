@@ -99,6 +99,7 @@ def test_dockerfile_uses_orchestration_default_command():
 
 
 def test_dockerfile_builds_go_tools_with_fixed_dependencies():
+    """Require pinned Go toolchains, source revisions, and verified dependency versions."""
     dockerfile = (REPO_ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
 
     go_builder = (

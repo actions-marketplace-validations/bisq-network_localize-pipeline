@@ -11,6 +11,7 @@ from localize.formats.properties import parse_properties_file
 
 class TestTranslationValidator(unittest.TestCase):
     def test_check_key_coverage(self):
+        """Identify source keys missing from the target and target-only extra keys."""
         base_keys = {'key.one', 'key.two', 'key.three'}
         target_keys = {'key.one', 'key.three', 'key.four'}
 

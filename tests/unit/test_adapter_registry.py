@@ -13,6 +13,7 @@ from localize.formats.metadata import LocalizationFormat, load_localization_form
 
 
 def _custom_adapter(format_id: str = "yaml_test") -> LocalizationFileAdapter:
+    """Build a YAML-shaped adapter with inert operations for registry tests."""
     localization_format = LocalizationFormat(
         id=format_id,
         display_name="YAML test",

@@ -16,6 +16,7 @@ from localize.formats.validation import check_placeholder_parity
 
 
 def test_extract_placeholder_tokens_supports_common_localization_syntaxes():
+    """Recognize MessageFormat, template, printf, and markup placeholders together."""
     text = "Hello {0}, {0,choice,0#none|1#one}, {{name}}, %1$d, %(amount).2f, %s, <b>bold</b>"
 
     assert extract_placeholder_tokens(text) == Counter(

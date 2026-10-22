@@ -326,6 +326,7 @@ class TestLoadAppConfig:
 
 
     def test_load_config_reads_project_context_and_format(self):
+        """Load project context, glossary, custom format, and layout into the profile."""
         mock_config = {
             "dry_run": True,
             "project_context": "Translate for a developer tool.",
@@ -359,6 +360,7 @@ class TestLoadAppConfig:
         assert config.localization_profiles[0].localization_format.id == "custom_json"
 
     def test_load_config_records_profile_without_mutating_placeholder_state(self):
+        """Store the configured placeholder profile without changing the active one."""
         import localize.formats.placeholders as placeholder_rules
 
         mock_config = {
@@ -1061,6 +1063,7 @@ class TestProviderAbstraction:
 
     @staticmethod
     def _load(mock_config, env):
+        """Load mocked YAML in an isolated environment and return the client factory spy."""
         with patch("builtins.open", mock_open(read_data=yaml.dump(mock_config))):
             with patch("os.path.exists", return_value=True):
                 with patch("os.access", return_value=True):

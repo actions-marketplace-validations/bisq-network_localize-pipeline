@@ -15,6 +15,7 @@ from localize.formats.validation import find_glossary_mismatches
 
 
 def _properties_mismatches(source, target, glossary):
+    """Compare glossary terms after decoding Java Properties whitespace escapes."""
     return find_glossary_mismatches(
         source, target, glossary, decode_properties_whitespace=True
     )

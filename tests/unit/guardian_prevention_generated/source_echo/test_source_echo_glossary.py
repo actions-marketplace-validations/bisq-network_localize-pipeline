@@ -12,6 +12,7 @@ from localize.formats.profiles import LocalizationProfile
 
 
 def test_changed_source_echoes_across_locales_exclude_exact_glossary_value(tmp_path):
+    """Report new source echoes while exempting exact locale-specific glossary values."""
     base = tmp_path / "base"
     head = tmp_path / "head"
     trusted = tmp_path / "trusted"

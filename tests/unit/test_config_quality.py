@@ -178,6 +178,7 @@ def test_llms_txt_guides_agents_to_stable_surfaces():
 
 
 def test_core_public_modules_do_not_import_bisq_profile_assumptions():
+    """Keep public packages and core implementations free of Bisq-specific defaults."""
     public_modules = [
         PROJECT_ROOT / "localize" / "core" / "__init__.py",
         PROJECT_ROOT / "localize" / "formats" / "__init__.py",
