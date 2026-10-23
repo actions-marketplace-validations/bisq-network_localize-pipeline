@@ -273,7 +273,8 @@ def controller_runtime(tmp_path):
 
 
 @pytest.mark.parametrize('historical', [False, True])
-def test_actual_controller_routes_policy_candidate_and_trusted_config(tmp_path, controller_runtime, historical):
+@pytest.mark.parametrize('candidate_count', [1, 2])
+def test_actual_controller_routes_policy_candidate_and_trusted_config(tmp_path, controller_runtime, historical, candidate_count):
     from tests.unit import test_guardian_controller as fixture
     from localize.guardian.codex import GuardianRecurrenceCandidate
     from localize.guardian.prevention_runtime import PreventionCoordinator
@@ -286,9 +287,10 @@ def test_actual_controller_routes_policy_candidate_and_trusted_config(tmp_path, 
                 nonlocal final
                 decision = replace(result.feedback[0], verdict='needs_human', replacements=(),
                                    report_reason='policy_conflict', decision_required=True)
-                final = replace(result, feedback=(decision,), recurrence_candidates=(
-                    GuardianRecurrenceCandidate(scope='project_config', summary='Review exact project wording',
-                                                evidence_feedback_ids=(decision.feedback_id,)),))
+                final = replace(result, feedback=(decision,), recurrence_candidates=tuple(
+                    GuardianRecurrenceCandidate(scope='project_config', summary=f'Review exact project wording {index}',
+                                                evidence_feedback_ids=(decision.feedback_id,))
+                    for index in range(candidate_count)))
                 if success_observer:
                     success_observer(attempt, usage, final)
             super().run(task, success_observer=persist, **kwargs)
@@ -334,6 +336,8 @@ def test_actual_controller_routes_policy_candidate_and_trusted_config(tmp_path, 
                                      checkout=checkout, provider=provider, driver=Assessment(),
                                      broker=broker, prevention_runner=prevention, **kwargs).poll_once()
         assert result.prevention_failures == ()
+        assert result.prevention_items_deferred == candidate_count - 1
+        assert state.latest_health('guardian').status == 'ok'
         assert len(result.project_policy_proposals) == 1
         assert result.applied_commits == ()
         assert result.prevention_drafts_created == 0
@@ -344,6 +348,36 @@ def test_actual_controller_routes_policy_candidate_and_trusted_config(tmp_path, 
         assert payload['identity']['repository'] == 'acme/widgets'
         assert payload['status'] == 'evidence_incomplete'
         assert state.model_calls_committed_for_day(fixture.NOW.date()) == 2
+
+
+@pytest.mark.parametrize('historical', [False, True])
+def test_policy_authoring_cap_defers_new_work_and_reuses_existing_artifacts(tmp_path, historical):
+    with GuardianState(tmp_path / 'state.sqlite3') as state:
+        coordinator, author, kwargs, checks, data = setup(tmp_path, state, historical=historical)
+        coordinator.max_drafts = 1
+        first = coordinator.propose(**kwargs)
+        assert first.failures == ()
+        second_kwargs = dict(kwargs, recurrence_candidates=(replace(
+            kwargs['recurrence_candidates'][0], summary='Another reviewed Private chat policy candidate'),))
+        with failure_audit(state):
+            second = coordinator.propose(**second_kwargs)
+        assert second.deferred == 1
+        assert second.failures == ()
+        assert second.policy_proposals == ()
+        assert author.calls == 1
+        assert state.latest_health('guardian-failure') is None
+        replay = coordinator.propose(**kwargs)
+        assert replay.policy_proposals == first.policy_proposals
+        assert replay.skipped == 1 and replay.failures == ()
+        assert author.calls == 1
+        coordinator.begin_poll()
+        resumed = coordinator.propose(**second_kwargs)
+        assert resumed.failures == () and resumed.deferred == 0
+        assert len(resumed.policy_proposals) == 1
+        assert author.calls == 2
+        assert state.model_calls_committed_for_day(NOW.date()) == 2
+        assert {row[0] for row in state._connection.execute(
+            "SELECT status FROM actions WHERE action='project_policy_proposal'")} == {'pending'}
 
 
 def test_artifact_first_crash_recovers_audit_and_status_without_model_spend(tmp_path):

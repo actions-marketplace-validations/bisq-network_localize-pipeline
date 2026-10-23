@@ -10920,3 +10920,64 @@ def test_daily_prevention_publication_zero_or_invalid_limit_never_reserves(
         assert (
             state.prevention_publication_slots_for_day(date(2026, 9, 29)) == 0
         )
+
+
+def _record_prevention_decline(
+    state: GuardianState, decline_key: str, explanation: str
+) -> None:
+    state.record_health(
+        component="prevention-author",
+        status="declined",
+        message="Prevention author declined a generic patch.",
+        details={
+            "schema_version": 1,
+            "decline_key": decline_key,
+            "outcome": "declined",
+            "reason": "project_policy",
+            "explanation": explanation,
+            "inspected_paths": ["localize/rules.py"],
+        },
+    )
+
+
+def test_prevention_decline_lookup_uses_index_added_to_v12_in_place(
+    tmp_path: Path,
+) -> None:
+    """Index an existing v12 database at open without a schema-version bump."""
+    database = tmp_path / "guardian.sqlite3"
+    key, other = "a" * 64, "b" * 64
+    with GuardianState(database) as state:
+        _record_prevention_decline(state, key, "First disposition.")
+        _record_prevention_decline(state, other, "Other evidence.")
+        _record_prevention_decline(state, key, "Latest disposition.")
+        state.record_health(
+            component="prevention-author", status="ok",
+            message="Unrelated row.", details={"decline_key": key},
+        )
+    # A database written before this index existed is still version 12.
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX health_prevention_decline_key")
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+
+    with GuardianState(database) as state:
+        plan = " ".join(
+            str(row["detail"])
+            for row in state._connection.execute(  # noqa: SLF001
+                "EXPLAIN QUERY PLAN " + guardian_state._PREVENTION_DECLINE_SQL,
+                (key,),
+            )
+        )
+        assert "USING INDEX health_prevention_decline_key" in plan
+        assert "TEMP B-TREE" not in plan
+        latest = state.prevention_decline(key)
+        assert latest is not None
+        assert latest["explanation"] == "Latest disposition."
+        assert state.prevention_decline(other)["explanation"] == "Other evidence."
+        assert state.prevention_decline("c" * 64) is None
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'health_prevention_decline_key'"
+        ).fetchone()[0] == 1

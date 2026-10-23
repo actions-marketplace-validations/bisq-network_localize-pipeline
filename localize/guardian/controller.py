@@ -65,6 +65,7 @@ from localize.guardian.github import (
     ClosedPullScanResult,
     FeedbackKind,
     FeedbackRevision,
+    GitHubAPIError,
     GitHubAuthenticationError,
     GitHubWriteBroker,
     OpenPullPathAuthority,
@@ -560,6 +561,7 @@ class PollOutcome:
     prevention_items_skipped: int = 0
     prevention_items_deferred: int = 0
     prevention_failures: tuple[str, ...] = ()
+    prevention_items_declined: int = 0
     project_policy_proposals: tuple[str, ...] = ()
     remediation_drafts_created: int = 0
     remediation_items_deferred: int = 0
@@ -593,6 +595,7 @@ class _PollAccumulator:
     prevention_items_skipped: int = 0
     prevention_items_deferred: int = 0
     prevention_failures: list[str] = field(default_factory=list)
+    prevention_items_declined: int = 0
     project_policy_proposals: list[str] = field(default_factory=list)
     remediation_drafts_created: int = 0
     remediation_items_deferred: int = 0
@@ -627,6 +630,7 @@ class _PollAccumulator:
             prevention_items_skipped=self.prevention_items_skipped,
             prevention_items_deferred=self.prevention_items_deferred,
             prevention_failures=tuple(self.prevention_failures),
+            prevention_items_declined=self.prevention_items_declined,
             project_policy_proposals=tuple(self.project_policy_proposals),
             remediation_drafts_created=self.remediation_drafts_created,
             remediation_items_deferred=self.remediation_items_deferred,
@@ -2348,6 +2352,7 @@ class GuardianController:
 
         outcome = _PollAccumulator()
         lease_lost = False
+        publication_preflight_failed = False
         open_poll_succeeded: set[str] = set()
         open_changed_paths: dict[str, frozenset[str]] = {}
         try:
@@ -2369,7 +2374,13 @@ class GuardianController:
                         checked_at=observed_at,
                     )
                 except Exception as exc:
-                    outcome.authentication_circuit_open = True
+                    # A failed identity check blocks this entire poll, but a
+                    # non-authentication API failure must not latch the daily
+                    # authentication circuit. The bounded scheduler can retry.
+                    publication_preflight_failed = True
+                    outcome.authentication_circuit_open = not isinstance(
+                        exc, GitHubAPIError
+                    )
                     outcome.failures.append(_safe_failure_name(exc))
                     self.state.record_health(
                         component="controller",
@@ -2386,6 +2397,7 @@ class GuardianController:
             if (
                 self.config.mode is GuardianMode.PROPOSE_PREVENTION
                 and not outcome.authentication_circuit_open
+                and not publication_preflight_failed
             ):
                 # Constructor enforces this dependency for the only mode that
                 # may use it.
@@ -2444,6 +2456,7 @@ class GuardianController:
             for policy in self.config.repositories:
                 if (
                     lease_lost
+                    or publication_preflight_failed
                     or outcome.authentication_circuit_open
                     or outcome.model_circuit_open
                 ):
@@ -2620,6 +2633,7 @@ class GuardianController:
             if (
                 include_history
                 and not lease_lost
+                and not publication_preflight_failed
                 and "PollDeadlineExceeded" not in outcome.failures
                 and not outcome.authentication_circuit_open
                 and not outcome.model_circuit_open
@@ -2808,6 +2822,7 @@ class GuardianController:
                                 outcome.prevention_items_deferred
                             ),
                             "prevention_failures": tuple(outcome.prevention_failures),
+                            "prevention_items_declined": outcome.prevention_items_declined,
                             "remediation_drafts_created": (
                                 outcome.remediation_drafts_created
                             ),
@@ -7146,6 +7161,7 @@ class GuardianController:
             1 for draft in result.drafts if draft.created
         )
         outcome.prevention_items_skipped += result.skipped
+        outcome.prevention_items_declined += result.declined
         outcome.prevention_items_deferred += result.deferred
         outcome.prevention_failures.extend(result.failures)
         outcome.project_policy_proposals.extend(result.policy_proposals)

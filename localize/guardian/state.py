@@ -36,6 +36,12 @@ _UTC = timezone.utc
 # resolved feedback. The ledger shape is unchanged; its resolution semantics are not.
 _SCHEMA_VERSION = 12
 _SUPPORTED_SCHEMA_VERSIONS = frozenset(range(_SCHEMA_VERSION + 1))
+# Must match the partial expression index health_prevention_decline_key.
+_PREVENTION_DECLINE_SQL = (
+    "SELECT details_json FROM health WHERE component='prevention-author' "
+    "AND status='declined' AND json_extract(details_json, '$.decline_key')=? "
+    "ORDER BY health_id DESC LIMIT 1"
+)
 _TERMINAL_ACTION_STATUSES = frozenset({"completed", "skipped"})
 _ACTION_STATUSES = _TERMINAL_ACTION_STATUSES | {"failed", "pending"}
 _RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -2552,6 +2558,9 @@ class GuardianState:
                 ON assessment_results(created_at);
             CREATE INDEX IF NOT EXISTS health_component_checked
                 ON health(component, checked_at DESC, health_id DESC);
+            CREATE INDEX IF NOT EXISTS health_prevention_decline_key
+                ON health(json_extract(details_json, '$.decline_key'))
+                WHERE component = 'prevention-author' AND status = 'declined';
             CREATE INDEX IF NOT EXISTS publication_events_pending
                 ON publication_events(repository, pr_number, publication_key,
                                       publication_event_id DESC);
@@ -9993,6 +10002,23 @@ class GuardianState:
                 ),
             )
         return int(cursor.lastrowid)
+
+    def prevention_decline(self, decline_key: str) -> Mapping[str, Any] | None:
+        """Find a private disposition bound to exact code, policy and source evidence."""
+        if not re.fullmatch(r"[0-9a-f]{64}", decline_key):
+            raise ValueError("Invalid prevention decline key")
+        row = self._connection.execute(
+            _PREVENTION_DECLINE_SQL, (decline_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        from localize.guardian.prevention_decision import parse_decision
+        details = loads_bounded_json(row["details_json"])
+        parse_decision({key: details.get(key) for key in
+                        ("schema_version", "outcome", "reason", "explanation", "inspected_paths")})
+        if details["outcome"] != "declined":
+            raise RuntimeError("Invalid persisted prevention decline")
+        return details
 
     def latest_health(self, component: str) -> HealthRecord | None:
         """Return the latest health observation for a component."""

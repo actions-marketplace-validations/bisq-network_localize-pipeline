@@ -3210,3 +3210,16 @@ def test_guardian_result_schema_is_declared_as_wheel_package_data() -> None:
     ]
     schema = project_root / "localize/guardian/schemas/guardian-result.schema.json"
     assert json.loads(schema.read_text(encoding="utf-8"))["type"] == "object"
+
+
+def test_status_exposes_decline_reference_without_untrusted_rationale(tmp_path, capsys):
+    config_path = _init_config(tmp_path)
+    capsys.readouterr()
+    with GuardianState(cli.guardian_state_path(config_path)) as state:
+        state.record_health(component="prevention-author", status="declined",
+                            message="private", details={"reason": "project_policy", "explanation": "private-untrusted-prose"})
+    assert cli.main(["status", "--config", str(config_path)]) == 0
+    output = capsys.readouterr().out
+    assert "latest prevention decline: #" in output
+    assert "project_policy" in output and "not repair proof" in output
+    assert "private-untrusted-prose" not in output

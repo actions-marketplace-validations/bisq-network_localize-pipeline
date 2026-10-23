@@ -55,7 +55,7 @@ def test_assembled_stages_use_selected_models_and_share_call_budget(
     invocations = []
 
     def process(argv, **kwargs):
-        stage = "assessment" if "--output-schema" in argv else "prevention"
+        stage = "assessment" if 'default_permissions="guardian_evidence"' in argv else "prevention"
         model = argv[argv.index("--model") + 1]
         effort = next(x for x in argv if x.startswith("model_reasoning_effort="))
         invocations.append((stage, model, effort))
@@ -74,6 +74,11 @@ def test_assembled_stages_use_selected_models_and_share_call_budget(
             assert 'default_permissions="guardian_prevention_author"' in argv
             if prevention_failure:
                 return subprocess.CompletedProcess(argv, 1, "", "You've hit your usage limit")
+        if stage == "prevention":
+            Path(argv[argv.index("-o") + 1]).write_text(json.dumps({
+                "schema_version": 1, "outcome": "patch", "reason": "",
+                "explanation": "Implemented the generic engine correction.",
+                "inspected_paths": ["localize/rules.py"]}))
         return subprocess.CompletedProcess(
             argv, 0,
             json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10,

@@ -1063,6 +1063,28 @@ def plan_prevention_draft(
     )
 
 
+def inspect_prevention_decline(
+    *,
+    base_workspace: Path,
+    candidate_workspace: Path,
+    inspected_paths: Sequence[str],
+    deadline: PollDeadline | None = None,
+) -> None:
+    """A structured decline requires an unchanged tree and real inspected files."""
+    base = _trusted_workspace(base_workspace, label="base")
+    candidate = _trusted_workspace(candidate_workspace, label="candidate")
+    if _workspaces_overlap(base, candidate):
+        raise PreventionPolicyError("base and candidate workspaces overlap")
+    before = _inventory(base, deadline=deadline)
+    after = _inventory(candidate, deadline=deadline)
+    if _changed_entries(before, after, deadline=deadline):
+        raise PreventionPolicyError("declined prevention candidate contains changes")
+    if not inspected_paths or any(
+        path not in before or before[path].kind != "regular" for path in inspected_paths
+    ):
+        raise PreventionPolicyError("prevention decline references unavailable files")
+
+
 __all__ = [
     "DraftPreventionPlan",
     "DuplicatePreventionCandidateError",
@@ -1071,6 +1093,7 @@ __all__ = [
     "TestCommandResult",
     "TestOutcome",
     "inspect_prevention_patch",
+    "inspect_prevention_decline",
     "plan_prevention_draft",
     "prevention_evidence_hash",
 ]

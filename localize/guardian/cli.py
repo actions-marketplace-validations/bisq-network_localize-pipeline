@@ -1766,6 +1766,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             )
             diagnostic = None if state is None else state.latest_health("guardian-failure")
             policy_proposal = None if state is None else state.latest_health("project-policy")
+            prevention_decline = None if state is None else state.latest_health("prevention-author")
     except Exception:
         print("error: Guardian state is unavailable or invalid.", file=sys.stderr)
         return 1
@@ -1778,6 +1779,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if diagnostic is not None:
         print(f"last failure diagnostic: #{diagnostic.health_id} at {diagnostic.checked_at.isoformat()}")
         print(json.dumps(diagnostic.details, sort_keys=True))
+    if prevention_decline is not None and prevention_decline.status == "declined":
+        from localize.guardian.prevention_decision import DECLINE_REASONS
+        reason = prevention_decline.details.get("reason")
+        if not isinstance(reason, str) or reason not in DECLINE_REASONS:
+            reason = "unknown"
+        print(f"latest prevention decline: #{prevention_decline.health_id} ({reason}); "
+              "private rationale recorded, not repair proof")
     if policy_proposal is not None:
         print(f"latest private project-policy proposal: {policy_proposal.details.get('path', 'unavailable')}")
         print(f"proposal evidence: {policy_proposal.details.get('status', 'unknown')}; operator review required")

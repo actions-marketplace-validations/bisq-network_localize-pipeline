@@ -92,6 +92,11 @@ _GIT_REASONS = {
     "timed out": "timeout",
 }
 _INVARIANT_REASONS = {
+    "prevention draft contains no changed files": "empty_prevention_patch",
+    "declined prevention candidate contains changes": "decline_contains_changes",
+    "prevention decline references unavailable files": "invalid_decline_reference",
+    "Prevention author disposition is invalid.": "invalid_author_disposition",
+    "Prevention author disposition is missing or malformed.": "missing_author_disposition",
     "exact SSH signing material is unavailable": "signing_material_unavailable",
     "SSH signing program is unavailable": "signing_program_unavailable",
     "SSH_AUTH_SOCK is only permitted for SSH git commit": "signing_environment_scope",

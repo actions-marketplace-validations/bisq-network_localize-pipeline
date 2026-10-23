@@ -1306,7 +1306,15 @@ Each scheduled wake after the configured local start time can then poll GitHub,
 at least 900 seconds apart and at most 96 polls per local day. Failed attempts
 count too; a crash does not lose the checkpoint. Authentication or provider/model
 capacity circuit failures stop subsequent scheduled attempts for that day; diagnose
-the cause before an explicit manual retry. These are **poll** limits, not Codex
+the cause before an explicit manual retry. Non-authentication GitHub API failures
+(including connection errors, timeouts, server errors and rate limits) during
+publication identity verification stop all work in that poll, but do not open
+the daily authentication circuit. The next configured interval can retry, within
+the same daily attempt limit; failed polls never produce a success heartbeat.
+Reaching the per-poll project-policy authoring cap defers new candidates without
+failing the poll. Existing private proposals remain reusable at that cap;
+invalid evidence, malformed artifacts and authoring errors still fail closed.
+These are **poll** limits, not Codex
 session limits: unchanged completed feedback does not start another model session.
 The shared `limits.max_model_calls_per_day` budget still counts every model retry,
 and the existing per-run timeouts, bounded model retries, and no-fallback
@@ -1421,3 +1429,21 @@ and public comment counts. Rerunning with the same findings at the same revision
 does not duplicate the comment. An unchanged English value is a candidate for
 review, not proof of a mistranslation; product names and shared-language terms
 may correctly remain unchanged.
+
+### Prevention author declines
+
+Pipeline prevention authoring returns a structured `patch` or `declined` result.
+A decline must identify `project_policy`, `no_generic_defect`, or `already_covered`,
+provide a bounded explanation, and reference existing regular files it inspected.
+The controller independently requires the candidate tree to be unchanged before
+recording the disposition in the private `prevention-author` health ledger. This
+records a model assessment; it does not prove the translation issue is resolved
+or authorize a code or project-policy change.
+
+A missing or malformed result, an unexplained empty patch, a nonexistent inspected
+file, or edits accompanying a decline still fail the poll. Valid declines are
+counted separately from failed and deferred work. `guardian status` shows the
+latest private decline reference without printing its untrusted rationale.
+Repeated authoring is suppressed only for the same pipeline base, repository
+policy, source authority and evidence revisions. Changed inputs require a fresh
+assessment. Historical failure diagnostics remain available.
