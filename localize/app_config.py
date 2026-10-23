@@ -12,18 +12,18 @@ from dotenv import load_dotenv
 
 from localize.ignore_keys import compile_ignore_key_patterns
 from localize.logging_config import setup_logger
-from localize.placeholder_rules import DEFAULT_PLACEHOLDER_PROFILE, validate_placeholder_profile
-from localize.localization_formats import (
+from localize.formats.placeholders import DEFAULT_PLACEHOLDER_PROFILE, validate_placeholder_profile
+from localize.formats.metadata import (
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,
 )
-from localize.localization_layouts import (
+from localize.formats.layouts import (
     SUFFIX_LAYOUT,
     LocalizationLayout,
     load_localization_layout,
 )
-from localize.localization_profiles import LocalizationProfile, load_localization_profiles
-from localize.model_provider import (
+from localize.formats.profiles import LocalizationProfile, load_localization_profiles
+from localize.providers.models import (
     ChatModelProvider,
     DEFAULT_MODEL_PROVIDER,
     DEFAULT_TRANSLATION_MODEL,

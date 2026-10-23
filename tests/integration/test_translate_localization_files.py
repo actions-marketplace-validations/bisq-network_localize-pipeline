@@ -12,10 +12,10 @@ from types import SimpleNamespace
 import pytest
 import localize.translate_localization_files
 from localize.ignore_keys import compile_ignore_key_patterns
-from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-from localize.localization_layouts import LocalizationLayout
-from localize.localization_profiles import LocalizationProfile
-from localize.properties_parser import parse_properties_file
+from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+from localize.formats.layouts import LocalizationLayout
+from localize.formats.profiles import LocalizationProfile
+from localize.formats.properties import parse_properties_file
 from localize.translation_memory import (
     TranslationMemory,
     load_translation_memory,

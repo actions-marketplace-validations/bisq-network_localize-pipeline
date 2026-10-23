@@ -21,7 +21,7 @@ import yaml
 from localize.guardian.evidence import _locale_codes
 from localize.guardian.json_safety import loads_bounded_json
 from localize.guardian.real_data_impact import RealDataCorpus
-from localize.localization_profiles import load_localization_profiles
+from localize.formats.profiles import load_localization_profiles
 from localize.semantic_quality import (
     TranslationChange, evaluate_semantic_rules, iter_all_translation_entries,
     load_semantic_rules,

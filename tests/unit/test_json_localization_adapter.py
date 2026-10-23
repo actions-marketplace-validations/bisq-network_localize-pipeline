@@ -2,11 +2,12 @@
 
 import json
 
-from localize.localization_adapters import _escape_messageformat_if_needed, get_localization_adapter
-from localize.localization_formats import JSON_FORMAT
+from localize.formats.adapters import _escape_messageformat_if_needed, get_localization_adapter
+from localize.formats.metadata import JSON_FORMAT
 
 
 def write_json(path, payload):
+    """Write a readable UTF-8 JSON fixture without escaping non-ASCII text."""
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

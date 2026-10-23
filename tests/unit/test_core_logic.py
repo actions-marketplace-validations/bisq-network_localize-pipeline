@@ -34,7 +34,7 @@ from localize.translate_localization_files import (
     _handle_retry,
 )
 from localize.ignore_keys import compile_ignore_key_patterns
-from localize.properties_parser import parse_properties_file, reassemble_file
+from localize.formats.properties import parse_properties_file, reassemble_file
 
 
 class TestCoreLogic(unittest.TestCase):
@@ -1446,8 +1446,8 @@ class TestFileDetectionLogic(unittest.TestCase):
     @patch('subprocess.run')
     def test_get_changed_files_supports_json_locale_directory_layout(self, mock_subprocess_run):
         """Directory-based locale projects should not need locale suffix filenames."""
-        from localize.localization_formats import JSON_FORMAT
-        from localize.localization_layouts import LocalizationLayout
+        from localize.formats.metadata import JSON_FORMAT
+        from localize.formats.layouts import LocalizationLayout
         from localize.translate_localization_files import get_changed_translation_files
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1478,9 +1478,9 @@ class TestFileDetectionLogic(unittest.TestCase):
     @patch('subprocess.run')
     def test_get_changed_files_supports_mixed_format_profiles(self, mock_subprocess_run):
         """Projects can discover changed locale files across configured format profiles."""
-        from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-        from localize.localization_layouts import LocalizationLayout
-        from localize.localization_profiles import LocalizationProfile
+        from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+        from localize.formats.layouts import LocalizationLayout
+        from localize.formats.profiles import LocalizationProfile
         from localize.translate_localization_files import get_changed_translation_files
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1523,9 +1523,9 @@ class TestFileDetectionLogic(unittest.TestCase):
     @patch('subprocess.run')
     def test_process_all_files_supports_mixed_format_profiles(self, mock_subprocess_run):
         """Full scans should include target files from every configured format profile."""
-        from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-        from localize.localization_layouts import LocalizationLayout
-        from localize.localization_profiles import LocalizationProfile
+        from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+        from localize.formats.layouts import LocalizationLayout
+        from localize.formats.profiles import LocalizationProfile
         from localize.translate_localization_files import get_changed_translation_files
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1566,9 +1566,9 @@ class TestFileDetectionLogic(unittest.TestCase):
 
     def test_explicit_profiles_take_precedence_over_implicit_default(self):
         """Compatibility default must not shadow explicitly configured profiles."""
-        from localize.localization_formats import JSON_FORMAT
-        from localize.localization_layouts import LocalizationLayout
-        from localize.localization_profiles import LocalizationProfile
+        from localize.formats.metadata import JSON_FORMAT
+        from localize.formats.layouts import LocalizationLayout
+        from localize.formats.profiles import LocalizationProfile
         from localize.translate_localization_files import get_source_filename
 
         explicit_profiles = (

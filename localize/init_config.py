@@ -21,18 +21,18 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
-from localize.localization_formats import (
+from localize.formats.metadata import (
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,
     list_localization_formats,
     load_localization_format,
 )
-from localize.localization_layouts import (
+from localize.formats.layouts import (
     SUFFIX_LAYOUT,
     LocalizationLayout,
     load_localization_layout,
 )
-from localize.model_provider import DEFAULT_TRANSLATION_MODEL
+from localize.providers.models import DEFAULT_TRANSLATION_MODEL
 
 # Human-readable names for common locale codes; unknown codes fall back to the code.
 _LOCALE_NAMES: Dict[str, str] = {

@@ -27,7 +27,7 @@ from uuid import uuid4
 import yaml
 
 from localize.formats import get_localization_adapter
-from localize.translation_validator import find_glossary_mismatches
+from localize.formats.validation import find_glossary_mismatches
 from localize.guardian.authorization import (
     AuthorizedFeedback,
     IntakePolicyError,
@@ -123,7 +123,7 @@ from localize.guardian.workspace import (
     HistoricalRevision,
     HistoricalWorkspace,
 )
-from localize.localization_profiles import (
+from localize.formats.profiles import (
     LocalizationProfile,
     load_localization_profiles,
 )

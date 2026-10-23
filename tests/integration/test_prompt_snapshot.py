@@ -6,11 +6,11 @@ import pytest
 from aiolimiter import AsyncLimiter
 
 import localize.translate_localization_files as translation_runtime
-from localize.localization_adapters import get_localization_adapter
-from localize.localization_formats import JAVA_PROPERTIES_FORMAT
-from localize.placeholder_rules import capture_placeholder_tokens, protect_placeholders
-from localize.prompt_capture import PromptCaptureProvider
-from localize.properties_parser import parse_properties_file
+from localize.formats.adapters import get_localization_adapter
+from localize.formats.metadata import JAVA_PROPERTIES_FORMAT
+from localize.formats.placeholders import capture_placeholder_tokens, protect_placeholders
+from localize.providers.prompt_capture import PromptCaptureProvider
+from localize.formats.properties import parse_properties_file
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "bisq_prompt_snapshot"

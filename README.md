@@ -315,6 +315,10 @@ Use these packages for reusable code:
 Avoid importing implementation modules directly unless you are contributing to
 this repository.
 
+Implementations live inside these packages. See the
+[package boundaries and import migration guide](docs/repository-structure.md#package-boundaries)
+for the module layout and replacements for the former root-level imports.
+
 ## Modularity Guardrails
 
 Java properties, JSON, Bisq, and Bisq mobile are supported profiles, not core

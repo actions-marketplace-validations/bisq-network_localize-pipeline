@@ -25,22 +25,22 @@ from typing import (
 import yaml
 
 from localize.ignore_keys import compile_ignore_key_patterns, is_ignored_key
-from localize.localization_adapters import get_localization_adapter
-from localize.localization_formats import (
+from localize.formats.adapters import get_localization_adapter
+from localize.formats.metadata import (
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,
     load_localization_format,
 )
-from localize.localization_layouts import (
+from localize.formats.layouts import (
     SUFFIX_LAYOUT,
     LocalizationLayout,
     load_localization_layout,
 )
-from localize.localization_profiles import (
+from localize.formats.profiles import (
     LocalizationProfile,
     load_localization_profiles,
 )
-from localize.placeholder_rules import strip_placeholder_tokens
+from localize.formats.placeholders import strip_placeholder_tokens
 from localize.semantic_quality import (
     SemanticFinding,
     SemanticQAStats,
@@ -56,7 +56,7 @@ from localize.semantic_quality import (
     normalize_retained_source_word_allowlist,
 )
 from localize.source_identical_acceptance import is_accepted_source_identical, normalize_acceptances
-from localize.translation_validator import find_disallowed_control_characters
+from localize.formats.validation import find_disallowed_control_characters
 
 
 @dataclass

@@ -6,9 +6,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-from localize.localization_layouts import LocalizationLayout, SUFFIX_LAYOUT
-from localize.localization_profiles import LocalizationProfile
+from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+from localize.formats.layouts import LocalizationLayout, SUFFIX_LAYOUT
+from localize.formats.profiles import LocalizationProfile
 from localize.semantic_quality import SemanticQAStats, SemanticRule
 from localize.translation_quality_gate import (
     QualityGateConfig,

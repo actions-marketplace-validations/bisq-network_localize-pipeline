@@ -26,7 +26,17 @@ from localize.guardian.workspace import (
 )
 
 
+@pytest.fixture
+def askpass_helper(tmp_path: Path) -> str:
+    """Provide a regular executable without relying on system utility symlinks."""
+    helper = tmp_path / "askpass"
+    helper.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    helper.chmod(0o700)
+    return str(helper)
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> str:
+    """Run Git in a test repository, returning stdout and optionally asserting success."""
     completed = subprocess.run(
         ["git", "-C", str(repo), *args],
         check=False,
@@ -297,6 +307,7 @@ def test_checkout_stops_before_starting_git_after_the_poll_deadline(tmp_path):
 
 
 def test_checkout_promotes_a_deadline_bound_git_timeout(tmp_path):
+    """Convert a Git timeout bounded by the poll deadline into PollDeadlineExceeded."""
     calls: list[float] = []
 
     def timed_out_git(args, **kwargs):
@@ -316,7 +327,8 @@ def test_checkout_promotes_a_deadline_bound_git_timeout(tmp_path):
     assert calls == [3]
 
 
-def test_credentials_are_fetch_only_and_never_placed_in_argv(tmp_path):
+def test_credentials_are_fetch_only_and_never_placed_in_argv(tmp_path, askpass_helper):
+    """Expose credentials only to fetch's environment and never to command arguments."""
     remote, _base_sha, head_sha = _create_remote(tmp_path)
     secret = "guardian-secret-value"
     calls: list[tuple[tuple[str, ...], Mapping[str, str]]] = []
@@ -331,7 +343,7 @@ def test_credentials_are_fetch_only_and_never_placed_in_argv(tmp_path):
         remote_url=remote.as_uri(),
         allow_file_remote=True,
         credential_environment=lambda: {
-            "GIT_ASKPASS": "/usr/bin/false",
+            "GIT_ASKPASS": askpass_helper,
             "LOCALIZE_GUARDIAN_GIT_TOKEN": secret,
         },
         _process_runner=recording_run,
@@ -453,6 +465,7 @@ def test_commits_only_exact_translation_paths_and_links_feedback(tmp_path):
 
 
 def test_fork_commit_links_feedback_in_the_base_repository(tmp_path):
+    """Attribute a fork's feedback commit to the upstream repository's review thread."""
     remote, _base_sha, head_sha = _create_remote(tmp_path)
     with materialize_exact_checkout(
         _revision(ref="refs/heads/translation-review", sha=head_sha),
@@ -479,7 +492,10 @@ def test_fork_commit_links_feedback_in_the_base_repository(tmp_path):
         )
 
 
-def test_publishes_exact_descendant_with_expected_old_ref_and_confirms_ref(tmp_path):
+def test_publishes_exact_descendant_with_expected_old_ref_and_confirms_ref(
+    tmp_path, askpass_helper,
+):
+    """Publish with an exact remote-ref lease, isolated credentials, and ref confirmation."""
     remote, _base_sha, head_sha = _create_remote(tmp_path)
     calls = []
     publication_sequence: list[str] = []
@@ -515,7 +531,7 @@ def test_publishes_exact_descendant_with_expected_old_ref_and_confirms_ref(tmp_p
         published = workspace.publish_commit(
             commit,
             credential_environment=lambda: {
-                "GIT_ASKPASS": "/usr/bin/false",
+                "GIT_ASKPASS": askpass_helper,
                 "LOCALIZE_GUARDIAN_GIT_TOKEN": "publish-secret",
             },
             require_signature=False,
@@ -1115,8 +1131,9 @@ def test_unsigned_openpgp_commit_still_rejects_malformed_supplied_key(tmp_path):
 
 
 def test_signs_validated_prevention_modifications_and_new_tests_then_creates_branch(
-    tmp_path,
+    tmp_path, askpass_helper,
 ):
+    """Require signature verification and a live lease before creating a prevention branch."""
     remote, _base_sha, head_sha = _create_remote(tmp_path)
     original_run = subprocess.run
     calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
@@ -1159,7 +1176,7 @@ def test_signs_validated_prevention_modifications_and_new_tests_then_creates_bra
                 branch="guardian/prevention-abc",
                 branch_prefix="guardian/prevention-",
                 credential_environment=lambda: {
-                    "GIT_ASKPASS": "/usr/bin/false",
+                    "GIT_ASKPASS": askpass_helper,
                 },
                 before_push=lost_lease,
                 remote_url=remote.as_uri(),
@@ -1182,7 +1199,7 @@ def test_signs_validated_prevention_modifications_and_new_tests_then_creates_bra
             branch="guardian/prevention-abc",
             branch_prefix="guardian/prevention-",
             credential_environment=lambda: {
-                "GIT_ASKPASS": "/usr/bin/false",
+                "GIT_ASKPASS": askpass_helper,
                 "LOCALIZE_GUARDIAN_GIT_TOKEN": "prevention-secret",
             },
             before_push=lambda: lease_checks.append("checked"),

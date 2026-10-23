@@ -19,9 +19,9 @@ from openai import (
     RateLimitError,
 )
 
-from localize.cost_estimator import CostEstimate, estimate_run_cost, format_estimate
-from localize.openai_compat import create_chat_completion, create_chat_completion_with_fallback
-from localize.usage_tracker import DEFAULT_PRICES, UsageTracker
+from localize.providers.costs import CostEstimate, estimate_run_cost, format_estimate
+from localize.providers.openai_compat import create_chat_completion, create_chat_completion_with_fallback
+from localize.providers.usage import DEFAULT_PRICES, UsageTracker
 
 
 _LOCAL_PROVIDER_PLACEHOLDER_KEY = "not-needed"

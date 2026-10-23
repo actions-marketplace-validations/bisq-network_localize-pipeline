@@ -17,9 +17,9 @@ import yaml
 from localize.formats import get_localization_adapter
 from localize.guardian.models import ProposedReplacement
 from localize.guardian.path_globs import matches_any_path_glob
-from localize.localization_profiles import LocalizationProfile, load_localization_profiles
-from localize.placeholder_rules import DEFAULT_PLACEHOLDER_PROFILE, placeholder_profile
-from localize.translation_validator import (
+from localize.formats.profiles import LocalizationProfile, load_localization_profiles
+from localize.formats.placeholders import DEFAULT_PLACEHOLDER_PROFILE, placeholder_profile
+from localize.formats.validation import (
     check_encoding_and_mojibake,
     check_placeholder_parity,
     find_disallowed_control_characters,

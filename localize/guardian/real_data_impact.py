@@ -28,7 +28,7 @@ from localize.guardian.evidence import (
 )
 from localize.guardian.json_safety import loads_bounded_json
 from localize.guardian.prevention import TestOutcome
-from localize.localization_profiles import load_localization_profiles
+from localize.formats.profiles import load_localization_profiles
 
 
 DEFAULT_MAX_NEW_REAL_DATA_FINDINGS = 5

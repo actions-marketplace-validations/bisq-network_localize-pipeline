@@ -4,17 +4,18 @@ import json
 
 import pytest
 
-from localize.localization_formats import JSON_FORMAT
-from localize.properties_parser import reassemble_file
+from localize.formats.metadata import JSON_FORMAT
+from localize.formats.properties import reassemble_file
 from localize.translate_localization_files import (
     _prefer_glossary_compliant_draft,
     run_per_key_validation_with_summary,
     run_post_translation_validation,
 )
-from localize.translation_validator import find_glossary_mismatches
+from localize.formats.validation import find_glossary_mismatches
 
 
 def _properties_mismatches(source, target, glossary):
+    """Compare glossary terms after decoding Java Properties whitespace escapes."""
     return find_glossary_mismatches(
         source, target, glossary, decode_properties_whitespace=True
     )

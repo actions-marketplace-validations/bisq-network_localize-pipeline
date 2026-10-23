@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Mapping, Optional, Protocol
 
 from localize.atomic_io import write_json_atomic, write_text_atomic
-from localize.pipeline_core import (
+from localize.core.pipeline import (
     ProcessQueueResult,
     RUN_METRIC_KEYS,
     TranslationPipelineOptions,

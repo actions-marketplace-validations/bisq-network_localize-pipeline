@@ -23,7 +23,7 @@ from localize.json_response import (
     chat_reasoning_effort_kwargs,
     loads_json_object,
 )
-from localize.model_provider import (
+from localize.providers.models import (
     ChatModelProvider,
     DEFAULT_MODEL_PROVIDER,
     ModelProviderConfigurationError,
@@ -31,7 +31,7 @@ from localize.model_provider import (
     create_model_provider,
     normalize_reasoning_effort,
 )
-from localize.placeholder_rules import (
+from localize.formats.placeholders import (
     DEFAULT_PLACEHOLDER_PROFILE,
     set_placeholder_profile,
     validate_placeholder_profile,

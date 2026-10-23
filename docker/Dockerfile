@@ -1,8 +1,9 @@
-FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS gh-builder
+FROM golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af AS gh-builder
 
 ARG GH_VERSION=2.96.0
 ARG GH_COMMIT=b300f2ec7ec9dc9addc39b2ad88c54097ded7ca0
 ARG GRPC_VERSION=1.83.2
+ARG COMPRESS_VERSION=1.18.7
 ARG X_MOD_VERSION=0.41.0
 ARG X_TEXT_VERSION=0.42.0
 ARG X_NET_VERSION=0.60.0
@@ -13,6 +14,7 @@ RUN git clone --depth 1 --branch "v${GH_VERSION}" \
         https://github.com/cli/cli.git . && \
     test "$(git rev-parse HEAD)" = "$GH_COMMIT" && \
     go get "google.golang.org/grpc@v${GRPC_VERSION}" && \
+    go get "github.com/klauspost/compress@v${COMPRESS_VERSION}" && \
     go get "golang.org/x/mod@v${X_MOD_VERSION}" && \
     go get "golang.org/x/text@v${X_TEXT_VERSION}" && \
     go get "golang.org/x/net@v${X_NET_VERSION}" && \
@@ -21,6 +23,8 @@ RUN git clone --depth 1 --branch "v${GH_VERSION}" \
 RUN go version -m /out/gh > /tmp/gh-buildinfo && \
     grep -E "google[.]golang[.]org/grpc[[:space:]]+v${GRPC_VERSION}([[:space:]]|$)" \
         /tmp/gh-buildinfo && \
+    grep -E "github[.]com/klauspost/compress[[:space:]]+v${COMPRESS_VERSION}([[:space:]]|$)" \
+        /tmp/gh-buildinfo && \
     grep -E "golang[.]org/x/mod[[:space:]]+v${X_MOD_VERSION}([[:space:]]|$)" \
         /tmp/gh-buildinfo && \
     grep -E "golang[.]org/x/text[[:space:]]+v${X_TEXT_VERSION}([[:space:]]|$)" \
@@ -28,7 +32,7 @@ RUN go version -m /out/gh > /tmp/gh-buildinfo && \
     grep -E "golang[.]org/x/net[[:space:]]+v${X_NET_VERSION}([[:space:]]|$)" \
         /tmp/gh-buildinfo
 
-FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS yq-builder
+FROM golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af AS yq-builder
 
 ARG YQ_VERSION=4.53.3
 ARG YQ_COMMIT=1b9b4ac5187171d2e5e3129be0cfa827c7f9d53d
@@ -50,7 +54,7 @@ RUN /out/yq --version && \
     grep -E "golang[.]org/x/net[[:space:]]+v${X_NET_VERSION}([[:space:]]|$)" \
         /tmp/yq-buildinfo
 
-FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS tx-builder
+FROM golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af AS tx-builder
 
 ARG TX_VERSION=1.6.17
 ARG TX_COMMIT=30dac142446db7bd1919894e9eb93545f58cc980
@@ -78,7 +82,7 @@ RUN /out/tx --version && \
     grep -E "golang[.]org/x/net[[:space:]]+v${X_NET_VERSION}([[:space:]]|$)" \
         /tmp/tx-buildinfo
 
-FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS gosu-builder
+FROM golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af AS gosu-builder
 
 ARG GOSU_VERSION=1.19
 ARG GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513

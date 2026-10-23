@@ -39,21 +39,21 @@ from localize.json_response import (
     chat_reasoning_effort_kwargs,
     loads_json_object,
 )
-from localize.localization_adapters import (
+from localize.formats.adapters import (
     get_localization_adapter,
     lint_properties_file as lint_properties_file,
 )
-from localize.localization_formats import JAVA_PROPERTIES_FORMAT, LocalizationFormat
-from localize.localization_layouts import LocalizationLayout
-from localize.localization_profiles import LocalizationProfile
-from localize.model_provider import OpenAICompatibleProvider
-from localize.placeholder_rules import (
+from localize.formats.metadata import JAVA_PROPERTIES_FORMAT, LocalizationFormat
+from localize.formats.layouts import LocalizationLayout
+from localize.formats.profiles import LocalizationProfile
+from localize.providers.models import OpenAICompatibleProvider
+from localize.formats.placeholders import (
     extract_placeholder_tokens,
     protect_placeholders,
     restore_placeholders as restore_protected_placeholders,
     set_placeholder_profile,
 )
-from localize.pipeline_core import (
+from localize.core.pipeline import (
     RUN_METRIC_KEYS,
     TranslationPipelineOptions,
     TranslationPipelinePaths,
@@ -67,7 +67,7 @@ from localize.translation_memory import (
     load_translation_memory,
     save_translation_memory,
 )
-from localize.translation_validator import (
+from localize.formats.validation import (
     check_placeholder_parity,
     check_encoding_and_mojibake,
     find_glossary_mismatches,

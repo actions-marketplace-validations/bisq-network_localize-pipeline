@@ -1,8 +1,8 @@
 from pathlib import Path
 import json
 
-from localize.localization_formats import JSON_FORMAT
-from localize.localization_layouts import LocalizationLayout
+from localize.formats.metadata import JSON_FORMAT
+from localize.formats.layouts import LocalizationLayout
 from localize.semantic_quality import (
     SemanticRule,
     TranslationChange,

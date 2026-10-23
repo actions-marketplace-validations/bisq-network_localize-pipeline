@@ -29,16 +29,25 @@ This project has three supported surfaces:
 | `localize/cli.py` | `localize formats/init/check/validate/run/bootstrap-pr/memory`. |
 | `localize/bootstrap_pr.py` | Self-service onboarding branch and PR generation. |
 | `localize/init_config.py` | Config scaffolding and locale detection. |
-| `localize/pipeline_core.py` | Format-agnostic orchestration with injected steps. |
-| `localize/connectors.py` | Public source/processor/reporter/publisher protocols plus reusable filesystem/reporter/processor connectors. |
-| `localize/formats/` | Public format API and adapter conformance helpers. |
-| `localize/localization_formats.py` | Format metadata and registry. |
-| `localize/localization_layouts.py` | Filename/path layout helpers. |
-| `localize/localization_profiles.py` | Single and mixed format/layout profile loading. |
-| `localize/localization_adapters.py` | Built-in Java `.properties` and JSON adapters. |
+| `localize/core/pipeline.py` | Format-agnostic orchestration with injected steps. |
+| `localize/core/connectors.py` | Public source/processor/reporter/publisher protocols plus reusable filesystem/reporter/processor connectors. |
+| `localize/formats/` | Format implementations and public API. |
+| `localize/formats/metadata.py` | Format metadata and registry. |
+| `localize/formats/layouts.py` | Filename/path layout helpers. |
+| `localize/formats/profiles.py` | Single and mixed format/layout profile loading. |
+| `localize/formats/adapters.py` | Built-in Java `.properties` and JSON adapters. |
+| `localize/formats/properties.py` | Java `.properties` parser and serializer. |
+| `localize/formats/validation.py` | Key synchronization, encoding, and translation validation. |
+| `localize/formats/placeholders.py` | Placeholder profiles, protection, and parity helpers. |
+| `localize/formats/locale_utils.py` | Locale suffix extraction. |
+| `localize/formats/testing.py` | Reusable adapter conformance checks for plugin authors. |
 | `localize/plugins.py` | Plugin loading through entry points, env modules, and `--plugin`. |
-| `localize/providers/` | Public provider API. |
-| `localize/model_provider.py` | AISuite and direct OpenAI-compatible provider implementations. |
+| `localize/providers/` | Model implementations and public API. |
+| `localize/providers/models.py` | AISuite and direct OpenAI-compatible provider implementations. |
+| `localize/providers/openai_compat.py` | OpenAI request parameter compatibility. |
+| `localize/providers/costs.py` | Run cost estimates. |
+| `localize/providers/usage.py` | Token accounting and usage reports. |
+| `localize/providers/prompt_capture.py` | Offline provider for prompt regression snapshots. |
 | `localize/translation_memory.py` | Exact-match translation memory store, import/export, fuzzy suggestions, and conflict handling. |
 | `localize/translate_localization_files.py` | Runtime translation pipeline. |
 | `localize/translation_quality_gate.py` | Deterministic PR quality gate. |
@@ -53,6 +62,49 @@ Downstream projects should import from:
 - `localize.providers`
 
 Implementation modules are for contributors to this repository.
+
+### Package boundaries
+
+The implementations live in these packages; each `__init__.py` only defines its
+public exports. Within the repository, import the specific implementation module
+when working on that layer.
+
+- `core` owns orchestration and connector contracts. Format handling, model
+  calls, and publishing are supplied through injected steps and connectors.
+- `formats` owns parsing, serialization, layout/profile metadata, and structural
+  validation. Add format adapters through its registry and verify them with
+  `formats.testing`.
+- `providers` owns model access, capabilities, token accounting, and cost
+  estimation. Provider implementations follow `ChatModelProvider`.
+
+These three packages do not import one another or load application configuration.
+The root package holds the CLI, configuration, runtime composition, translation
+memory, and quality-review workflows that combine them. `guardian` remains its
+own application package. Shared filesystem helpers stay in `localize.atomic_io`.
+
+### Migrating implementation imports
+
+The documented package imports above are unchanged. The former root-level
+implementation modules have moved, with no compatibility aliases. Scripts or
+plugins that imported them directly must update those imports:
+
+| Old module (under `localize`) | New module (under `localize`) |
+| --- | --- |
+| `pipeline_core` | `core.pipeline` |
+| `connectors` | `core.connectors` |
+| `localization_formats` | `formats.metadata` |
+| `localization_layouts` | `formats.layouts` |
+| `localization_profiles` | `formats.profiles` |
+| `localization_adapters` | `formats.adapters` |
+| `properties_parser` | `formats.properties` |
+| `translation_validator` | `formats.validation` |
+| `placeholder_rules` | `formats.placeholders` |
+| `locale_utils` | `formats.locale_utils` |
+| `model_provider` | `providers.models` |
+| `openai_compat` | `providers.openai_compat` |
+| `cost_estimator` | `providers.costs` |
+| `usage_tracker` | `providers.usage` |
+| `prompt_capture` | `providers.prompt_capture` |
 
 ## Profiles And Examples
 

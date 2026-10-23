@@ -11,10 +11,11 @@ from dataclasses import dataclass
 from pathlib import PurePath
 from typing import Any, Dict, Mapping, Optional, Sequence
 
-from localize.localization_formats import LocalizationFormat
+from localize.formats.metadata import LocalizationFormat
 
 
 def _as_posix(path: str) -> str:
+    """Normalize either slash style to a POSIX path without accessing the filesystem."""
     return PurePath(path.replace("\\", "/")).as_posix()
 
 

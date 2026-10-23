@@ -4,18 +4,19 @@ from collections import Counter
 
 import pytest
 
-from localize.placeholder_rules import (
+from localize.formats.placeholders import (
     extract_placeholder_tokens,
     placeholder_profile,
     protect_placeholders,
     restore_placeholders,
     strip_placeholder_tokens,
 )
-from localize.translation_validator import check_placeholder_parity
+from localize.formats.validation import check_placeholder_parity
 
 
 @pytest.mark.parametrize("profile", ["standard", "java-indexed"])
 def test_numeric_trans_tags_preserve_multiplicity_and_round_trip(profile):
+    """Preserve repeated numeric tags and interpolation tokens in both placeholder profiles."""
     text = '<1>Read <3>{{name}}</3></1><1>again</1><5/><10 />'
     expected = Counter({'<1>': 2, '</1>': 2, '<3>': 1, '</3>': 1,
                         '{{name}}': 1, '<5/>': 1, '<10 />': 1})

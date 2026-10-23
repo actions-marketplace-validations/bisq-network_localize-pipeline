@@ -9,8 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
-from localize.cost_estimator import CostEstimate, estimate_run_cost, format_estimate
-from localize.model_provider import ModelProviderCapabilities
+from localize.providers.costs import CostEstimate, estimate_run_cost, format_estimate
+from localize.providers.models import ModelProviderCapabilities
 
 
 def _json_safe(value: Any) -> Any:

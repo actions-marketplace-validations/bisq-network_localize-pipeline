@@ -13,10 +13,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Pattern, Sequence, Tuple
 
-from localize.localization_adapters import get_localization_adapter
-from localize.localization_formats import JAVA_PROPERTIES_FORMAT, LocalizationFormat
-from localize.localization_layouts import SUFFIX_LAYOUT, LocalizationLayout
-from localize.properties_parser import _has_unescaped_trailing_backslash
+from localize.formats.adapters import get_localization_adapter
+from localize.formats.metadata import JAVA_PROPERTIES_FORMAT, LocalizationFormat
+from localize.formats.layouts import SUFFIX_LAYOUT, LocalizationLayout
+from localize.formats.properties import _has_unescaped_trailing_backslash
 
 
 @dataclass(frozen=True)
