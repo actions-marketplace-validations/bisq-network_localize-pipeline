@@ -22,6 +22,11 @@ class PreventionDecision:
     inspected_paths: tuple[str, ...]
 
 
+def _is_explanation_control(ch: str) -> bool:
+    """Allow prose line breaks and tabs, but no terminal or other C0 controls."""
+    return (ord(ch) < 32 and ch not in "\n\t") or ord(ch) == 127
+
+
 def parse_decision(value: object) -> PreventionDecision:
     """Validate model output independently of the provider's schema enforcement."""
     try:
@@ -48,7 +53,7 @@ def parse_decision(value: object) -> PreventionDecision:
             not isinstance(explanation, str)
             or not explanation.strip()
             or len(explanation) > 2000
-            or any(ord(ch) < 32 or ord(ch) == 127 for ch in explanation)
+            or any(_is_explanation_control(ch) for ch in explanation)
         ):
             raise ValueError
         if not isinstance(paths, list) or not 1 <= len(paths) <= 16:

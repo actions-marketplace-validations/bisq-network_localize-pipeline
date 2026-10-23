@@ -44,6 +44,14 @@ def test_read_explicit_decline(tmp_path):
         {"extra": 1},
         {"outcome": "patch", "reason": "project_policy"},
         {"explanation": "hidden\u001b[2J"},
+        {"explanation": "carriage\rreturn"},
+        {"explanation": "delete\u007f"},
+        {"explanation": "\n\t "},
+        {"inspected_paths": [""]},
+        {"inspected_paths": ["x" * 257]},
+        {"inspected_paths": [f"localize/f{i}.py" for i in range(17)]},
+        {"inspected_paths": ["localize/rules.py\n"]},
+        {"inspected_paths": ["localize/\trules.py"]},
     ],
 )
 def test_reject_malformed_decision(tmp_path, changes):
@@ -53,6 +61,16 @@ def test_reject_malformed_decision(tmp_path, changes):
     p.write_text(json.dumps(data))
     with pytest.raises(CodexOutputError):
         read_decision(p)
+
+
+@pytest.mark.parametrize(
+    "explanation",
+    ["First line.\nSecond line.", "Column\tvalue", "x" * 2000],
+)
+def test_accept_multiline_and_tabbed_explanation(tmp_path, explanation):
+    p = tmp_path / "result.json"
+    p.write_text(json.dumps(payload() | {"explanation": explanation}))
+    assert read_decision(p).explanation == explanation
 
 
 @pytest.mark.parametrize(
