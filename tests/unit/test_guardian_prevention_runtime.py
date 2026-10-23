@@ -9419,3 +9419,63 @@ def test_decline_persistence_survives_restart_and_new_base_invalidates_it(tmp_pa
         policy = replace(policy, prevention=replace(policy.prevention, max_changed_files=3))
         assert execute(state, tmp_path / "new-policy", policy).declined == 1
         assert author.calls == 3
+
+
+@pytest.mark.parametrize("error", ["source_authority", "authentication"])
+def test_decline_revalidation_failure_is_isolated_per_candidate(
+    tmp_path, monkeypatch, error
+):
+    from localize.guardian.prevention_decision import PreventionDecision
+
+    class DecliningAuthor(_FakeAuthor):
+        def run(self, **kwargs):
+            self.calls += 1
+            return PreventionAuthorResult(attempts=1, usage=None, decision=PreventionDecision(
+                "declined", "project_policy", "This is a project wording rule.",
+                ("localize/rules.py",)))
+
+    recorded = []
+    monkeypatch.setattr(
+        prevention_runtime, "record_failure",
+        lambda exc, **context: recorded.append(type(exc).__name__),
+    )
+    author = DecliningAuthor()
+    raised = False
+
+    def revoke_after_first_decline(_source, _revisions):
+        nonlocal raised
+        if author.calls == 1 and not raised:
+            raised = True
+            if error == "authentication":
+                raise GitHubAuthenticationError("redacted GitHub authentication failure")
+            raise PreventionSourceAuthorityError("source changed after decline")
+
+    now = datetime(2026, 8, 30, 12, tzinfo=UTC)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        run_id = state.start_run(repository="acme/translations", locale="ru",
+                                 mode=GuardianMode.PROPOSE_PREVENTION, started_at=now)
+        coordinator = _coordinator(state=state, tmp_path=tmp_path, broker=_FakeBroker(),
+                                   author=author, max_drafts=2)
+        kwargs = dict(_open_source_kwargs(),
+                      require_exact_open_source_authority=revoke_after_first_decline)
+        propose = lambda: coordinator.propose(  # noqa: E731
+            policy=_repository_policy(),
+            recurrence_candidates=(_candidate(), _candidate("A different defect")),
+            evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
+            run_id=run_id, observed_at=now, require_live_lease=_live_lease,
+            require_current_base_unchanged=_current_base, **kwargs)
+        if error == "authentication":
+            with pytest.raises(GitHubAuthenticationError):
+                propose()
+            assert author.calls == 1
+            assert state.latest_health("prevention-author") is None
+            return
+        outcome = propose()
+        assert raised and author.calls == 2
+        assert outcome.failures == ("PreventionSourceAuthorityError",)
+        assert recorded == ["PreventionSourceAuthorityError"]
+        assert outcome.declined == 1
+        rows = state._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM health WHERE component = 'prevention-author'"
+        ).fetchone()[0]
+        assert rows == 1

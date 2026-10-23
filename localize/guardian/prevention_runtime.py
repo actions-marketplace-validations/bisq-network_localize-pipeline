@@ -5381,6 +5381,36 @@ class PreventionCoordinator:
                     ),
                     real_data=real_data,
                 )
+                if isinstance(draft, PreventionDecision):
+                    # This is private model evidence, never publication or repair
+                    # proof. Revalidation failures are per-candidate, like
+                    # authoring failures, and never record a decline.
+                    _require_live_prevention_lease(require_live_lease)
+                    require_current_base_unchanged()
+                    if open_source is not None:
+                        require_exact_open_source_authority(
+                            open_source, normalized_source_revision_ids
+                        )
+                    else:
+                        require_exact_sources_still_closed(
+                            normalized_sources, normalized_source_revision_ids
+                        )
+                    self.state.record_health(
+                        component="prevention-author",
+                        status="declined",
+                        message="Prevention author declined a generic patch; private assessment retained.",
+                        details={
+                            "schema_version": 1, "decline_key": decline_key,
+                            "repository": policy.base_repo, "run_id": run_id,
+                            "base_sha": base.revision.sha, "evidence_hash": _evidence_hash,
+                            "evidence_ids": evidence_ids, "outcome": draft.outcome,
+                            "reason": draft.reason, "explanation": draft.explanation,
+                            "inspected_paths": draft.inspected_paths,
+                        },
+                        checked_at=_as_utc(self.now()),
+                    )
+                    declined += 1
+                    continue
             except (
                 CodexAuthenticationError,
                 CodexCapacityError,
@@ -5394,34 +5424,6 @@ class PreventionCoordinator:
                 _require_live_prevention_lease(require_live_lease)
                 record_failure(exc, repository=policy.base_repo, run_id=run_id)
                 failures.append(type(exc).__name__)
-                continue
-            if isinstance(draft, PreventionDecision):
-                # This is private model evidence, never publication or repair proof.
-                _require_live_prevention_lease(require_live_lease)
-                require_current_base_unchanged()
-                if open_source is not None:
-                    require_exact_open_source_authority(
-                        open_source, normalized_source_revision_ids
-                    )
-                else:
-                    require_exact_sources_still_closed(
-                        normalized_sources, normalized_source_revision_ids
-                    )
-                self.state.record_health(
-                    component="prevention-author",
-                    status="declined",
-                    message="Prevention author declined a generic patch; private assessment retained.",
-                    details={
-                        "schema_version": 1, "decline_key": decline_key,
-                        "repository": policy.base_repo, "run_id": run_id,
-                        "base_sha": base.revision.sha, "evidence_hash": _evidence_hash,
-                        "evidence_ids": evidence_ids, "outcome": draft.outcome,
-                        "reason": draft.reason, "explanation": draft.explanation,
-                        "inspected_paths": draft.inspected_paths,
-                    },
-                    checked_at=_as_utc(self.now()),
-                )
-                declined += 1
                 continue
             drafts.append(draft)
             known_hashes = known_hashes | {
