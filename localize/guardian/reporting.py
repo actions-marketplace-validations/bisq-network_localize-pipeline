@@ -1,0 +1,451 @@
+"""Deterministic public explanations, separate from private model rationale.
+
+Only enumerated explanations and validated repository identifiers reach GitHub.
+Never interpolate model prose, file paths, configuration, or replacement values.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from collections import Counter
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from localize.guardian.models import FeedbackEvent
+
+
+def quiet_clean_review(event: FeedbackEvent, details: Mapping[str, object]) -> bool:
+    """Keep an assessed, clean CodeRabbit summary in the private audit only.
+
+    This is a publication filter, never an intake or assessment shortcut. A
+    recognized clean-review sentence alone cannot hide decisions or findings.
+    Unknown formats and summaries with additional findings remain reportable.
+    """
+    if (
+        event.kind != "issue_comment"
+        or event.author.casefold() != "coderabbitai[bot]"
+        or event.author_type != "Bot"
+        or details.get("verdict") != "reject"
+        or details.get("outcome") != "not_applicable"
+        or details.get("report_outcome", "not_applicable") != "not_applicable"
+        or details.get("report_reason") != "not_applicable"
+        or any(details.get(key) for key in (
+            "decision_required", "changed_keys", "commit_sha",
+            "held_value_edits", "deferred_value_edits",
+        ))
+    ):
+        return False
+    # Private prevention candidates can derive from the review's description
+    # of already-corrected strings. They do not turn it into a new suggestion.
+    body = event.body
+    prefix = "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->"
+    start, end = "<!-- recent_review_start -->", "<!-- recent_review_end -->"
+    if (
+        not body.startswith(prefix)
+        or body.count(start) != 1 or body.count(end) != 1
+        or body.index(start) >= body.index(end)
+    ):
+        return False
+    # Recognize the known wrapper, not arbitrary text quoting a clean verdict.
+    # New CodeRabbit sections remain visible until their format is supported.
+    section = re.compile(
+        r"<!-- (?P<name>review_stack_entry|recent_review|walkthrough|final_review_risk|"
+        r"architecture_review|pre_merge_checks_walkthrough|finishing_touch_checkbox|tips)_start -->"
+        r".*?<!-- (?P=name)_end -->|<!-- autopilot:start -->.*?<!-- autopilot:end -->",
+        re.DOTALL,
+    )
+    remaining = body[len(prefix):].strip()
+    seen = set()
+    while remaining:
+        match = section.match(remaining)
+        if match is None or match.group("name") in seen:
+            return False
+        seen.add(match.group("name"))
+        remaining = remaining[match.end():].strip()
+    recent = body.split(start, 1)[1].split(end, 1)[0].strip()
+    if not re.match(
+        r"No actionable comments were generated in the recent review\.(?: 🎉)?(?:\n\n|$)",
+        recent,
+    ):
+        return False
+    return not re.search(
+        r"nitpick|outside[ -]diff|additional (?:review )?comments|"
+        r"actionable comments posted|```suggestion|potential issue|⚠|❌",
+        body, re.IGNORECASE,
+    )
+
+def reviewer_followup_kind(event: FeedbackEvent, *, is_reply: bool) -> str | None:
+    """Recognize acknowledgements, never arbitrary resolved or bot feedback.
+
+    Match whole sentences after masking inline literals, rather than one old
+    paragraph layout. Unknown sentences, mixed requests, and unknown wrappers
+    stay visible. This classification grants no intake or assessment authority.
+    """
+    if (not is_reply or event.kind != "review_comment"
+            or event.author.casefold() != "coderabbitai[bot]" or event.author_type != "Bot"):
+        return None
+    suffix = "\n\n_You are interacting with an AI system._\n\n<!-- This is an auto-generated reply by CodeRabbit -->"
+    if not event.body.endswith(suffix):
+        return None
+    text = event.body[:-len(suffix)].strip()
+    resolved = text.endswith("✅ Review thread resolved.")
+    if resolved:
+        text = text[:-len("✅ Review thread resolved.")].rstrip()
+        text = text.removesuffix("<!-- <review_comment_withdrawn> -->").rstrip()
+    # Learnings are ancillary only in their known wrapper, with a bounded
+    # explanatory learning. A new instruction or finding there stays visible.
+    if "\n---\n" in text:
+        text, learning = text.split("\n---\n", 1)
+        match = re.fullmatch(
+            r'\s*<details>\s*<summary>(?:✏️ Learnings added|🧠 Learnings used)</summary>'
+            r'\s*```\nLearnt from: [A-Za-z0-9_-]+\nRepo: [A-Za-z0-9_./-]+ PR: [0-9]+\n'
+            r'File: [A-Za-z0-9_./:-]+\nTimestamp: [0-9T:.Z-]+\nLearning: ([^\n]+)\n```'
+            r'(?:\s*> Note: Learnings are effective only in the context of similar code segments\. '
+            r'To apply general coding guidelines, please configure \[review instructions\]'
+            r'\(https://docs\.coderabbit\.ai/guides/review-instructions\)\. '
+            r'You can manage existing learnings in the \[app\]\(https://app\.coderabbit\.ai/learnings\)\.)?'
+            r'\s*</details>\s*', learning,
+        )
+        if not match or not re.fullmatch(
+            r'In [A-Za-z0-9_./-]+, the Java properties key [A-Za-z0-9_.]+ distinguishes '
+            r'the Tor version in \{[0-9]+\} from the Tor Browser version in \{[0-9]+\}\. '
+            r'Labels such as “Tor-Version” in [A-Za-z0-9_./-]+ are valid; '
+            r'omitting “binary” does not by itself constitute a correctness issue\.', match[1],
+        ):
+            return None
+    text = re.sub(r'^`?@[A-Za-z0-9_-]+`? ', '', text.strip())
+    text = re.sub(r'`[^`\n]+`', 'CODE', text)
+    if any(marker in text for marker in ('`', '<', '>', '```')):
+        return None
+    sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?]”)\s+', text)
+    patterns = (
+        r'Agreed\.', r'Thanks for the clarification\.',
+        r'The (?:supplied revision|assessed revision|current value|supplied value) (?:already )?uses CODE(?:, (?:with no|without) (?:CODE(?: in the label)?|the extra CODE))?\.',
+        r'The supplied file content shows CODE, with no Cyrillic letters\.',
+        r'The supplied CODE contains no Cyrillic letters\.',
+        r'(?:The|This) (?:mixed-script )?finding (?:no longer applies|does not apply(?: to the assessed revision)?|remains withdrawn)\.',
+        r'The finding does not apply, so I withdraw it\.',
+        r'I withdraw (?:it|(?:this |the )?(?:finding|suggestion))(?: for (?:that|the assessed) revision)?[.;](?: no correction is needed\.)?',
+        r'No (?:code change|further change|correction|further action|correction or translation regeneration) is needed\.',
+        r'No configuration change or translation regeneration is needed for this finding\.',
+        r'My original finding overstated a wording preference as a correctness issue\.',
+        r'The supplied template distinguishes CODE from CODE\.',
+        r'“Tor version” is a valid label for the Tor binary version\.',
+        r'Adding “binary” is optional, not a functional correction\.',
+        r'The supplied template and existing learning confirm that CODE is valid\.',
+    ) if resolved else (
+        r'The (?:supplied|available) evidence does not establish (?:a translation defect|that CODE is incorrect in this context)\.',
+        r'The script confirms the wording, but it does not establish whether CODE adequately conveys “forwarded” in this context\.',
+        r'Do not change the translation or configuration based on this finding alone\.',
+        r'A [A-Z][a-z]+ reviewer should confirm whether the wording preserves the distinction between the forwarding trader and the displayed sender\.',
+        r'The finding remains unconfirmed pending that review\.',
+        r'No correction is authorized by this reply\.',
+        r'The evidence remains insufficient to confirm a translation defect\.',
+        r'The evidence does not confirm a translation defect\.',
+        r'Keep the translation and configuration unchanged on the basis of this finding alone\.',
+        r'A maintainer should obtain a [A-Z][a-z]+ reviewer’s assessment of whether CODE preserves the intended meaning of “forwarded\.”',
+        r'The finding remains unconfirmed pending that assessment\.',
+        r'The finding remains unconfirmed pending a maintainer decision informed by a [A-Z][a-z]+ reviewer’s assessment\.',
+        r'No new evidence confirms a translation defect\.',
+        r'This finding remains unconfirmed and does not justify a translation or configuration change\.',
+        r'A maintainer decision is still (?:needed|pending)\.',
+        r'If a [A-Z][a-z]+ reviewer confirms that CODE loses the intended meaning of “forwarded,” provide that assessment and the recommended wording\.',
+        r'The finding remains unconfirmed\.',
+        r'No translation or configuration change is justified by this finding alone\.',
+        r'Leave both unchanged pending a maintainer decision supported by a [A-Z][a-z]+ reviewer’s assessment\.',
+        r'The translation concern remains unconfirmed\.',
+        r'This finding alone does not justify a translation or configuration change\.',
+        r'A [A-Z][a-z]+ reviewer’s assessment is needed to determine whether CODE preserves the intended meaning of “forwarded\.”',
+    )
+    if sentences and all(any(re.fullmatch(pattern, sentence) for pattern in patterns) for sentence in sentences):
+        return "resolved" if resolved else "insufficient_evidence"
+    return None
+
+
+def quiet_reviewer_reply(event: FeedbackEvent, details: Mapping[str, object], *, is_reply: bool) -> bool:
+    """Keep resolved CodeRabbit acknowledgements private after assessment.
+
+    Intake and assessment still process every revision, including edits and new
+    findings. Only known resolved replies with a completed no-op are quiet.
+    """
+    reason = details.get("report_reason")
+    if (not is_reply or event.kind != "review_comment"
+            or event.author.casefold() != "coderabbitai[bot]" or event.author_type != "Bot"
+            or reason not in {"not_applicable", "already_addressed"}
+            or details.get("verdict") != "reject" or details.get("outcome") != reason
+            or details.get("report_outcome", reason) != reason
+            or any(details.get(key) for key in (
+                "decision_required", "changed_keys", "commit_sha", "held_value_edits",
+                "deferred_value_edits",
+            ))):
+        return False
+    return reviewer_followup_kind(event, is_reply=is_reply) == "resolved"
+
+
+REASONS = {
+    "processing_failure": "Processing did not complete. Work remains deferred under the configured retry, quota, and authority limits.",
+    "unspecified": "The assessment did not establish a more specific public reason.",
+    "as_suggested": "The assessment accepted the suggested correction; publication status is reported separately.",
+    "alternative_glossary": "The suggested terminology conflicts with the configured glossary; a glossary-compliant alternative was selected.",
+    "alternative_source_fidelity": "An alternative was selected to preserve the current source meaning.",
+    "alternative_other": "A validated alternative was selected instead of the literal suggestion; reviewer confirmation is needed.",
+    "glossary_conflict": "The suggested terminology conflicts with the configured glossary. No glossary change has been authorized.",
+    "policy_conflict": "The suggested change conflicts with configured edit authority or validation requirements.",
+    "insufficient_evidence": "The available evidence is insufficient to authorize a correction.",
+    "already_addressed": "The reported issue is already addressed in the assessed revision.",
+    "not_applicable": "The suggestion does not apply to the assessed revision.",
+}
+
+
+_VERDICT_REASONS = {
+    "apply": {
+        "unspecified", "as_suggested", "alternative_glossary",
+        "alternative_source_fidelity", "alternative_other",
+    },
+    "reject": {
+        "unspecified", "glossary_conflict", "policy_conflict",
+        "insufficient_evidence", "already_addressed", "not_applicable",
+    },
+    "needs_human": {
+        "unspecified", "glossary_conflict", "policy_conflict", "insufficient_evidence",
+    },
+}
+
+
+def validated_decision_required(
+    verdict: str, report_reason: str, decision_required: bool
+) -> bool:
+    """Validate explanation semantics and retain every implied human decision.
+
+    Older assessments omit the flag. Normalize those conservatively without
+    inventing a reason or rejecting a still-valid retained assessment.
+    """
+    if report_reason not in _VERDICT_REASONS.get(verdict, ()):
+        raise ValueError("report_reason contradicts the assessment verdict.")
+    if not isinstance(decision_required, bool):
+        raise ValueError("decision_required must be a boolean.")
+    return (
+        decision_required or verdict == "needs_human"
+        or report_reason in {"glossary_conflict", "alternative_glossary"}
+    )
+
+
+def held_report_reason(reason: str) -> str:
+    """Convert a previous assessment's reason into a current held-decision reason."""
+    if reason not in REASONS:
+        raise ValueError("Unsupported held explanation code.")
+    if reason == "alternative_glossary":
+        return "glossary_conflict"
+    if reason in _VERDICT_REASONS["needs_human"]:
+        return reason
+    return "insufficient_evidence"
+
+
+def report_disposition(details: Mapping[str, object]) -> str:
+    """A correction, decision, and delivery status are independent facts."""
+    outcome = details.get("report_outcome", details.get("outcome"))
+    if outcome == "applied":
+        reason = str(details.get("report_reason", "unspecified"))
+        return "applied_alternative" if reason.startswith("alternative_") else "applied"
+    if outcome in {"translation_batch_deferred", "failed", "prepared", "would_apply"}:
+        return "deferred"
+    if outcome in {"already_addressed", "not_applicable"}:
+        return str(outcome)
+    return (
+        "needs_human"
+        if details.get("decision_required") or outcome == "needs_human"
+        else "not_applied"
+    )
+
+
+def legacy_report_body(
+    details: Mapping[str, object],
+    *,
+    repository: str,
+    feedback_id: str,
+    pull_number: int | None = None,
+    web_base_url: str = "https://github.com",
+) -> str:
+    """Reconstruct historical content for read-only ambiguous-write recovery."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("Invalid report repository")
+    if not re.fullmatch(
+        r"(?:review_comment|issue_comment|review):[1-9][0-9]*(?::[A-Za-z0-9_.-]+)*",
+        feedback_id,
+    ):
+        raise ValueError("Invalid report feedback identifier")
+    reason = details.get("report_reason", "unspecified")
+    if reason not in REASONS:
+        raise ValueError("Unsupported public explanation code")
+    commit = details.get("commit_sha")
+    if commit is not None and (
+        not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+    ):
+        raise ValueError("Invalid report commit")
+    disposition = report_disposition(details)
+    labels = {
+        "applied": "Applied a validated correction",
+        "applied_alternative": "Applied an alternative correction",
+        "already_addressed": "Already addressed",
+        "not_applicable": "Not applicable",
+        "deferred": "Deferred work",
+        "needs_human": "Maintainer decision needed",
+        "not_applied": "No eligible correction",
+    }
+    kind, identifier = feedback_id.split(":", 1)
+    number = identifier.split(":", 1)[0]
+    anchor = {
+        "review_comment": "discussion_r",
+        "issue_comment": "issuecomment-",
+        "review": "pullrequestreview-",
+    }[kind]
+    # Review-object links are generated from validated IDs, never supplied URLs.
+    body = f"🤖 **Localize Guardian — {labels[disposition]}** (`{feedback_id}`).\n\n"
+    if pull_number is not None:
+        if type(pull_number) is not int or pull_number <= 0:
+            raise ValueError("Invalid report pull number")
+        body += f"[Source feedback]({web_base_url}/{repository}/pull/{pull_number}#{anchor}{number}). "
+    if commit:
+        body += f"Published correction: [`{commit[:12]}`]({web_base_url}/{repository}/commit/{commit}). "
+    else:
+        body += "No correction was published for this assessment. "
+    body += REASONS[reason]
+    if details.get("report_outcome") == "failed" and reason != "processing_failure":
+        body += " " + REASONS["processing_failure"]
+    if disposition == "deferred":
+        body += " Remaining work is not being claimed as completed."
+    if details.get("decision_required"):
+        body += " An explicit maintainer decision is still required. The operator must update the governed configuration before automatic reconsideration; a bot acknowledgement or PR merge is not policy approval."
+        remaining = (
+            details.get("held_value_edits") or details.get("deferred_value_edits") or 0
+        )
+        if type(remaining) is not int or not 0 <= remaining <= 100000:
+            raise ValueError("Invalid held edit count")
+        if remaining:
+            body += f" {remaining} remaining value edits are human-held, not claimed as completed or automatically retryable."
+    return body + "\n\nThe review thread remains open for reviewer confirmation."
+
+
+def report_body(
+    details: Mapping[str, object], *, repository: str, feedback_id: str,
+    pull_number: int | None = None, web_base_url: str = "https://github.com",
+) -> str:
+    """Give reviewers the decision and next action, without internal identifiers."""
+    # Preserve one validation boundary for both current and historical schemas.
+    legacy = legacy_report_body(details, repository=repository, feedback_id=feedback_id,
+                                pull_number=pull_number, web_base_url=web_base_url)
+    title = legacy.split("\n", 1)[0].replace(f" (`{feedback_id}`).", "")
+    reason = str(details.get("report_reason", "unspecified"))
+    reasons = {
+        "processing_failure": "Processing did not complete.",
+        "unspecified": "The assessment did not establish a specific reason.",
+        "as_suggested": "The suggested correction was accepted.",
+        "alternative_glossary": "An alternative follows the configured glossary.",
+        "alternative_source_fidelity": "An alternative preserves the current source meaning.",
+        "alternative_other": "An alternative correction needs reviewer confirmation.",
+        "glossary_conflict": "The suggestion conflicts with the configured glossary.",
+        "policy_conflict": "The change is outside the configured edit or validation rules.",
+        "insufficient_evidence": "Evidence is insufficient to authorize a correction.",
+        "already_addressed": "The issue is already addressed in the assessed revision.",
+        "not_applicable": "The suggestion does not apply to the assessed revision.",
+    }
+    action = "Please review"
+    if report_disposition(details) in {"already_addressed", "not_applicable"} and not details.get("decision_required"):
+        action = "No action needed"
+    body = f"{title}\n\n{action}: {reasons[reason]}"
+    if details.get("decision_required"):
+        body += " A maintainer decision is needed before the operator can update the configuration."
+        remaining = details.get("held_value_edits") or details.get("deferred_value_edits") or 0
+        if remaining:
+            noun = "correction needs" if remaining == 1 else "corrections need"
+            body += f" {remaining} remaining {noun} maintainer approval."
+    if details.get("report_outcome") == "failed" and reason != "processing_failure":
+        body += " Guardian could not complete the correction."
+    commit = details.get("commit_sha")
+    if commit:
+        body += f" [Correction]({web_base_url}/{repository}/commit/{commit})."
+    else:
+        body += " No correction was published."
+    if pull_number is not None:
+        kind, identifier = feedback_id.split(":", 1)
+        anchor = {"review_comment": "discussion_r", "issue_comment": "issuecomment-",
+                  "review": "pullrequestreview-"}[kind]
+        body += f" [Source feedback]({web_base_url}/{repository}/pull/{pull_number}#{anchor}{identifier.split(':', 1)[0]})."
+    return body
+
+
+def report_key(
+    *, repository_id: int, pull_number: int, feedback_id: str, body: str
+) -> str:
+    """Deduplicate a logical explanation across retries and assessment runs."""
+    return hashlib.sha256(
+        json.dumps(
+            [repository_id, pull_number, feedback_id, body], ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+
+
+def summary_body(
+    reports,
+    *,
+    repository: str,
+    pull_number: int,
+    web_base_url: str = "https://github.com",
+) -> str:
+    """One bounded, repository-bound summary without model-controlled prose."""
+    heading = "🤖 **Localize Guardian — feedback status**\n\n"
+    allowed = {
+        "applied",
+        "applied_alternative",
+        "already_addressed",
+        "not_applicable",
+        "deferred",
+        "needs_human",
+        "not_applied",
+    }
+    if len(reports) > 100:
+        raise ValueError("Feedback summary exceeds its publication bound.")
+    if not reports:
+        return heading + "No current authorized feedback reports. Their withdrawal does not approve outstanding glossary changes."
+    outcomes = Counter()
+    finding_count = 0
+    for report in reports:
+        url, disposition = report["url"], report["disposition"]
+        prefix = f"{web_base_url}/{repository}/pull/{pull_number}#"
+        commit_prefix = f"{web_base_url}/{repository}/commit/"
+        internal_commit = bool(
+            report.get("internal_finding") is True and isinstance(url, str)
+            and url.startswith(commit_prefix)
+            and re.fullmatch(r"[0-9a-f]{40}", url[len(commit_prefix):])
+        )
+        if (
+            not isinstance(url, str)
+            or (not internal_commit and (not url.startswith(prefix)
+            or not re.fullmatch(
+                r"(?:discussion_r|issuecomment-)[1-9][0-9]*", url[len(prefix) :]
+            )))
+            or disposition not in allowed
+        ):
+            raise ValueError("Invalid feedback summary entry.")
+        count = report.get("finding_count")
+        if count is not None:
+            if type(count) is not int or not 1 <= count <= 10000:
+                raise ValueError("Invalid machine finding summary count.")
+            finding_count += count
+        outcomes[disposition.replace("_", " ")] += count or 1
+    held = any(report.get("decision_required") for report in reports)
+    no_action = not held and all(report["disposition"] in {"already_addressed", "not_applicable"} for report in reports)
+    lead = "No action needed" if no_action else "Please review"
+    body = heading + lead + ": " + "; ".join(f"{count} {label}" for label, count in sorted(outcomes.items()))
+    if held:
+        body += "; maintainer decision still required"
+    if finding_count:
+        body += f" ({finding_count} automated quality findings)"
+    linked = sorted(reports, key=lambda item: not item.get("decision_required"))[:3]
+    body += ". " + " · ".join(f"[Details {index}]({report['url']})" for index, report in enumerate(linked, 1))
+    if len(reports) > len(linked):
+        body += f"; {len(reports) - len(linked)} more outcomes included in the counts."
+    return body

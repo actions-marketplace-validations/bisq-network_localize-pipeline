@@ -22,7 +22,9 @@ from typing import Any, Callable, Mapping, Sequence
 from jsonschema import Draft202012Validator
 
 from localize.guardian.deadline import PollDeadline, PollDeadlineExceeded
+from localize.guardian.diagnostics import AdapterFailure
 from localize.guardian.json_safety import loads_bounded_json
+from localize.guardian.reporting import validated_decision_required
 from localize.guardian.models import (
     CodexAuthMode,
     FeedbackEvent,
@@ -43,6 +45,13 @@ from localize.guardian.process import (
 # --output-schema interface.
 RESULT_SCHEMA_PATH = (
     Path(__file__).resolve().parent / "schemas" / "guardian-result.schema.json"
+)
+REPLACEMENT_UNIQUENESS_GUIDANCE = (
+    "Across the entire feedback array, emit at most one replacement per (path, key). "
+    "When feedback items overlap, assign the replacement to one feedback ID "
+    "authorized for that target. For the other overlapping IDs, use an appropriate "
+    "existing reject or needs_human verdict with empty replacements, not apply. "
+    "Do not describe an uncommitted correction as already addressed."
 )
 
 _ALLOWED_ENVIRONMENT_KEYS = frozenset(
@@ -177,6 +186,8 @@ class GuardianFeedbackDecision:
     confidence: float
     rationale: str
     replacements: tuple[GuardianReplacement, ...]
+    report_reason: str = "unspecified"
+    decision_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -226,6 +237,8 @@ def serialize_codex_result(result: CodexResult) -> str:
                 "verdict": decision.verdict,
                 "confidence": decision.confidence,
                 "rationale": decision.rationale,
+                "report_reason": decision.report_reason,
+                "decision_required": decision.decision_required,
                 "replacements": [
                     {
                         "path": replacement.path,
@@ -247,7 +260,9 @@ def serialize_codex_result(result: CodexResult) -> str:
             for candidate in result.recurrence_candidates
         ],
     }
-    _parse_semantic_result(_validate_schema(payload), attempts=0)
+    validated = _parse_semantic_result(_validate_schema(payload), attempts=0)
+    for item, decision in zip(payload["feedback"], validated.feedback, strict=True):
+        item["decision_required"] = decision.decision_required
     serialized = json.dumps(
         payload,
         ensure_ascii=False,
@@ -319,6 +334,18 @@ def _result_validator() -> Draft202012Validator:
 
 
 def _validate_schema(payload: object) -> Mapping[str, Any]:
+    # Old retained assessments predate public reporting. Conservative defaults
+    # allow replay without inventing agreement with a reviewer's suggestion.
+    if isinstance(payload, dict) and isinstance(payload.get("feedback"), list):
+        payload = {
+            **payload,
+            "feedback": [
+                {"report_reason": "unspecified", "decision_required": False, **item}
+                if isinstance(item, dict)
+                else item
+                for item in payload["feedback"]
+            ],
+        }
     errors = sorted(
         _result_validator().iter_errors(payload),
         key=lambda error: tuple(str(part) for part in error.absolute_path),
@@ -361,6 +388,7 @@ def _validate_repository_path(raw_path: str) -> None:
 
 
 def _parse_semantic_result(payload: Mapping[str, Any], *, attempts: int) -> CodexResult:
+    """Validate assessment semantics after checking the provider output schema."""
     summary = str(payload["summary"])
     _require_meaningful(summary, "summary")
 
@@ -409,6 +437,15 @@ def _parse_semantic_result(payload: Mapping[str, Any], *, attempts: int) -> Code
             )
 
         verdict = str(raw_decision["verdict"])
+        report_reason = str(raw_decision["report_reason"])
+        try:
+            decision_required = validated_decision_required(
+                verdict, report_reason, raw_decision["decision_required"]
+            )
+        except ValueError as exc:
+            raise CodexOutputError(str(exc)) from exc
+        # Structured Outputs cannot express the conditional allOf/if/then
+        # constraint; enforce the verdict/replacement relationship locally.
         if verdict == "apply" and not replacements:
             raise CodexOutputError(
                 f"Codex apply verdict for {feedback_id!r} must include a replacement."
@@ -426,6 +463,8 @@ def _parse_semantic_result(payload: Mapping[str, Any], *, attempts: int) -> Code
                 confidence=float(raw_decision["confidence"]),
                 rationale=rationale,
                 replacements=tuple(replacements),
+                report_reason=report_reason,
+                decision_required=decision_required,
             )
         )
 
@@ -585,6 +624,7 @@ def to_guardian_assessments(
     *,
     feedback_events: Sequence[FeedbackEvent],
     source_values: Mapping[tuple[str, str], str],
+    target_locales_by_feedback: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[GuardianAssessment, ...]:
     """Combine wire decisions with trusted event and source metadata.
 
@@ -632,18 +672,32 @@ def to_guardian_assessments(
         decision = decisions_by_id[event.feedback_id]
         replacements: list[ProposedReplacement] = []
         for replacement in decision.replacements:
+            locale = event.locale
+            if target_locales_by_feedback is not None:
+                locale = target_locales_by_feedback.get(event.feedback_id, {}).get(
+                    replacement.path
+                )
+                if locale is None:
+                    raise CodexOutputError(
+                        f"Replacement path {replacement.path!r} is not authorized "
+                        "for this feedback author and target locale."
+                    )
             source_location = (replacement.path, replacement.key)
             if source_location not in source_values:
-                raise CodexOutputError(
+                error = CodexOutputError(
                     "Trusted source lookup has no value for "
                     f"{replacement.path}:{replacement.key}."
                 )
+                error.guardian_failure = AdapterFailure(
+                    "validate-assessment", "source-lookup", "missing_trusted_source",
+                )
+                raise error
             replacements.append(
                 ProposedReplacement(
                     feedback_id=event.feedback_id,
                     path=replacement.path,
                     key=replacement.key,
-                    locale=event.locale,
+                    locale=locale,
                     expected_value=replacement.expected_value,
                     proposed_value=replacement.proposed_value,
                     confidence=decision.confidence,
@@ -659,6 +713,8 @@ def to_guardian_assessments(
                 confidence=decision.confidence,
                 rationale=decision.rationale,
                 replacements=tuple(replacements),
+                report_reason=decision.report_reason,
+                decision_required=decision.decision_required,
                 recurrence_candidates=tuple(
                     candidate
                     for candidate in recurrence_candidates
@@ -780,6 +836,7 @@ class CodexDriver:
         attempt_observer: CodexAttemptObserver | None = None,
         success_observer: CodexSuccessObserver | None = None,
     ) -> CodexResult:
+        """Run bounded read-only assessment attempts with explicit usage accounting."""
         prompt = task.prompt
         evidence_dir = Path(task.evidence_dir).expanduser().resolve()
         if not prompt.strip():
@@ -866,7 +923,10 @@ class CodexDriver:
                         start_new_session=True,
                         limits=ProcessLimits.for_timeout(
                             effective_timeout,
-                            max_file_size_bytes=16 * 1024 * 1024,
+                            # The current CLI can exceed 16 MiB during a real
+                            # tool-using turn (SIGXFSZ on macOS). Keep a finite
+                            # runtime limit; result JSON remains capped at 2 MiB.
+                            max_file_size_bytes=128 * 1024 * 1024,
                             require_linux_cgroup=True,
                         ),
                         workspace_quota=workspace_quota,
@@ -926,6 +986,11 @@ class CodexDriver:
                             "Codex capacity is unavailable; inspect plan allowance, "
                             "credits, or API billing limits."
                         )
+                    if "invalid_json_schema" in diagnostic.casefold():
+                        raise CodexOutputError(
+                            "Codex rejected the configured output schema; "
+                            "retrying the same schema cannot repair it."
+                        )
                     if attempt == self.max_attempts:
                         raise CodexTransientError(
                             f"Codex failed after {self.max_attempts} attempt(s) "
@@ -949,6 +1014,13 @@ class CodexDriver:
                         )
                     if attempt == self.max_attempts:
                         raise
+                    # Only fixed instructions cross the retry boundary, never
+                    # result text or parser errors containing untrusted targets.
+                    prompt = task.prompt + (
+                        "\nThe previous result failed schema or semantic validation. "
+                        "Return only the schema-conforming result and assess each "
+                        "manifest feedback ID exactly once. "
+                    ) + REPLACEMENT_UNIQUENESS_GUIDANCE
                     continue
 
                 usage = _extract_usage(completed.stdout)
@@ -961,7 +1033,27 @@ class CodexDriver:
                     usage=usage,
                 )
                 if success_observer is not None:
-                    success_observer(attempt, usage, successful_result)
+                    try:
+                        # The controller validates trusted task identities before
+                        # persistence. Rejections use this same bounded loop.
+                        success_observer(attempt, usage, successful_result)
+                    except CodexOutputError as exc:
+                        last_output_error = exc
+                        if attempt_observer is not None:
+                            attempt_observer(attempt, "failed", usage)
+                        if attempt == self.max_attempts:
+                            raise
+                        # Never reflect untrusted result text or exception details
+                        # into the next prompt as authoritative instructions.
+                        prompt = task.prompt + (
+                            "\nThe previous result failed trusted-task validation. "
+                            "Re-read the evidence and use only its exact keys, "
+                            "authorized paths and feedback IDs. Follow the glossary "
+                            "and brand requirements in validation-rules.json, including "
+                            "required term occurrence counts. If evidence is "
+                            "insufficient, return needs_human without replacements."
+                        )
+                        continue
                 if attempt_observer is not None:
                     attempt_observer(attempt, "succeeded", usage)
                 return successful_result

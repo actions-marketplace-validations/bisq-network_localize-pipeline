@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from localize.guardian import codex
 from localize.guardian.deadline import PollDeadline, PollDeadlineExceeded
-from localize.guardian.models import CodexAuthMode, FeedbackEvent
+from localize.guardian.models import CodexAuthMode, FeedbackEvent, GuardianAssessment
 
 
 def _valid_payload() -> dict:
@@ -59,9 +60,195 @@ def _payload_with_duplicate_member() -> str:
     )
 
 
+@pytest.mark.parametrize(
+    ("verdict", "report_reason"),
+    [
+        ("apply", "already_addressed"),
+        ("apply", "not_applicable"),
+        ("apply", "glossary_conflict"),
+        ("apply", "policy_conflict"),
+        ("apply", "insufficient_evidence"),
+        ("reject", "as_suggested"),
+        ("reject", "alternative_glossary"),
+        ("reject", "alternative_source_fidelity"),
+        ("reject", "alternative_other"),
+        ("needs_human", "as_suggested"),
+        ("needs_human", "alternative_glossary"),
+        ("needs_human", "alternative_source_fidelity"),
+        ("needs_human", "alternative_other"),
+        ("needs_human", "already_addressed"),
+        ("needs_human", "not_applicable"),
+    ],
+)
+def test_cached_codex_result_rejects_contradictory_public_reason(verdict, report_reason):
+    """Do not publish an explanation contradicting the actual assessment verdict."""
+    payload = _valid_payload()
+    decision = payload["feedback"][0]
+    decision.update(verdict=verdict, report_reason=report_reason)
+    if verdict != "apply":
+        decision["replacements"] = []
+
+    with pytest.raises(codex.CodexOutputError, match="report_reason.*verdict"):
+        codex.parse_cached_codex_result(json.dumps(payload))
+
+
+@pytest.mark.parametrize("verdict", ["apply", "reject", "needs_human"])
+@pytest.mark.parametrize("explicit_reason", [False, True])
+def test_cached_codex_result_preserves_unspecified_reason_compatibility(
+    verdict, explicit_reason
+):
+    """Retained assessments remain replayable without inventing a specific reason."""
+    payload = _valid_payload()
+    decision = payload["feedback"][0]
+    decision["verdict"] = verdict
+    if verdict != "apply":
+        decision["replacements"] = []
+    if explicit_reason:
+        decision["report_reason"] = "unspecified"
+
+    result = codex.parse_cached_codex_result(json.dumps(payload))
+
+    assert result.feedback[0].verdict == verdict
+    assert result.feedback[0].report_reason == "unspecified"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "report_reason"),
+    [
+        ("apply", "as_suggested"),
+        ("apply", "alternative_glossary"),
+        ("apply", "alternative_source_fidelity"),
+        ("apply", "alternative_other"),
+        ("reject", "glossary_conflict"),
+        ("reject", "policy_conflict"),
+        ("reject", "insufficient_evidence"),
+        ("reject", "already_addressed"),
+        ("reject", "not_applicable"),
+        ("needs_human", "glossary_conflict"),
+        ("needs_human", "policy_conflict"),
+        ("needs_human", "insufficient_evidence"),
+    ],
+)
+def test_cached_codex_result_accepts_consistent_public_reason(verdict, report_reason):
+    """Preserve the intended explicit reasons through durable serialization."""
+    payload = _valid_payload()
+    decision = payload["feedback"][0]
+    decision.update(verdict=verdict, report_reason=report_reason)
+    if verdict != "apply":
+        decision["replacements"] = []
+
+    result = codex.parse_cached_codex_result(json.dumps(payload))
+    restored = codex.parse_cached_codex_result(codex.serialize_codex_result(result))
+
+    assert restored.feedback[0].verdict == verdict
+    assert restored.feedback[0].report_reason == report_reason
+
+
+@pytest.mark.parametrize("reason", ["as_suggested", "alternative_other"])
+def test_assessment_rejects_incompatible_reason_after_verdict_rewrite(reason):
+    """Internal rewrites obey the same reason contract as cached model results."""
+    with pytest.raises(ValueError, match="report_reason.*verdict"):
+        GuardianAssessment(
+            feedback_id="review_comment:123", verdict="needs_human",
+            confidence=0.98, rationale="A prior decision remains held.",
+            report_reason=reason, decision_required=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "verdict,reason", [("needs_human", "unspecified"),
+                       ("apply", "alternative_glossary"),
+                       ("reject", "glossary_conflict")]
+)
+def test_required_decision_survives_cache_round_trip(verdict, reason):
+    """Legacy or omitted flags cannot hide a decision implied by the verdict."""
+    payload = _valid_payload()
+    payload["feedback"][0].update(verdict=verdict, report_reason=reason)
+    if verdict != "apply":
+        payload["feedback"][0]["replacements"] = []
+    result = codex.parse_cached_codex_result(json.dumps(payload))
+    assert result.feedback[0].decision_required is True
+    result = replace(result, feedback=(replace(
+        result.feedback[0], decision_required=False
+    ),))
+    encoded = codex.serialize_codex_result(result)
+    assert json.loads(encoded)["feedback"][0]["decision_required"] is True
+
+
+@pytest.mark.parametrize("held_value_edits", [-1, 100001, True, False, 1.0, "1", None])
+def test_guardian_assessment_rejects_invalid_held_value_count(held_value_edits):
+    """Held-edit accounting must be bounded integer data, not truthy coercions."""
+    with pytest.raises(ValueError, match="held_value_edits"):
+        GuardianAssessment(
+            feedback_id="review_comment:123",
+            verdict="needs_human",
+            confidence=0.98,
+            rationale="A maintainer must decide on the terminology.",
+            held_value_edits=held_value_edits,
+        )
+
+
+@pytest.mark.parametrize("held_value_edits", [0, 1, 100000])
+def test_guardian_assessment_accepts_bounded_held_value_count(held_value_edits):
+    """Include both accounting boundaries and a normal pending edit."""
+    assessment = GuardianAssessment(
+        feedback_id="review_comment:123",
+        verdict="needs_human",
+        confidence=0.98,
+        rationale="A maintainer must decide on the terminology.",
+        held_value_edits=held_value_edits,
+    )
+
+    assert assessment.held_value_edits == held_value_edits
+
+
+def test_codex_output_schema_uses_supported_structured_output_keywords():
+    """Reject schema constructs unsupported by the structured-output provider."""
+    schema = json.loads(codex.RESULT_SCHEMA_PATH.read_text(encoding="utf-8"))
+    unsupported = {"allOf", "not", "dependentRequired", "dependentSchemas", "if", "then", "else"}
+
+    def check(node):
+        """Recursively check every schema branch for unsupported keywords."""
+        assert not unsupported.intersection(node)
+        assert "type" in node or "$ref" in node or "anyOf" in node
+        if node.get("type") == "object":
+            assert node.get("additionalProperties") is False
+            assert set(node["required"]) == set(node["properties"])
+        for collection in ("properties", "$defs"):
+            for child in node.get(collection, {}).values():
+                check(child)
+        if "items" in node:
+            check(node["items"])
+        for child in node.get("anyOf", []):
+            check(child)
+
+    check(schema)
+
+
+@pytest.mark.parametrize("channel", ["stdout", "stderr"])
+def test_codex_driver_does_not_retry_invalid_provider_schema(tmp_path, monkeypatch, channel):
+    """A deterministic provider schema error must consume only one attempt."""
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        """Simulate provider schema rejection on either output channel."""
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 1, **{channel: '{"error":{"code":"invalid_json_schema"}}'}
+        )
+
+    monkeypatch.setattr(codex, "run_bounded_process", fake_run)
+    with pytest.raises(codex.CodexOutputError, match="schema"):
+        codex.CodexDriver(model="gpt-5.6-terra").run(
+            codex.CodexTask(prompt="Synthetic setup check", evidence_dir=tmp_path)
+        )
+    assert len(calls) == 1
+
+
 def test_codex_driver_uses_read_only_contract_and_scrubbed_environment(
     tmp_path, monkeypatch
 ):
+    """Restrict assessment execution and remove ambient write credentials."""
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
     hostile_comment = (
@@ -72,6 +259,7 @@ def test_codex_driver_uses_read_only_contract_and_scrubbed_environment(
     observed: dict[str, object] = {}
 
     def fake_run(argv, **kwargs):
+        """Return controlled subprocess output without executing external commands."""
         observed["argv"] = list(argv)
         observed["kwargs"] = kwargs
         observed["home_mode"] = Path(kwargs["env"]["HOME"]).stat().st_mode & 0o777
@@ -160,6 +348,7 @@ def test_codex_driver_uses_read_only_contract_and_scrubbed_environment(
     assert kwargs["timeout"] == 37
     assert kwargs["start_new_session"] is True
     assert kwargs["limits"].require_linux_cgroup is True
+    assert kwargs["limits"].max_file_size_bytes == 128 * 1024 * 1024
 
     child_env = kwargs["env"]
     assert "OPENAI_API_KEY" not in child_env
@@ -398,6 +587,7 @@ def test_codex_driver_rejects_recurrence_worksets_above_schema_bound(
     monkeypatch,
     oversized_field,
 ):
+    """Reject recurrence worksets exceeding the response schema bound."""
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
     payload = _valid_payload()
@@ -413,6 +603,7 @@ def test_codex_driver_rejects_recurrence_worksets_above_schema_bound(
         payload["recurrence_candidates"] = [candidate]
 
     def fake_run(argv, **_kwargs):
+        """Return controlled subprocess output without executing external commands."""
         _write_result(list(argv), payload)
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -425,6 +616,7 @@ def test_codex_driver_rejects_recurrence_worksets_above_schema_bound(
 
 
 def test_codex_driver_accepts_exact_recurrence_schema_bound(tmp_path, monkeypatch):
+    """Accept a recurrence workset exactly at its schema limit."""
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
     payload = _valid_payload()
@@ -449,6 +641,7 @@ def test_codex_driver_accepts_exact_recurrence_schema_bound(tmp_path, monkeypatc
     ]
 
     def fake_run(argv, **_kwargs):
+        """Return controlled subprocess output without executing external commands."""
         _write_result(list(argv), payload)
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -484,6 +677,7 @@ def test_codex_driver_rejects_non_standard_json_numbers(
 
 
 def test_codex_driver_rejects_semantically_invalid_apply_result(tmp_path, monkeypatch):
+    """Reject apply verdicts that lack a valid replacement contract."""
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
     payload = _valid_payload()
@@ -495,7 +689,7 @@ def test_codex_driver_rejects_semantically_invalid_apply_result(tmp_path, monkey
 
     monkeypatch.setattr(codex, "run_bounded_process", fake_run)
 
-    with pytest.raises(codex.CodexOutputError, match="schema"):
+    with pytest.raises(codex.CodexOutputError, match="must include a replacement"):
         codex.CodexDriver(model="gpt-5.6-sol").run(
             codex.CodexTask(prompt="review", evidence_dir=evidence_dir)
         )
@@ -507,6 +701,7 @@ def test_codex_driver_rejects_replacements_for_non_apply_verdicts(
     monkeypatch,
     verdict,
 ):
+    """Prevent non-apply verdicts from carrying executable replacement proposals."""
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
     payload = _valid_payload()
@@ -518,7 +713,7 @@ def test_codex_driver_rejects_replacements_for_non_apply_verdicts(
 
     monkeypatch.setattr(codex, "run_bounded_process", fake_run)
 
-    with pytest.raises(codex.CodexOutputError, match="schema"):
+    with pytest.raises(codex.CodexOutputError, match="must not include replacements"):
         codex.CodexDriver(model="gpt-5.6-sol").run(
             codex.CodexTask(prompt="review", evidence_dir=evidence_dir)
         )
@@ -836,6 +1031,7 @@ def test_codex_driver_never_treats_non_finite_usage_as_a_known_cost(
 
 
 def test_codex_driver_rejects_invalid_runtime_configuration(tmp_path):
+    """Reject invalid runtime options before invoking the model."""
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
 
@@ -853,7 +1049,9 @@ def test_codex_driver_rejects_invalid_runtime_configuration(tmp_path):
         )
 
 
-def test_wire_result_conversion_uses_only_trusted_identity_locale_and_source():
+@pytest.mark.parametrize("anchor_locale", ["ru", "cs"])
+def test_wire_result_conversion_uses_only_trusted_identity_locale_and_source(anchor_locale):
+    """Resolve replacement authority from trusted data, not model-supplied identity."""
     event = FeedbackEvent(
         repository="acme/widgets",
         pr_number=42,
@@ -865,7 +1063,7 @@ def test_wire_result_conversion_uses_only_trusted_identity_locale_and_source():
         body="Please improve this translation.",
         head_sha="a" * 40,
         base_sha="b" * 40,
-        locale="ru",
+        locale=anchor_locale,
     )
     result = codex.CodexResult(
         schema_version=1,
@@ -899,6 +1097,7 @@ def test_wire_result_conversion_uses_only_trusted_identity_locale_and_source():
     assessments = codex.to_guardian_assessments(
         result,
         feedback_events=(event,),
+        target_locales_by_feedback={event.feedback_id: {"l10n/Messages_ru.properties": "ru"}},
         source_values={
             ("l10n/Messages_ru.properties", "Dialog.title"): "Trusted English source"
         },
@@ -915,6 +1114,12 @@ def test_wire_result_conversion_uses_only_trusted_identity_locale_and_source():
     assert replacement.locale == "ru"
     assert replacement.source_value == "Trusted English source"
     assert replacement.evidence == ("The new value is more idiomatic.",)
+    with pytest.raises(codex.CodexOutputError, match="not authorized"):
+        codex.to_guardian_assessments(
+            result, feedback_events=(event,),
+            source_values={("l10n/Messages_ru.properties", "Dialog.title"): "Source"},
+            target_locales_by_feedback={event.feedback_id: {}},
+        )
 
 
 @pytest.mark.parametrize("include_event", [False, True])
@@ -996,9 +1201,11 @@ def test_wire_result_conversion_requires_trusted_source_value():
         attempts=1,
     )
 
-    with pytest.raises(codex.CodexOutputError, match="Trusted source lookup"):
+    with pytest.raises(codex.CodexOutputError, match="Trusted source lookup") as caught:
         codex.to_guardian_assessments(
             result,
             feedback_events=(event,),
             source_values={},
         )
+    assert caught.value.guardian_failure.reason == "missing_trusted_source"
+    assert caught.value.guardian_failure.stage == "validate-assessment"

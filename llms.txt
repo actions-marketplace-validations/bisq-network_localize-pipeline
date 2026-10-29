@@ -59,7 +59,7 @@ that local day's single attempt; retry only with an explicit manual
 - `localize.core` - format-agnostic orchestration.
 - `localize.formats` - localization format adapter API and conformance helpers.
 - `localize.providers` - model provider abstraction.
-- `localize.connectors` - source, reporter, publisher, and filesystem/GitHub contracts.
+- `localize.core.connectors` - source, reporter, publisher, and filesystem/GitHub contracts.
 - `profiles/` - project-specific configuration, glossary, paths, locales, and policy.
 
 Treat `profiles/bisq/` as one production profile, not as a product default.

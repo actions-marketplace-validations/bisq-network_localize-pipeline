@@ -15,6 +15,11 @@ translation_queue_folder: "translation_queue"
 translated_queue_folder: "translated_queue"
 dry_run: false
 retranslate_identical_source_strings: false
+# Reviewed corrections in bisq-mobile#1919; later source changes revoke acceptance.
+accepted_source_identical_translations:
+  pcm:
+    mobile.client.topic.private_chat_channels.title: "Private chats"
+    mobile.community.contacts.reason.privateChat: "Private chat"
 translation_key_ledger_file_path: "/app/logs/translation_key_ledger.json"
 quality_gate:
   source_identical_min_block_count: 5
@@ -34,6 +39,71 @@ semantic_review:
   reasoning_effort: "none"
   auto_apply_error_suggestions: true
 semantic_quality_rules:
+  # Opt-in exact-copy recurrence guards; this is not a general semantic validator.
+  # Pinned originals/corrections: tests/fixtures/project_policy/bisq_review_regressions.json.
+  # An English source change revokes each guard and requires a new review.
+  - id: "mobile-pcm-private-chats-known-typo"
+    message: 'Use ''Private'' instead of the known ''Privet'' typo in this label.'
+    locales: ['pcm']
+    keys: ['mobile.client.topic.private_chat_channels.title']
+    source_regex: '\APrivate chats\Z'
+    forbidden_target_regex: '\APrivet chats\Z'
+    severity: "error"
+    source: 'https://github.com/bisq-network/bisq-mobile/blob/28612a5ea4e8033a738fd20dda4012718c4be78b/shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties'
+  - id: "mobile-pcm-private-chat-known-typo"
+    message: 'Use ''Private'' instead of the known ''Privet'' typo in this label.'
+    locales: ['pcm']
+    keys: ['mobile.community.contacts.reason.privateChat']
+    source_regex: '\APrivate chat\Z'
+    forbidden_target_regex: '\APrivet chat\Z'
+    severity: "error"
+    source: 'https://github.com/bisq-network/bisq-mobile/blob/28612a5ea4e8033a738fd20dda4012718c4be78b/shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties'
+  - id: "mobile-log-known-stale-es"
+    message: 'Update this log-file warning to reflect the current sharing and redaction behavior.'
+    locales: ['es']
+    keys: ['mobile.genericError.reportInfo.logFile']
+    source_regex: '\AIt will make debugging easier if you attach the log file to your bug report\. Only the most recent part is shared, and network addresses, profile and trade identifiers are replaced with placeholders before it leaves the device\.\Z'
+    forbidden_target_regex: '\AFacilitará la depuración si adjuntas el archivo de registro a tu informe de error\. Por favor, revísalo primero, puede contener direcciones de red y detalles de comercio\.\Z'
+    severity: "error"
+    source: 'https://github.com/bisq-network/bisq-mobile/blob/a822b2d67dce327c00d7dccc358518f6c736aa11/shared/domain/src/commonMain/resources/mobile/mobile_es.properties'
+  - id: "mobile-log-known-stale-fr"
+    message: 'Update this log-file warning to reflect the current sharing and redaction behavior.'
+    locales: ['fr']
+    keys: ['mobile.genericError.reportInfo.logFile']
+    source_regex: '\AIt will make debugging easier if you attach the log file to your bug report\. Only the most recent part is shared, and network addresses, profile and trade identifiers are replaced with placeholders before it leaves the device\.\Z'
+    forbidden_target_regex: '\AIl sera plus facile de déboguer si vous joignez le fichier journal à votre rapport de bogue\. Veuillez le consulter d''abord, il peut contenir des adresses réseau et des détails sur les échanges\.\Z'
+    severity: "error"
+    source: 'https://github.com/bisq-network/bisq-mobile/blob/a822b2d67dce327c00d7dccc358518f6c736aa11/shared/domain/src/commonMain/resources/mobile/mobile_fr.properties'
+  - id: "mobile-log-known-stale-hi"
+    message: 'Update this log-file warning to reflect the current sharing and redaction behavior.'
+    locales: ['hi']
+    keys: ['mobile.genericError.reportInfo.logFile']
+    source_regex: '\AIt will make debugging easier if you attach the log file to your bug report\. Only the most recent part is shared, and network addresses, profile and trade identifiers are replaced with placeholders before it leaves the device\.\Z'
+    forbidden_target_regex: '\Aयदि आप अपनी बग रिपोर्ट के साथ लॉग फ़ाइल संलग्न करते हैं तो यह डिबगिंग को आसान बना देगा। कृपया पहले इसकी समीक्षा करें, इसमें नेटवर्क पते और व्यापार विवरण हो सकते हैं।\Z'
+    severity: "error"
+    source: 'https://github.com/bisq-network/bisq-mobile/blob/a822b2d67dce327c00d7dccc358518f6c736aa11/shared/domain/src/commonMain/resources/mobile/mobile_hi.properties'
+  - id: "mobile-log-known-stale-pt-br"
+    message: 'Update this log-file warning to reflect the current sharing and redaction behavior.'
+    locales: ['pt_BR']
+    keys: ['mobile.genericError.reportInfo.logFile']
+    source_regex: '\AIt will make debugging easier if you attach the log file to your bug report\. Only the most recent part is shared, and network addresses, profile and trade identifiers are replaced with placeholders before it leaves the device\.\Z'
+    forbidden_target_regex: '\ASerá mais fácil depurar se você anexar o arquivo de log ao seu relatório de bug\. Por favor, revise\-o primeiro, ele pode conter endereços de rede e detalhes da negociação\.\Z'
+    severity: "error"
+    source: 'https://github.com/bisq-network/bisq-mobile/blob/a822b2d67dce327c00d7dccc358518f6c736aa11/shared/domain/src/commonMain/resources/mobile/mobile_pt_BR.properties'
+  - id: "it-trade-failure-terminology"
+    message: "Use 'scambio', without 'transazione' or 'commercio', for 'trade' in these reviewed Italian failure messages."
+    locales: ["it"]
+    keys:
+      - "bisqEasy.openTrades.failed"
+      - "bisqEasy.openTrades.failed.popup"
+      - "bisqEasy.openTrades.failedAtPeer"
+      - "bisqEasy.openTrades.failedAtPeer.popup"
+    source_regex: '\btrade\b'
+    required_target_regex: '\bscambio\b'
+    forbidden_target_regex: '\b(?:transazione|commercio)\b'
+    regex_ignorecase: true
+    severity: "error"
+    source: "bisq-mobile#1913"
   - id: "trade-history-traders-label"
     message: "Fully localize the Trade Details traders/role label; do not retain the English term 'Traders'."
     locales: ["*"]

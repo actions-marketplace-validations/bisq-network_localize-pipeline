@@ -12,18 +12,18 @@ from dotenv import load_dotenv
 
 from localize.ignore_keys import compile_ignore_key_patterns
 from localize.logging_config import setup_logger
-from localize.placeholder_rules import DEFAULT_PLACEHOLDER_PROFILE, validate_placeholder_profile
-from localize.localization_formats import (
+from localize.formats.placeholders import DEFAULT_PLACEHOLDER_PROFILE, validate_placeholder_profile
+from localize.formats.metadata import (
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,
 )
-from localize.localization_layouts import (
+from localize.formats.layouts import (
     SUFFIX_LAYOUT,
     LocalizationLayout,
     load_localization_layout,
 )
-from localize.localization_profiles import LocalizationProfile, load_localization_profiles
-from localize.model_provider import (
+from localize.formats.profiles import LocalizationProfile, load_localization_profiles
+from localize.providers.models import (
     ChatModelProvider,
     DEFAULT_MODEL_PROVIDER,
     DEFAULT_TRANSLATION_MODEL,
@@ -34,6 +34,7 @@ from localize.model_provider import (
     normalize_model_provider_name,
     requires_openai_credentials,
 )
+from localize.source_identical_acceptance import normalize_acceptances
 from localize.semantic_quality import normalize_retained_source_word_allowlist
 
 
@@ -133,6 +134,7 @@ class AppConfig:
     api_base_url: Optional[str] = None
 
     # Project/format profile
+    accepted_source_identical_translations: Dict[str, Dict[str, str]] = field(default_factory=dict)
     project_context: str = ""
     localization_format: LocalizationFormat = JAVA_PROPERTIES_FORMAT
     localization_layout: LocalizationLayout = SUFFIX_LAYOUT
@@ -1003,6 +1005,7 @@ def load_app_config() -> AppConfig:
         model_provider_name=model_provider_name,
         quality_gate=quality_gate,
         api_base_url=api_base_url,
+        accepted_source_identical_translations=normalize_acceptances(config.get("accepted_source_identical_translations")),
         project_context=project_context,
         localization_format=localization_format,
         localization_layout=localization_layout,

@@ -6,9 +6,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-from localize.localization_layouts import LocalizationLayout, SUFFIX_LAYOUT
-from localize.localization_profiles import LocalizationProfile
+from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+from localize.formats.layouts import LocalizationLayout, SUFFIX_LAYOUT
+from localize.formats.profiles import LocalizationProfile
 from localize.semantic_quality import SemanticQAStats, SemanticRule
 from localize.translation_quality_gate import (
     QualityGateConfig,
@@ -77,6 +77,89 @@ def test_source_identical_gate_ignores_glossary_tokens_and_enum_keys(tmp_path):
     assert stats.expected_source_identical_count == 2
     assert stats.unexpected_source_identical_count == 2
     assert stats.unexpected_source_identical_ratio == 2 / 3
+
+
+def test_source_identical_gate_blocks_new_non_brand_values_and_honors_locale_allowlist(tmp_path):
+    """A reviewed shared term must not exempt other untranslated values."""
+    repo_root = tmp_path
+    input_folder = repo_root / "resources"
+    _write_properties(
+        input_folder / "mobile.properties",
+        {
+            "mobile.trade": "Trade",
+            "mobile.network": "Internet",
+        },
+    )
+    diff_text = """diff --git a/resources/mobile_cs.properties b/resources/mobile_cs.properties
++++ b/resources/mobile_cs.properties
++mobile.trade=Trade
++mobile.network=Internet
+"""
+
+    stats = analyze_source_identical_changes(
+        diff_text=diff_text,
+        repo_root=str(repo_root),
+        input_folder=str(input_folder),
+        locale_codes=["cs"],
+        brand_glossary=[],
+        source_identical_allowlist={"cs": ["Internet"]},
+    )
+    report = build_quality_gate_report(
+        source_stats=stats,
+        semantic_stats=None,
+        validation_summary={"files": {}, "pipeline_warnings": []},
+        changed_files=["resources/mobile_cs.properties"],
+        input_folder=str(input_folder),
+        config=QualityGateConfig(source_identical_min_block_count=1),
+    )
+
+    assert stats.expected_source_identical_count == 1
+    assert stats.unexpected_source_identical_count == 1
+    assert report["blocking"] is True
+
+
+def test_new_short_ui_copy_blocks_across_locales_without_flagging_shared_values(tmp_path):
+    input_folder = tmp_path / "resources"
+    _write_properties(input_folder / "mobile.properties", {
+        "mobile.action": "Open trades",
+        "mobile.brand": "Bisq",
+        "mobile.shared": "Internet",
+        "mobile.placeholder": "{0}",
+        "mobile.markup": "<br/>",
+        "mobile.token": "BTC",
+    })
+    diff_text = "".join(
+        f"diff --git a/resources/mobile_{locale}.properties b/resources/mobile_{locale}.properties\n"
+        f"+++ b/resources/mobile_{locale}.properties\n"
+        "+mobile.action=Open trades\n"
+        "+mobile.brand=Bisq\n"
+        "+mobile.shared=Internet\n"
+        "+mobile.placeholder={0}\n"
+        "+mobile.markup=<br/>\n"
+        "+mobile.token=BTC\n"
+        for locale in ("de", "es", "fr")
+    )
+    stats = analyze_source_identical_changes(
+        diff_text=diff_text,
+        repo_root=str(tmp_path),
+        input_folder=str(input_folder),
+        locale_codes=["de", "es", "fr"],
+        brand_glossary=["Bisq"],
+        source_identical_allowlist={"*": ["Internet"]},
+    )
+    report = build_quality_gate_report(
+        source_stats=stats,
+        semantic_stats=None,
+        validation_summary={"files": {}, "pipeline_warnings": []},
+        changed_files=[f"resources/mobile_{locale}.properties" for locale in ("de", "es", "fr")],
+        input_folder=str(input_folder),
+        config=QualityGateConfig(),
+    )
+
+    assert stats.new_source_identical_prose_count == 3
+    assert stats.unexpected_source_identical_count == 3
+    assert {example["key"] for example in stats.examples} == {"mobile.action"}
+    assert report["blocking"] is True
 
 
 def test_source_identical_gate_supports_json_locale_directory_layout(tmp_path):
@@ -446,6 +529,121 @@ def test_quality_gate_blocks_many_unexpected_source_identical_changes(tmp_path):
     assert report["blocking"] is True
     assert "source-identical" in report["blocking_reasons"][0]
     assert report["status_state"] == "failure"
+
+
+def test_quality_gate_blocks_new_source_identical_sentences_but_allows_shared_terms(tmp_path):
+    input_folder = tmp_path / "resources"
+    entries = {
+        "offer.create": "Create an offer to buy bitcoin.",
+        "offer.review": "The seller will review your offer before accepting.",
+        "offer.amount": "{0}",
+        "offer.divider": "---",
+        "offer.break": "<br/>",
+        "offer.brand": "Bisq",
+        "offer.network": "Internet",
+        "offer.done": "Your offer is ready.",
+    }
+    _write_properties(input_folder / "offers.properties", entries)
+    diff_header = """diff --git a/resources/offers_da.properties b/resources/offers_da.properties
++++ b/resources/offers_da.properties
+"""
+    controls = {
+        "offer.amount": "{0}",
+        "offer.divider": "---",
+        "offer.break": "<br/>",
+        "offer.brand": "Bisq",
+        "offer.network": "Internet",
+        "offer.done": "Dit tilbud er klar.",
+    }
+
+    def report_for(target_entries):
+        diff_text = diff_header + "".join(
+            f"+{key}={value}\n" for key, value in target_entries.items()
+        )
+        stats = analyze_source_identical_changes(
+            diff_text=diff_text,
+            repo_root=str(tmp_path),
+            input_folder=str(input_folder),
+            locale_codes=["da"],
+            brand_glossary=["Bisq"],
+        )
+        report = build_quality_gate_report(
+            source_stats=stats,
+            semantic_stats=None,
+            validation_summary={"files": {}, "pipeline_warnings": []},
+            changed_files=["resources/offers_da.properties"],
+            input_folder=str(input_folder),
+            config=QualityGateConfig(),
+        )
+        return stats, report
+
+    _, control_report = report_for(controls)
+    assert control_report["blocking"] is False
+
+    stats, report = report_for({
+        **controls,
+        "offer.create": entries["offer.create"],
+        "offer.review": entries["offer.review"],
+    })
+    assert {example["key"] for example in stats.examples} >= {
+        "offer.create", "offer.review"
+    }
+    assert report["blocking"] is True
+    assert "source-identical prose" in report["blocking_reasons"][0]
+
+
+@pytest.mark.parametrize("removed,blocking", [
+    ("-payment.safety=Bewahren Sie den Beleg für {0} Tage auf.\n", True),
+    ("", True),
+    ("-payment.safety=Keep the receipt for {0} days.\n", False),
+    ("-payment.safety=\n", True),
+])
+def test_quality_gate_blocks_regression_and_new_prose_but_respects_other_thresholds(tmp_path, removed, blocking):
+    repo_root = tmp_path
+    input_folder = repo_root / "resources"
+    _write_properties(
+        input_folder / "mobile.properties",
+        {
+            "payment.safety": "Keep the receipt for {0} days.",
+            "metadata.source": "Imported from {0}.",
+        },
+    )
+    diff_text = """diff --git a/resources/mobile_de.properties b/resources/mobile_de.properties
++++ b/resources/mobile_de.properties
+REMOVED+payment.safety=Keep the receipt for {0} days.
++metadata.source=Imported from {0}.
+""".replace("REMOVED", removed)
+
+    stats = analyze_source_identical_changes(
+        diff_text=diff_text,
+        repo_root=str(repo_root),
+        input_folder=str(input_folder),
+        locale_codes=["de"],
+        brand_glossary=[],
+        ignore_key_patterns=[r"^metadata\."],
+    )
+    report = build_quality_gate_report(
+        source_stats=stats,
+        semantic_stats=None,
+        validation_summary={"files": {}, "pipeline_warnings": []},
+        changed_files=["resources/mobile_de.properties"],
+        input_folder=str(input_folder),
+        config=QualityGateConfig(
+            source_identical_min_block_count=99,
+            source_identical_max_count=99,
+            source_identical_max_ratio=1.0,
+        ),
+    )
+
+    assert stats.unexpected_source_identical_count == 1
+    assert stats.examples == [
+        {
+            "file": "mobile_de.properties",
+            "key": "payment.safety",
+            "value": "Keep the receipt for {0} days.",
+        }
+    ]
+    assert report["blocking"] is blocking
 
 
 def test_pipeline_warnings_are_blocking_when_configured():

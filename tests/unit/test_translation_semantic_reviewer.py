@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,7 +12,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 from localize.semantic_quality import TranslationChange
 from localize.app_config import resolve_semantic_review_model
 from localize.formats import unregister_localization_adapter
-from localize.model_provider import ModelProviderConfigurationError
+from localize.providers.models import ModelProviderConfigurationError
 from localize.translation_semantic_reviewer import (
     _run,
     append_semantic_review_findings,
@@ -1248,3 +1249,65 @@ async def test_semantic_reviewer_fails_when_provider_configuration_is_invalid(
         "Translation pipeline warnings require manual resolution."
         not in report["blocking_reasons"]
     )
+
+
+@pytest.fixture
+def semantic_calibration():
+    fixture = Path(__file__).parents[1] / "fixtures/project_policy/semantic_review_calibration.json"
+    return json.loads(fixture.read_text(encoding="utf-8"))
+
+
+def calibration_changes(fixture):
+    return [TranslationChange("calibration_de.properties", fixture["locale"],
+                              case["key"], case["source"], None, case["target"])
+            for case in fixture["cases"]]
+
+
+def test_semantic_review_calibration_prompt_explains_clean_results_and_severity(semantic_calibration):
+    messages = build_semantic_review_messages(
+        semantic_calibration["target_language"], calibration_changes(semantic_calibration),
+        [], semantic_calibration["brand_glossary"],
+    )
+    payload = json.loads(messages[1]["content"])
+    assert payload["no_issues_response"] == {"findings": []}
+    assert [row["key"] for row in payload["changes"]] == [
+        row["key"] for row in semantic_calibration["cases"]]
+    system = messages[0]["content"]
+    assert "Correct translations must not receive a finding" in system
+    assert "material discrepancy supported by source_value" in system
+    assert "negation" in system and "brand identity" in system
+    assert "synonyms" in system and "stylistic preferences are not errors" in system
+
+
+def test_semantic_calibration_allows_clean_results_without_dropping_real_errors(semantic_calibration):
+    changes = calibration_changes(semantic_calibration)
+    assert normalize_review_response('{"findings": []}', changes) == []
+    expected = [row for row in semantic_calibration["cases"] if row["expected"] == "error"]
+    response = {"findings": [{"file": "calibration_de.properties", "key": row["key"],
+                              "severity": "error",
+                              "reason": "Other wording is accurate, but a source condition or actor is changed."}
+                             for row in expected]}
+    findings = normalize_review_response(json.dumps(response), changes)
+    assert [row["key"] for row in findings] == [row["key"] for row in expected]
+    assert all(row["severity"] == "error" for row in findings)
+
+
+def test_semantic_suggestion_representation_is_properties_only():
+    changes = [
+        TranslationChange("messages_de.properties", "de", "properties.key", r"First\nSecond", None, r"Erste\nZweite"),
+        TranslationChange("messages_de.json", "de", "/json.key", "First\nSecond", None, "Erste\nZweite"),
+    ]
+    messages = build_semantic_review_messages("German", changes, [], [])
+    payload = json.loads(messages[1]["content"])
+    assert payload["properties_suggestion_example"] == r"First line\nSecond line"
+    assert "never actual CR/LF" in messages[0]["content"]
+    assert "native value representation for other file formats" in messages[0]["content"]
+    assert payload["changes"][1]["new_target_value"] == "Erste\nZweite"
+    response = {"findings": [
+        {"file": change.file, "key": change.key, "severity": "error", "reason": "Changed meaning.",
+         "suggested_value": target}
+        for change, target in zip(changes, [r"Erste\nZweite", "Erste\nZweite"])
+    ]}
+    findings = normalize_review_response(json.dumps(response), changes)
+    assert findings[0]["suggested_value"] == r"Erste\nZweite"
+    assert findings[1]["suggested_value"] == "Erste\nZweite"

@@ -1,4 +1,4 @@
-from localize.translation_validator import find_glossary_mismatches
+from localize.formats.validation import find_glossary_mismatches
 from localize.translate_localization_files import (
     _build_holistic_review_system_prompt,
     _glossary_for_deterministic_enforcement,

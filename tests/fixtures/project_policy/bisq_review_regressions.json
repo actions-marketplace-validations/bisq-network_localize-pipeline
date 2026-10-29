@@ -1,0 +1,351 @@
+{
+  "format_version": 1,
+  "purpose": "Exact known-defect recurrence fixtures, not a general semantic equivalence oracle. Original/corrected values are pinned public evidence independent of proposal-generated regression wording. Constructed alternatives are explicitly labelled and not native-speaker approvals.",
+  "scope": "Opt-in reference profiles only. Source changes revoke these constraints. #205 is optional defense after #206.",
+  "records": [
+    {
+      "id": "mobile-pcm-private-chats-known-typo",
+      "rule_id": "mobile-pcm-private-chats-known-typo",
+      "profile": "bisq-mobile",
+      "locale": "pcm",
+      "key": "mobile.client.topic.private_chat_channels.title",
+      "source": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "a182d41603caea8d5eef0906ae624309c82f602e",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile.properties",
+        "value": "Private chats",
+        "value_sha256": "5ef871896389662419d12383730d82737220718a8b07b1693d5fc10e1f65bfcf",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/a182d41603caea8d5eef0906ae624309c82f602e/shared/domain/src/commonMain/resources/mobile/mobile.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "28612a5ea4e8033a738fd20dda4012718c4be78b",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties",
+        "value": "Privet chats",
+        "value_sha256": "db539755ec492588ff14f143170793cffe76c70090f0c8d65104994f74d414f0",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/28612a5ea4e8033a738fd20dda4012718c4be78b/shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties"
+      },
+      "corrections": [
+        {
+          "repository": "bisq-network/bisq-mobile",
+          "commit": "a182d41603caea8d5eef0906ae624309c82f602e",
+          "path": "shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties",
+          "value": "Private chats",
+          "value_sha256": "5ef871896389662419d12383730d82737220718a8b07b1693d5fc10e1f65bfcf",
+          "url": "https://github.com/bisq-network/bisq-mobile/blob/a182d41603caea8d5eef0906ae624309c82f602e/shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties"
+        }
+      ],
+      "valid_alternatives": [
+        {
+          "value": "Private chats (Privet)",
+          "kind": "synthetic_preserved_brand_control"
+        },
+        {
+          "value": "Private chats https://privet.example",
+          "kind": "synthetic_preserved_url_control"
+        }
+      ],
+      "reason": "Known PCM typo in a reviewed private-chat label; optional defense after the acceptance/translation-memory repair in #206."
+    },
+    {
+      "id": "mobile-pcm-private-chat-known-typo",
+      "rule_id": "mobile-pcm-private-chat-known-typo",
+      "profile": "bisq-mobile",
+      "locale": "pcm",
+      "key": "mobile.community.contacts.reason.privateChat",
+      "source": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "a182d41603caea8d5eef0906ae624309c82f602e",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile.properties",
+        "value": "Private chat",
+        "value_sha256": "704d863e0d9e319326bf133287d4c59faff85b7201f6d93dc571d24cc19f8b93",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/a182d41603caea8d5eef0906ae624309c82f602e/shared/domain/src/commonMain/resources/mobile/mobile.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "28612a5ea4e8033a738fd20dda4012718c4be78b",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties",
+        "value": "Privet chat",
+        "value_sha256": "da60740680928aa6b4ab4e58a3e29c5359e665a5e9114a500c26bc219fd2306f",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/28612a5ea4e8033a738fd20dda4012718c4be78b/shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties"
+      },
+      "corrections": [
+        {
+          "repository": "bisq-network/bisq-mobile",
+          "commit": "a182d41603caea8d5eef0906ae624309c82f602e",
+          "path": "shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties",
+          "value": "Private chat",
+          "value_sha256": "704d863e0d9e319326bf133287d4c59faff85b7201f6d93dc571d24cc19f8b93",
+          "url": "https://github.com/bisq-network/bisq-mobile/blob/a182d41603caea8d5eef0906ae624309c82f602e/shared/domain/src/commonMain/resources/mobile/mobile_pcm.properties"
+        }
+      ],
+      "valid_alternatives": [
+        {
+          "value": "Private chat (Privet)",
+          "kind": "synthetic_preserved_brand_control"
+        },
+        {
+          "value": "Private chat https://privet.example",
+          "kind": "synthetic_preserved_url_control"
+        }
+      ],
+      "reason": "Known PCM typo in a reviewed private-chat label; optional defense after the acceptance/translation-memory repair in #206."
+    },
+    {
+      "id": "mobile-log-known-stale-es",
+      "rule_id": "mobile-log-known-stale-es",
+      "profile": "bisq-mobile",
+      "locale": "es",
+      "key": "mobile.genericError.reportInfo.logFile",
+      "source": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "467b8bef23011800b2544acc2c4c7a02c64194ab",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile.properties",
+        "value": "It will make debugging easier if you attach the log file to your bug report. Only the most recent part is shared, and network addresses, profile and trade identifiers are replaced with placeholders before it leaves the device.",
+        "value_sha256": "46d849804e1b9b64638617be8e3a57a5ddb7400daa1e7ff66a2dc9a399a9712a",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/467b8bef23011800b2544acc2c4c7a02c64194ab/shared/domain/src/commonMain/resources/mobile/mobile.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "a822b2d67dce327c00d7dccc358518f6c736aa11",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile_es.properties",
+        "value": "Facilitará la depuración si adjuntas el archivo de registro a tu informe de error. Por favor, revísalo primero, puede contener direcciones de red y detalles de comercio.",
+        "value_sha256": "43318b2225012768b7f620288080546518f01db3b8395b6b24159fa517a82fe5",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/a822b2d67dce327c00d7dccc358518f6c736aa11/shared/domain/src/commonMain/resources/mobile/mobile_es.properties"
+      },
+      "corrections": [],
+      "valid_alternatives": [
+        {
+          "value": "Facilitará la depuración si adjuntas el archivo de registro a tu informe de error. Se comparte exclusivamente la parte más reciente, y las direcciones de red y los identificadores de perfil y de operaciones se reemplazan por marcadores de posición antes de salir del dispositivo.",
+          "kind": "reviewer_constructed_faithful_alternative_not_native_approved"
+        }
+      ],
+      "reason": "Known old inspect-first warning is stale for this exact newer source. The original PR English still had the old warning; this guards recurrence against the later source, not an original-head mistranslation."
+    },
+    {
+      "id": "mobile-log-known-stale-fr",
+      "rule_id": "mobile-log-known-stale-fr",
+      "profile": "bisq-mobile",
+      "locale": "fr",
+      "key": "mobile.genericError.reportInfo.logFile",
+      "source": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "467b8bef23011800b2544acc2c4c7a02c64194ab",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile.properties",
+        "value": "It will make debugging easier if you attach the log file to your bug report. Only the most recent part is shared, and network addresses, profile and trade identifiers are replaced with placeholders before it leaves the device.",
+        "value_sha256": "46d849804e1b9b64638617be8e3a57a5ddb7400daa1e7ff66a2dc9a399a9712a",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/467b8bef23011800b2544acc2c4c7a02c64194ab/shared/domain/src/commonMain/resources/mobile/mobile.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "a822b2d67dce327c00d7dccc358518f6c736aa11",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile_fr.properties",
+        "value": "Il sera plus facile de déboguer si vous joignez le fichier journal à votre rapport de bogue. Veuillez le consulter d'abord, il peut contenir des adresses réseau et des détails sur les échanges.",
+        "value_sha256": "598f175b0b144e2b0c2e8e46be10b5700129b42b5a553901eb3590419b81fb11",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/a822b2d67dce327c00d7dccc358518f6c736aa11/shared/domain/src/commonMain/resources/mobile/mobile_fr.properties"
+      },
+      "corrections": [],
+      "valid_alternatives": [
+        {
+          "value": "Joindre le fichier journal à votre rapport facilite le débogage. Seule la partie la plus récente est partagée, et les adresses réseau ainsi que les identifiants de profil et de transaction sont remplacés par des espaces réservés avant de quitter l’appareil.",
+          "kind": "reviewer_constructed_faithful_alternative_not_native_approved"
+        }
+      ],
+      "reason": "Known old inspect-first warning is stale for this exact newer source. The original PR English still had the old warning; this guards recurrence against the later source, not an original-head mistranslation."
+    },
+    {
+      "id": "mobile-log-known-stale-hi",
+      "rule_id": "mobile-log-known-stale-hi",
+      "profile": "bisq-mobile",
+      "locale": "hi",
+      "key": "mobile.genericError.reportInfo.logFile",
+      "source": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "467b8bef23011800b2544acc2c4c7a02c64194ab",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile.properties",
+        "value": "It will make debugging easier if you attach the log file to your bug report. Only the most recent part is shared, and network addresses, profile and trade identifiers are replaced with placeholders before it leaves the device.",
+        "value_sha256": "46d849804e1b9b64638617be8e3a57a5ddb7400daa1e7ff66a2dc9a399a9712a",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/467b8bef23011800b2544acc2c4c7a02c64194ab/shared/domain/src/commonMain/resources/mobile/mobile.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "a822b2d67dce327c00d7dccc358518f6c736aa11",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile_hi.properties",
+        "value": "यदि आप अपनी बग रिपोर्ट के साथ लॉग फ़ाइल संलग्न करते हैं तो यह डिबगिंग को आसान बना देगा। कृपया पहले इसकी समीक्षा करें, इसमें नेटवर्क पते और व्यापार विवरण हो सकते हैं।",
+        "value_sha256": "b30c8060df17896642ac174676a35c8441298a5df4652d59afb3729213361155",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/a822b2d67dce327c00d7dccc358518f6c736aa11/shared/domain/src/commonMain/resources/mobile/mobile_hi.properties"
+      },
+      "corrections": [
+        {
+          "repository": "bisq-network/bisq-mobile",
+          "commit": "467b8bef23011800b2544acc2c4c7a02c64194ab",
+          "path": "shared/domain/src/commonMain/resources/mobile/mobile_hi.properties",
+          "value": "यदि आप अपनी बग रिपोर्ट के साथ लॉग फ़ाइल संलग्न करते हैं, तो डिबगिंग आसान हो जाएगी। लॉग का केवल सबसे हाल का हिस्सा साझा किया जाता है, और डिवाइस से बाहर भेजे जाने से पहले नेटवर्क पते, प्रोफ़ाइल पहचानकर्ता और व्यापार पहचानकर्ता प्लेसहोल्डर से बदल दिए जाते हैं।",
+          "value_sha256": "79e6589a3890611458273b0c8b0feb20ff4c102c19ead3601dbef188bd82bbbb",
+          "url": "https://github.com/bisq-network/bisq-mobile/blob/467b8bef23011800b2544acc2c4c7a02c64194ab/shared/domain/src/commonMain/resources/mobile/mobile_hi.properties"
+        }
+      ],
+      "valid_alternatives": [
+        {
+          "value": "यदि आप अपनी बग रिपोर्ट के साथ लॉग फ़ाइल संलग्न करते हैं, तो डिबगिंग आसान हो जाएगी। लॉग का सिर्फ सबसे हाल का हिस्सा साझा किया जाता है, और डिवाइस से बाहर भेजे जाने से पहले नेटवर्क पते, प्रोफ़ाइल पहचानकर्ता और व्यापार पहचानकर्ता प्लेसहोल्डर से बदल दिए जाते हैं।",
+          "kind": "reviewer_constructed_faithful_alternative_not_native_approved"
+        }
+      ],
+      "reason": "Known old inspect-first warning is stale for this exact newer source. The original PR English still had the old warning; this guards recurrence against the later source, not an original-head mistranslation."
+    },
+    {
+      "id": "mobile-log-known-stale-pt-br",
+      "rule_id": "mobile-log-known-stale-pt-br",
+      "profile": "bisq-mobile",
+      "locale": "pt_BR",
+      "key": "mobile.genericError.reportInfo.logFile",
+      "source": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "467b8bef23011800b2544acc2c4c7a02c64194ab",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile.properties",
+        "value": "It will make debugging easier if you attach the log file to your bug report. Only the most recent part is shared, and network addresses, profile and trade identifiers are replaced with placeholders before it leaves the device.",
+        "value_sha256": "46d849804e1b9b64638617be8e3a57a5ddb7400daa1e7ff66a2dc9a399a9712a",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/467b8bef23011800b2544acc2c4c7a02c64194ab/shared/domain/src/commonMain/resources/mobile/mobile.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq-mobile",
+        "commit": "a822b2d67dce327c00d7dccc358518f6c736aa11",
+        "path": "shared/domain/src/commonMain/resources/mobile/mobile_pt_BR.properties",
+        "value": "Será mais fácil depurar se você anexar o arquivo de log ao seu relatório de bug. Por favor, revise-o primeiro, ele pode conter endereços de rede e detalhes da negociação.",
+        "value_sha256": "1489d3d56866fe2a9e9c524424b43e7f445246d4ddfbb677032aae902dd8aa48",
+        "url": "https://github.com/bisq-network/bisq-mobile/blob/a822b2d67dce327c00d7dccc358518f6c736aa11/shared/domain/src/commonMain/resources/mobile/mobile_pt_BR.properties"
+      },
+      "corrections": [],
+      "valid_alternatives": [
+        {
+          "value": "Anexar o arquivo de log ao relatório facilita a depuração. É compartilhada exclusivamente a parte mais recente, e os endereços de rede e identificadores de perfil e de negociação são substituídos por marcadores antes de saírem do dispositivo.",
+          "kind": "reviewer_constructed_faithful_alternative_not_native_approved"
+        }
+      ],
+      "reason": "Known old inspect-first warning is stale for this exact newer source. The original PR English still had the old warning; this guards recurrence against the later source, not an original-head mistranslation."
+    },
+    {
+      "id": "bisq-note-known-saved-lt",
+      "rule_id": "bisq-note-known-saved-lt",
+      "profile": "bisq",
+      "locale": "lt",
+      "key": "wallet.receive.overlay.description",
+      "source": {
+        "repository": "bisq-network/bisq2",
+        "commit": "1f4d9507d40a29515d3f18f9bee2c1711288eb6a",
+        "path": "i18n/src/main/resources/wallet.properties",
+        "value": "You haven't saved the address note. If you proceed without saving, the note will be lost. Do you want to continue?",
+        "value_sha256": "fbc4d58b540ffb356079d9d9bd5319737c9f4bf6382a3ee3a2245b487bca0c60",
+        "url": "https://github.com/bisq-network/bisq2/blob/1f4d9507d40a29515d3f18f9bee2c1711288eb6a/i18n/src/main/resources/wallet.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq2",
+        "commit": "b7d33f091593b76497c9dbcb90eeb7f36f37e054",
+        "path": "i18n/src/main/resources/wallet_lt.properties",
+        "value": "Jūs nesaugote adreso pastabos. Jei tęsite be išsaugojimo, pastaba bus prarasta. Ar norite tęsti?",
+        "value_sha256": "09deea5c393b4f8bc3bb16f6d13e11e4076f90019aec93844ddb051da6d46c85",
+        "url": "https://github.com/bisq-network/bisq2/blob/b7d33f091593b76497c9dbcb90eeb7f36f37e054/i18n/src/main/resources/wallet_lt.properties",
+        "review_url": "https://github.com/bisq-network/bisq2/pull/4963#discussion_r3840574813"
+      },
+      "corrections": [
+        {
+          "repository": "bisq-network/bisq2",
+          "commit": "1f4d9507d40a29515d3f18f9bee2c1711288eb6a",
+          "path": "i18n/src/main/resources/wallet_lt.properties",
+          "value": "Neišsaugojote adreso pastabos. Jei tęsite be išsaugojimo, pastaba bus prarasta. Ar norite tęsti?",
+          "value_sha256": "33db83916033fd20eb44f4e2e71b713ace8f8d534bfe3a66d0837811d93f954a",
+          "url": "https://github.com/bisq-network/bisq2/blob/1f4d9507d40a29515d3f18f9bee2c1711288eb6a/i18n/src/main/resources/wallet_lt.properties"
+        }
+      ],
+      "valid_alternatives": [
+        {
+          "value": "Adreso pastaba neišsaugota. Jei tęsite jos neišsaugoję, ji bus prarasta. Ar norite tęsti?",
+          "kind": "reviewer_constructed_faithful_alternative_not_native_approved"
+        }
+      ],
+      "reason": "Known wallet warning omits the unsaved-note state."
+    },
+    {
+      "id": "bisq-note-known-saved-sk",
+      "rule_id": "bisq-note-known-saved-sk",
+      "profile": "bisq",
+      "locale": "sk",
+      "key": "wallet.receive.overlay.description",
+      "source": {
+        "repository": "bisq-network/bisq2",
+        "commit": "1f4d9507d40a29515d3f18f9bee2c1711288eb6a",
+        "path": "i18n/src/main/resources/wallet.properties",
+        "value": "You haven't saved the address note. If you proceed without saving, the note will be lost. Do you want to continue?",
+        "value_sha256": "fbc4d58b540ffb356079d9d9bd5319737c9f4bf6382a3ee3a2245b487bca0c60",
+        "url": "https://github.com/bisq-network/bisq2/blob/1f4d9507d40a29515d3f18f9bee2c1711288eb6a/i18n/src/main/resources/wallet.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq2",
+        "commit": "b7d33f091593b76497c9dbcb90eeb7f36f37e054",
+        "path": "i18n/src/main/resources/wallet_sk.properties",
+        "value": "Nespravili ste poznámku k adrese. Ak pokračujete bez uloženia, poznámka sa stratí. Chcete pokračovať?",
+        "value_sha256": "b10435b6b9426c22028e9484143e5d70dfb866fb3f6f2de66a34e14a796cb9ed",
+        "url": "https://github.com/bisq-network/bisq2/blob/b7d33f091593b76497c9dbcb90eeb7f36f37e054/i18n/src/main/resources/wallet_sk.properties",
+        "review_url": "https://github.com/bisq-network/bisq2/pull/4963#discussion_r3840574829"
+      },
+      "corrections": [
+        {
+          "repository": "bisq-network/bisq2",
+          "commit": "1f4d9507d40a29515d3f18f9bee2c1711288eb6a",
+          "path": "i18n/src/main/resources/wallet_sk.properties",
+          "value": "Neuložili ste poznámku k adrese. Ak pokračujete bez uloženia, poznámka sa stratí. Chcete pokračovať?",
+          "value_sha256": "e9fb1baddc9297be0ddf9b1a3d7af0197ff6dcf44fda6a93d5103613eb7224e4",
+          "url": "https://github.com/bisq-network/bisq2/blob/1f4d9507d40a29515d3f18f9bee2c1711288eb6a/i18n/src/main/resources/wallet_sk.properties"
+        }
+      ],
+      "valid_alternatives": [
+        {
+          "value": "Poznámka k adrese nie je uložená. Ak budete pokračovať bez uloženia, stratí sa. Chcete pokračovať?",
+          "kind": "reviewer_constructed_faithful_alternative_not_native_approved"
+        }
+      ],
+      "reason": "Known wallet warning omits the unsaved-note state."
+    },
+    {
+      "id": "bisq-bond-known-unlock-sv",
+      "rule_id": "bisq-bond-known-unlock-sv",
+      "profile": "bisq",
+      "locale": "sv",
+      "key": "user.bondedRoles.registration.how.info",
+      "source": {
+        "repository": "bisq-network/bisq2",
+        "commit": "1f4d9507d40a29515d3f18f9bee2c1711288eb6a",
+        "path": "i18n/src/main/resources/reputation.properties",
+        "value": "1. Select the user profile you want to use for registration and create a backup of your data directory.\\n2. Make a proposal at ''https://github.com/bisq-network/proposals'' to become {0} and add your profile ID to the proposal.\\n3. After your proposal got reviewed and got support from the community, make a DAO proposal for a bonded role.\\n4. After your DAO proposal got accepted in DAO voting lock up the required BSQ bond.\\n5. After your bond transaction is confirmed go to ''DAO/Bonding/Bonded roles'' in Bisq 1 and click on the sign button to open the signing popup window.\\n6. Copy the profile ID and paste it into the message field. Click sign and copy the signature. Paste the signature to the Bisq 2 signature field.\\n7. Copy the proposal transaction ID from the accepted proposal details in Bisq 1 and paste it into the Bisq 2 proposal transaction ID field.\\n8. Copy the lockup transaction ID from ''DAO/Bonding/Bonded roles'' in Bisq 1 and paste it into the Bisq 2 lockup transaction ID field.\\n9. Enter the bondholder username.\\n{1}",
+        "value_sha256": "e9d8a070ec04b5701f9ba9070459f4d316acfd03cce890173ed1d641a43bab8c",
+        "url": "https://github.com/bisq-network/bisq2/blob/1f4d9507d40a29515d3f18f9bee2c1711288eb6a/i18n/src/main/resources/reputation.properties"
+      },
+      "original": {
+        "repository": "bisq-network/bisq2",
+        "commit": "b7d33f091593b76497c9dbcb90eeb7f36f37e054",
+        "path": "i18n/src/main/resources/reputation_sv.properties",
+        "value": "1. Välj användarprofilen som du vill använda för registrering och skapa en säkerhetskopia av din datakatalog.\\n2. Gör ett förslag på ''https://github.com/bisq-network/proposals'' för att bli {0} och lägg till ditt profil-ID i förslaget.\\n3. Efter att ditt förslag har granskats och fått stöd från gemenskapen, gör ett DAO-förslag för en bundet roll.\\n4. Efter att ditt DAO-förslag har accepterats i DAO-omröstningen, lås upp den erforderliga BSQ-obligationen.\\n5. Efter att din obligationstransaktion har bekräftats, gå till ''DAO/Bonding/Bonded roles'' i Bisq 1 och klicka på signera-knappen för att öppna fönstret för signering.\\n6. Kopiera profil-ID:t och klistra in det i meddelandefältet. Klicka på signera och kopiera signaturen. Klistra in signaturen i Bisq 2:s signaturfält.\\n7. Kopiera transaktions-ID:t för förslaget från detaljerna för det accepterade förslaget i Bisq 1 och klistra in det i Bisq 2:s fält för transaktions-ID för förslaget.\\n8. Kopiera låsningstransaktions-ID:t från ''DAO/Bonding/Bonded roles'' i Bisq 1 och klistra in det i Bisq 2:s fält för låsningstransaktions-ID.\\n9. Ange obligationsinnehavarens användarnamn.\\n{1}",
+        "value_sha256": "02cb70b74b7e8feb3b9a220b83067c99817019eb6d08ecd001d455b06fc1028b",
+        "url": "https://github.com/bisq-network/bisq2/blob/b7d33f091593b76497c9dbcb90eeb7f36f37e054/i18n/src/main/resources/reputation_sv.properties",
+        "review_url": "https://github.com/bisq-network/bisq2/pull/4963#discussion_r3840574786"
+      },
+      "corrections": [
+        {
+          "repository": "bisq-network/bisq2",
+          "commit": "1f4d9507d40a29515d3f18f9bee2c1711288eb6a",
+          "path": "i18n/src/main/resources/reputation_sv.properties",
+          "value": "1. Välj användarprofilen som du vill använda för registrering och skapa en säkerhetskopia av din datakatalog.\\n2. Gör ett förslag på ''https://github.com/bisq-network/proposals'' för att bli {0} och lägg till ditt profil-ID i förslaget.\\n3. Efter att ditt förslag har granskats och fått stöd från gemenskapen, gör ett DAO-förslag för en bundet roll.\\n4. Efter att ditt DAO-förslag har accepterats i DAO-omröstningen, lås in den erforderliga BSQ-obligationen.\\n5. Efter att din obligationstransaktion har bekräftats, gå till ''DAO/Bonding/Bonded roles'' i Bisq 1 och klicka på signera-knappen för att öppna fönstret för signering.\\n6. Kopiera profil-ID:t och klistra in det i meddelandefältet. Klicka på signera och kopiera signaturen. Klistra in signaturen i Bisq 2:s signaturfält.\\n7. Kopiera transaktions-ID:t för förslaget från detaljerna för det accepterade förslaget i Bisq 1 och klistra in det i Bisq 2:s fält för transaktions-ID för förslaget.\\n8. Kopiera låsningstransaktions-ID:t från ''DAO/Bonding/Bonded roles'' i Bisq 1 och klistra in det i Bisq 2:s fält för låsningstransaktions-ID.\\n9. Ange obligationsinnehavarens användarnamn.\\n{1}",
+          "value_sha256": "db4e377f74eb3be32a89c6aa1c89805b7178b02d55b993ea48ab5df9ec1a02d6",
+          "url": "https://github.com/bisq-network/bisq2/blob/1f4d9507d40a29515d3f18f9bee2c1711288eb6a/i18n/src/main/resources/reputation_sv.properties"
+        }
+      ],
+      "valid_alternatives": [
+        {
+          "value": "1. Välj användarprofilen som du vill använda för registrering och skapa en säkerhetskopia av din datakatalog.\\n2. Gör ett förslag på ''https://github.com/bisq-network/proposals'' för att bli {0} och lägg till ditt profil-ID i förslaget.\\n3. Efter att ditt förslag har granskats och fått stöd från gemenskapen, gör ett DAO-förslag för en bundet roll.\\n4. Efter att ditt DAO-förslag har accepterats i DAO-omröstningen, lås den erforderliga BSQ-obligationen.\\n5. Efter att din obligationstransaktion har bekräftats, gå till ''DAO/Bonding/Bonded roles'' i Bisq 1 och klicka på signera-knappen för att öppna fönstret för signering.\\n6. Kopiera profil-ID:t och klistra in det i meddelandefältet. Klicka på signera och kopiera signaturen. Klistra in signaturen i Bisq 2:s signaturfält.\\n7. Kopiera transaktions-ID:t för förslaget från detaljerna för det accepterade förslaget i Bisq 1 och klistra in det i Bisq 2:s fält för transaktions-ID för förslaget.\\n8. Kopiera låsningstransaktions-ID:t från ''DAO/Bonding/Bonded roles'' i Bisq 1 och klistra in det i Bisq 2:s fält för låsningstransaktions-ID.\\n9. Ange obligationsinnehavarens användarnamn.\\n{1}",
+          "kind": "reviewer_constructed_faithful_alternative_not_native_approved"
+        }
+      ],
+      "reason": "Known reversed bond action."
+    }
+  ]
+}

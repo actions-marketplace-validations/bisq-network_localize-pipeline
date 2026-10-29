@@ -12,10 +12,10 @@ from types import SimpleNamespace
 import pytest
 import localize.translate_localization_files
 from localize.ignore_keys import compile_ignore_key_patterns
-from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-from localize.localization_layouts import LocalizationLayout
-from localize.localization_profiles import LocalizationProfile
-from localize.properties_parser import parse_properties_file
+from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+from localize.formats.layouts import LocalizationLayout
+from localize.formats.profiles import LocalizationProfile
+from localize.formats.properties import parse_properties_file
 from localize.translation_memory import (
     TranslationMemory,
     load_translation_memory,
@@ -23,6 +23,21 @@ from localize.translation_memory import (
 )
 
 # All fixtures are now defined in conftest.py and are auto-discovered by pytest.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["app_xx.properties", "missing_de.properties"])
+async def test_unprocessable_import_has_explicit_skip_record(integration_test_environment, name):
+    """Unknown locales and absent sources remain excluded from publication."""
+    env = integration_test_environment
+    with open(os.path.join(env["translation_queue_folder"], name), "w", encoding="utf-8") as handle:
+        handle.write("label=English import\n")
+    result = await localize.translate_localization_files.process_translation_queue(
+        translation_queue_folder=env["translation_queue_folder"],
+        translated_queue_folder=env["translated_queue_folder"],
+        glossary_file_path=env["mock_glossary_path_resolved"],
+    )
+    assert result[2][name]
 
 @pytest.mark.asyncio
 @patch('localize.translate_localization_files.get_changed_translation_files')
@@ -472,6 +487,107 @@ async def test_failed_model_translation_preserves_ledger_verified_target(
         ledger_path
     )
     assert ledger["app_de.properties"]["key.chat"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "previous_source,existing_value,expected_value",
+    [
+        ("Open {0}", "Öffnen {0}", "Öffnen {0}"),
+        ("Close {0}", "Schließen {0}", None),
+        ("Open {0}", "Öffnen {1}", None),
+        ("Open {0}", "Open {0}", "Open {0}"),
+    ],
+)
+async def test_source_echo_preserves_only_valid_current_source_baseline(
+    integration_test_environment, previous_source, existing_value, expected_value,
+):
+    """Echoes stay failed; only fresh, placeholder-safe old text reaches output."""
+    env = integration_test_environment
+    pipeline = localize.translate_localization_files
+    source_value = "Open {0}"
+    source_path = os.path.join(env['input_folder'], 'app.properties')
+    target_path = os.path.join(env['translation_queue_folder'], 'app_de.properties')
+    ledger_path = os.path.join(env['input_folder'], 'echo-ledger.json')
+    memory_path = os.path.join(env['input_folder'], 'echo-memory.json')
+    with open(source_path, 'w', encoding='utf-8') as stream:
+        stream.write(f"key.open={source_value}\n")
+    with open(target_path, 'w', encoding='utf-8') as stream:
+        stream.write(f"key.open={existing_value}\n")
+    pipeline.save_translation_key_ledger(ledger_path, {
+        "app_de.properties": pipeline.build_file_key_ledger(
+            {"key.open": previous_source}, {"key.open": existing_value},
+            failed_keys={"key.open"},
+        ),
+    })
+    summary = {}
+    with patch.object(pipeline, 'TRANSLATION_KEY_LEDGER_FILE_PATH', ledger_path), \
+         patch.object(pipeline, 'TRANSLATION_MEMORY_ENABLED', True), \
+         patch.object(pipeline, 'TRANSLATION_MEMORY_FILE_PATH', memory_path), \
+         patch.object(pipeline, 'get_working_tree_changed_keys', return_value=set()), \
+         patch.object(pipeline, 'translate_text_async', new_callable=AsyncMock) as translate, \
+         patch.object(pipeline, 'holistic_review_async', new_callable=AsyncMock) as review:
+        translate.return_value = (0, source_value, True)
+        review.return_value = {"key.open": source_value}
+        await pipeline.process_translation_queue(
+            env['translation_queue_folder'], env['translated_queue_folder'],
+            env['mock_glossary_path_resolved'], validation_summary=summary,
+        )
+    output_path = os.path.join(env['translated_queue_folder'], 'app_de.properties')
+    if expected_value is None:
+        assert not os.path.exists(output_path)
+    else:
+        _, output = parse_properties_file(output_path)
+        assert output["key.open"] == expected_value
+    assert summary["app_de.properties"]["source_identical_keys"] == ["key.open"]
+    assert summary["app_de.properties"]["reverted_keys_count"] == 1
+    ledger = pipeline.load_translation_key_ledger(ledger_path)
+    assert ledger["app_de.properties"]["key.open"]["status"] == "failed"
+    memory = load_translation_memory(memory_path)
+    assert memory.lookup(
+        source_value, locale="de", format_id=JAVA_PROPERTIES_FORMAT.id,
+    ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["echo", "empty", "placeholder", "control", "model"])
+async def test_rejected_translation_never_publishes_english_over_existing_target(
+    integration_test_environment, failure,
+):
+    """A first-run ledger miss must not turn a rejected update into English."""
+    env = integration_test_environment
+    pipeline = localize.translate_localization_files
+    source = "Open trade chat {0}"
+    old = "Handels-Chat öffnen {0}"
+    target = os.path.join(env['translation_queue_folder'], 'app_de.properties')
+    with open(os.path.join(env['input_folder'], 'app.properties'), 'w') as stream:
+        stream.write(f"key.open={source}\n")
+    with open(target, 'w', encoding='utf-8') as stream:
+        stream.write(f"key.open={old}\n")
+    candidate = {
+        "echo": source, "empty": "", "placeholder": "Chat öffnen {1}",
+        "control": "Chat öffnen {0}\\u0001", "model": source,
+    }[failure]
+    ledger_path = os.path.join(env['input_folder'], 'repair-ledger.json')
+    summary = {}
+    with patch.object(pipeline, 'TRANSLATION_KEY_LEDGER_FILE_PATH', ledger_path), \
+         patch.object(pipeline, 'get_working_tree_changed_keys', return_value={"key.open"}), \
+         patch.object(pipeline, 'translate_text_async', new_callable=AsyncMock) as translate, \
+         patch.object(pipeline, 'holistic_review_async', new_callable=AsyncMock) as review:
+        translate.return_value = (0, candidate, failure != "model")
+        review.return_value = {"key.open": candidate}
+        result = await pipeline.process_translation_queue(
+            env['translation_queue_folder'], env['translated_queue_folder'],
+            env['mock_glossary_path_resolved'], validation_summary=summary,
+        )
+    assert not os.path.exists(os.path.join(env['translated_queue_folder'], 'app_de.properties'))
+    assert result[2]['app_de.properties']
+    assert parse_properties_file(target)[1]["key.open"] == old
+    ledger = pipeline.load_translation_key_ledger(ledger_path)
+    assert ledger['app_de.properties']['key.open']['status'] == 'failed'
+    assert pipeline._ledger_verified_existing_translation(
+        'key.open', {'key.open': source}, {'key.open': old}, ledger['app_de.properties'],
+    ) is None
 
 
 @pytest.mark.asyncio

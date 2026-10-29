@@ -112,6 +112,9 @@ schedule:
 runtime:
   codex_model: gpt-5.6-terra
   codex_reasoning_effort: high
+  # Optional prevention-only overrides; omitted settings inherit the above.
+  # prevention_model: gpt-6-astra
+  # prevention_reasoning_effort: high
   # Uses the operator's Codex/ChatGPT plan allowance, not API billing.
   codex_auth_mode: chatgpt
   # ChatGPT mode only; remove this key when selecting api-key mode.
@@ -855,7 +858,9 @@ def _ssh_signing_key_configured(
                 public_key_path=signing_public_key,
                 expected_fingerprint=fingerprint,
                 signing_program=signing_program,
-                temporary_root=root,
+                # Use the runtime's snapshot parent. Nesting inside the probe
+                # can exceed macOS's Unix-socket path limit for agent.sock.
+                temporary_root=temporary_root if temporary_root is not None else root,
             ) as material:
                 signing_socket = ssh_agent_environment(
                     temporary_root=material.root,
@@ -1586,6 +1591,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     )
     healthy &= codex_capabilities
     if config.mode is GuardianMode.PROPOSE_PREVENTION:
+        print(
+            "Prevention model/effort: configured "
+            f"{config.runtime.effective_prevention_model} / "
+            f"{config.runtime.effective_prevention_reasoning_effort} "
+            "(not capability-validated)"
+        )
         author_capabilities = (
             _codex_capability_probe(
                 config.runtime.codex_executable,
@@ -1735,6 +1746,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
+    """Report bounded audit metadata without disclosing review text or credentials."""
     config_path = _resolved_config_path(args.config)
     try:
         config = _load_config_or_raise(config_path)
@@ -1747,6 +1759,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
     try:
         with _locked_existing_state(config_path) as state:
             snapshot = None if state is None else state.status_snapshot(mode=config.mode)
+            reporting = (0, 0) if state is None else state.feedback_reporting_counts()
+            human_total, human_evidence = (0, ()) if state is None else state.thread_hold_evidence_for_operator(
+                limit=getattr(args, "human_evidence_limit", 20),
+                after_revision_id=getattr(args, "human_evidence_after", 0),
+            )
+            diagnostic = None if state is None else state.latest_health("guardian-failure")
+            policy_proposal = None if state is None else state.latest_health("project-policy")
+            prevention_decline = None if state is None else state.latest_health("prevention-author")
     except Exception:
         print("error: Guardian state is unavailable or invalid.", file=sys.stderr)
         return 1
@@ -1755,7 +1775,29 @@ def _cmd_status(args: argparse.Namespace) -> int:
         return 0
 
     print(f"last completed run: {snapshot.last_completed_run or 'none'}")
+    print(f"last successful poll: {snapshot.last_successful_poll or 'none'}")
+    if diagnostic is not None:
+        print(f"last failure diagnostic: #{diagnostic.health_id} at {diagnostic.checked_at.isoformat()}")
+        print(json.dumps(diagnostic.details, sort_keys=True))
+    if prevention_decline is not None and prevention_decline.status == "declined":
+        from localize.guardian.prevention_decision import DECLINE_REASONS
+        reason = prevention_decline.details.get("reason")
+        if not isinstance(reason, str) or reason not in DECLINE_REASONS:
+            reason = "unknown"
+        print(f"latest prevention decline: #{prevention_decline.health_id} ({reason}); "
+              "private rationale recorded, not repair proof")
+    if policy_proposal is not None:
+        print(f"latest private project-policy proposal: {policy_proposal.details.get('path', 'unavailable')}")
+        print(f"proposal evidence: {policy_proposal.details.get('status', 'unknown')}; operator review required")
     print(f"pending feedback revisions: {snapshot.pending_revisions}")
+    print(f"pending explanation acknowledgements: {reporting[0]}")
+    print(f"recorded maintainer decisions: {reporting[1]}")
+    print(f"thread evidence awaiting human review: {human_total}")
+    for evidence in human_evidence:
+        print(json.dumps(evidence, sort_keys=True))
+    if human_evidence:
+        print(f"human evidence page ends at revision {human_evidence[-1]['revision_id']}; "
+              "use --human-evidence-after for the next page")
     actions = ", ".join(f"{status}={count}" for status, count in snapshot.actions)
     print(f"actions: {actions or 'none'}")
     health = ", ".join(f"{component}={status}" for component, status in snapshot.health)
@@ -2183,6 +2225,16 @@ def _operator_list_limit(raw_value: str) -> int:
     return value
 
 
+def _operator_revision_cursor(raw_value: str) -> int:
+    try:
+        value = int(raw_value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a non-negative 64-bit integer") from None
+    if not 0 <= value <= 9223372036854775807:
+        raise argparse.ArgumentTypeError("must be between 0 and 9223372036854775807")
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="localize guardian",
@@ -2229,6 +2281,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config", required=True, help="Operator-owned Guardian YAML path."
     )
     status_parser.set_defaults(func=_cmd_status)
+    status_parser.add_argument("--human-evidence-limit", type=_operator_list_limit, default=20,
+                               help="Show 1–100 pending human evidence records (default: 20).")
+    status_parser.add_argument("--human-evidence-after", type=_operator_revision_cursor, default=0,
+                               help="Page human evidence after this revision ID.")
 
     remediation_parser = subparsers.add_parser(
         "remediation",

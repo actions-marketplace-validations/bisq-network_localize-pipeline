@@ -42,6 +42,7 @@ from localize.guardian.github import (
     CodeRabbitCoverageStatus,
     FeedbackKind,
     FeedbackRevision,
+    GitHubAPIError,
     GitHubAuthenticationError,
     GitHubRepositoryIdentity,
     OpenPullPathAuthority,
@@ -97,6 +98,7 @@ from localize.guardian.remediation import (
 )
 from localize.guardian.workspace import (
     CommitResult,
+    ExactRevision,
     HistoricalRevision,
     HistoricalWorkspace,
     PublicationResult,
@@ -131,7 +133,7 @@ def _insert_legacy_publication(
     )
     publication_key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         # Restore the pre-v8 table shape while the production connection is
         # closed. The next GuardianState open performs the real v7 -> v8
         # migration and reinstalls every dropped production trigger.
@@ -760,6 +762,43 @@ def _snapshot(
     )
 
 
+def test_open_pull_base_is_read_only_while_head_requires_current_ref() -> None:
+    """A moving base branch must not invalidate the reviewed base snapshot."""
+    snapshot = _snapshot()
+    base, head = guardian_controller._exact_revisions(
+        _policy(), snapshot, github_host="github.com"
+    )
+    assert isinstance(base, HistoricalRevision)
+    assert base.sha == snapshot.pull_request.base_sha
+    assert isinstance(head, guardian_controller.ExactRevision)
+    assert head.sha == snapshot.pull_request.head_sha
+    assert head.ref == f"refs/heads/{snapshot.pull_request.head_ref}"
+
+
+def test_replacement_locales_require_actor_authority_for_each_target() -> None:
+    """Cross-locale comments must not expand a reviewer's locale allowlist."""
+    event = FeedbackEvent(
+        repository="acme/widgets", pr_number=12, kind="review_comment", event_id="44",
+        author="native-reviewer", author_id=101, author_type="User", body="Fix both.",
+        head_sha=HEAD_SHA, base_sha=BASE_SHA, locale="ru",
+    )
+    paths = {"l10n/app_ru.properties": "ru", "l10n/app_cs.properties": "cs"}
+    policy = _policy()
+    assert guardian_controller._replacement_target_locales(policy, (event,), paths) == {
+        event.feedback_id: {"l10n/app_ru.properties": "ru"}
+    }
+    both = replace(policy, trusted_reviewers={
+        "ru": policy.trusted_reviewers["ru"], "cs": policy.trusted_reviewers["ru"]
+    })
+    assert guardian_controller._replacement_target_locales(both, (event,), paths) == {
+        event.feedback_id: paths
+    }
+    for invalid in (replace(event, author_id=None), replace(event, author_type="Bot")):
+        assert guardian_controller._replacement_target_locales(both, (invalid,), paths) == {
+            event.feedback_id: {}
+        }
+
+
 def _authorized_historical_digest(
     policy: RepositoryPolicy,
     snapshot: PullRequestFeedbackSnapshot,
@@ -807,6 +846,136 @@ def test_historical_authority_digest_excludes_deletion_tombstones() -> None:
     )
 
     assert with_tombstone == live_digest
+
+
+def test_historical_quality_retirement_rechecks_immutable_assessment(
+    tmp_path: Path, runtime,
+) -> None:
+    base, head, checkout, provider, broker, _sequence = runtime
+    policy = replace(
+        _historical_policy(remediation=True),
+        quality_report_actor=TrustedActor("quality-reporter", 202, "User"),
+    )
+    config = _config(GuardianMode.APPLY_OWNED_TRANSLATIONS, policies=(policy,))
+    snapshot = _snapshot(pull=_pull(state="closed", head_sha=COMMIT_SHA))
+    authorized = authorize_historical_feedback(
+        policy=policy, snapshot=snapshot, path_locales={TARGET_PATH: "ru"},
+        changed_locales=("ru",),
+    )
+    assert len(authorized.events) == 1
+    old_policy_basis = {
+        "assessment": {
+            "minimum_confidence": config.limits.min_apply_confidence,
+            "model": FakeCodexDriver().model,
+            "reasoning_effort": config.runtime.codex_reasoning_effort,
+        },
+        "controller_implementation_version": guardian_controller._HISTORICAL_CONTROLLER_VERSION,
+        "mode": config.mode,
+        "pipeline_config_bundle": "f" * 64,
+        "repository_policy": policy,
+    }
+    old_policy_digest = guardian_controller._canonical_digest(old_policy_basis)
+    new_policy_digest = guardian_controller._historical_policy_digest(
+        config=config, policy=policy, model=FakeCodexDriver().model,
+        pipeline_config_bundle_digest="f" * 64,
+    )
+    assert new_policy_digest != old_policy_digest
+    non_quality_policy = _historical_policy(remediation=True)
+    assert guardian_controller._historical_policy_digest(
+        config=config, policy=non_quality_policy, model=FakeCodexDriver().model,
+        pipeline_config_bundle_digest="f" * 64,
+    ) == guardian_controller._canonical_digest({
+        **old_policy_basis, "repository_policy": non_quality_policy,
+    })
+
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        for index in range(39):
+            state.record_feedback_event(
+                FeedbackEvent(
+                    repository=policy.base_repo, pr_number=12,
+                    kind="issue_comment", event_id=f"400:quality:{index:064x}",
+                    author="quality-reporter", author_id=202, author_type="User",
+                    body="Prior private finding.", head_sha=HEAD_SHA,
+                    base_sha=BASE_SHA, locale="ru", path=TARGET_PATH,
+                    html_url=f"https://github.com/acme/widgets/pull/12#issuecomment-{index + 1}",
+                ),
+                observed_at=NOW,
+            )
+        selected = state.record_feedback_event(authorized.events[0], observed_at=NOW)
+        digest = guardian_controller._historical_pull_revision_digest(
+            policy, snapshot, feedback_events=authorized.events,
+        )
+        state.record_historical_pull_completion(
+            repository=policy.base_repo, repository_id=policy.base_repo_id,
+            pull_id=snapshot.pull_request.pull_id, pr_number=12,
+            pull_revision_digest=digest, policy_digest=old_policy_digest,
+            head_sha=COMMIT_SHA, base_sha=BASE_SHA,
+            event_revision_ids=(selected.revision_id,),
+            authority_scope=HistoricalCheckScope.ASSESSMENT, completed_at=NOW,
+        )
+        controller = _controller(
+            tmp_path=tmp_path, state=state, config=config, checkout=checkout,
+            provider=provider, driver=FakeCodexDriver(), broker=broker,
+            historical_snapshot_provider=FakeHistoricalSnapshotProvider((snapshot,)),
+            historical_checkout_factory=FakeHistoricalCheckoutFactory(
+                base, head, tmp_path,
+            ),
+            current_base_provider=FakeCurrentBaseProvider(),
+            remediation_runner=FakeRemediationRunner(),
+        )
+        controller._require_live_lease = lambda _owner: None  # type: ignore[method-assign]
+        intake = controller._prepare_historical_intake(
+            policy=policy, snapshot=snapshot, operator_config=None,
+            lease_owner="test-owner",
+        )
+        assert len(intake.tombstones) == 39
+        assert all(event.deleted and event.head_sha == COMMIT_SHA for event in intake.tombstones)
+        assert intake.historical_digest == digest
+        retired_ids = tuple(
+            state.record_feedback_event(event, observed_at=NOW).revision_id
+            for event in intake.tombstones
+        )
+
+        # Simulate interruption after retirement but before the new checkpoint.
+        retry = controller._prepare_historical_intake(
+            policy=policy, snapshot=snapshot, operator_config=None,
+            lease_owner="test-owner",
+        )
+        assert len(retry.tombstones) == 39
+        ignored = tuple(
+            state.record_feedback_event(event, observed_at=NOW).revision_id
+            for event in retry.tombstones
+        )
+        assert ignored == retired_ids
+        controller._historical_checkpoint(
+            policy=policy, snapshot=snapshot, pull_revision_digest=retry.historical_digest,
+            policy_digest=new_policy_digest, scope=HistoricalCheckScope.ASSESSMENT,
+            observed_at=NOW, event_revision_ids=(selected.revision_id,),
+            ignored_event_revision_ids=ignored,
+        )
+        controller._historical_checkpoint(
+            policy=policy, snapshot=snapshot, pull_revision_digest=retry.historical_digest,
+            policy_digest=new_policy_digest, scope=HistoricalCheckScope.ASSESSMENT,
+            observed_at=NOW, event_revision_ids=(selected.revision_id,),
+            ignored_event_revision_ids=ignored,
+        )
+        source = HistoricalPullReference(
+            repository=policy.base_repo, repository_id=policy.base_repo_id,
+            pull_id=snapshot.pull_request.pull_id, pr_number=12,
+            pull_revision_digest=digest, authority_digest=digest,
+            policy_digest=new_policy_digest, head_sha=COMMIT_SHA, base_sha=BASE_SHA,
+        )
+        state.validate_current_historical_remediation_evidence(
+            source_pulls=(source,), event_revision_ids=(selected.revision_id,),
+        )
+        state.record_feedback_event(
+            replace(authorized.events[0], event_id="new-real-review"),
+            observed_at=NOW,
+        )
+        with pytest.raises(ValueError, match="no longer current"):
+            state.validate_current_historical_remediation_evidence(
+                source_pulls=(source,), event_revision_ids=(selected.revision_id,),
+            )
 
 
 class FakeSnapshotProvider:
@@ -857,6 +1026,181 @@ class FakeSnapshotProvider:
             snapshot,
             pull_request=replace(snapshot.pull_request, head_sha=COMMIT_SHA),
         )
+
+
+@pytest.mark.parametrize("race_at", ("initial", "final"))
+@pytest.mark.parametrize("change", ("edited", "added"))
+def test_reporting_defers_verified_same_head_feedback_change(
+    tmp_path: Path, runtime, race_at: str, change: str
+) -> None:
+    _base, _head, checkout, provider, broker, _sequence = runtime
+    original = provider.snapshots[0]
+    feedback = list(original.feedback)
+    if change == "edited":
+        feedback[0] = replace(
+            feedback[0], body="Updated review text", updated_at="2026-08-30T10:01:00Z"
+        )
+    else:
+        feedback.append(_feedback(source_id="45"))
+    raced = replace(original, feedback=tuple(feedback))
+
+    class RacingProvider(FakeSnapshotProvider):
+        calls_count = 0
+
+        def revalidate_open_pull_request(self, policy, source):
+            del policy, source
+            self.calls_count += 1
+            return raced if race_at == "initial" or self.calls_count == 2 else original
+
+    policy = _policy()
+    authorized = authorize_feedback(
+        policy=policy, snapshot=original,
+        path_locales={TARGET_PATH: "ru"}, changed_locales=("ru",),
+    )
+    source = GuardianController._open_pull_authority_reference(
+        policy=policy, snapshot=original, authorized=authorized,
+    )
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        revision = state.record_feedback_event(authorized.events[0], observed_at=NOW)
+        controller = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS),
+            checkout=checkout, provider=RacingProvider((original,)),
+            driver=FakeCodexDriver(), broker=broker,
+        )
+        with pytest.raises(guardian_controller._SameHeadFeedbackChanged):
+            controller._require_exact_open_source_authority(
+                policy=policy, source=source,
+                event_revision_ids=(revision.revision_id,),
+                require_live_lease=lambda: None,
+                reporting_non_feedback_digest=guardian_controller._open_pull_non_feedback_digest(
+                    policy, original, source.repository
+                ),
+            )
+
+
+@pytest.mark.parametrize("change", ("feedback", "file", "head", "base"))
+def test_same_head_reporting_deferral_preserves_other_authority_guards(
+    tmp_path: Path, runtime, change: str
+) -> None:
+    _base, _head, checkout, provider, broker, _sequence = runtime
+    original = provider.snapshots[0]
+    edited_feedback = replace(
+        original.feedback[0], body="Updated review text", updated_at="2026-08-30T10:01:00Z"
+    )
+    raced = replace(original, feedback=(edited_feedback,))
+    if change == "file":
+        raced = replace(raced, changed_files=(replace(original.changed_files[0], sha="e" * 40),))
+    elif change == "head":
+        raced = replace(raced, pull_request=replace(original.pull_request, head_sha="e" * 40))
+    elif change == "base":
+        raced = replace(raced, pull_request=replace(original.pull_request, base_sha="e" * 40))
+
+    class RacingProvider(FakeSnapshotProvider):
+        def revalidate_open_pull_request(self, policy, source):
+            del policy, source
+            return raced
+
+    policy = _policy()
+    authorized = authorize_feedback(
+        policy=policy, snapshot=original,
+        path_locales={TARGET_PATH: "ru"}, changed_locales=("ru",),
+    )
+    source = GuardianController._open_pull_authority_reference(
+        policy=policy, snapshot=original, authorized=authorized,
+    )
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        revision = state.record_feedback_event(authorized.events[0], observed_at=NOW)
+        controller = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS),
+            checkout=checkout, provider=RacingProvider((original,)),
+            driver=FakeCodexDriver(), broker=broker,
+        )
+        with pytest.raises(guardian_controller.PreventionSourceAuthorityError) as failure:
+            controller._require_exact_open_source_authority(
+                policy=policy, source=source,
+                event_revision_ids=(revision.revision_id,),
+                require_live_lease=lambda: None,
+                reporting_non_feedback_digest=(
+                    None if change == "feedback" else
+                    guardian_controller._open_pull_non_feedback_digest(
+                        policy, original, source.repository
+                    )
+                ),
+            )
+        assert type(failure.value) is guardian_controller.PreventionSourceAuthorityError
+
+
+def test_reporting_keeps_same_head_feedback_race_pending(
+    tmp_path: Path, runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _base, _head, checkout, provider, broker, _sequence = runtime
+    policy = _policy()
+    snapshot = provider.snapshots[0]
+    authorized = authorize_feedback(
+        policy=policy, snapshot=snapshot,
+        path_locales={TARGET_PATH: "ru"}, changed_locales=("ru",),
+    )
+    source = GuardianController._open_pull_authority_reference(
+        policy=policy, snapshot=snapshot, authorized=authorized,
+    )
+    raced = replace(snapshot, feedback=(replace(
+        snapshot.feedback[0], body="Updated review text",
+        updated_at="2026-08-30T10:01:00Z",
+    ),))
+
+    class RacingProvider(FakeSnapshotProvider):
+        def revalidate_open_pull_request(self, policy, source):
+            del policy, source
+            return raced
+
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        revision = state.record_feedback_event(authorized.events[0], observed_at=NOW)
+        assert state.acquire_lease(
+            name="guardian:poll", owner="test-owner", ttl_seconds=60, now=NOW
+        )
+        controller = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS),
+            checkout=checkout, provider=RacingProvider((snapshot,)),
+            driver=FakeCodexDriver(), broker=broker,
+        )
+        monkeypatch.setattr(
+            state, "latest_feedback_report",
+            lambda *_args, **_kwargs: {
+                "report_policy_digest": "policy", "report_outcome": "needs_human",
+                "report_reason": "insufficient_evidence", "decision_required": True,
+            },
+        )
+
+        controller._flush_feedback_reports(
+            policy=policy, snapshot=snapshot,
+            current=((authorized.events[0], revision),),
+            open_source=source, lease_owner="test-owner", policy_digest="policy",
+        )
+        health = state.latest_health("feedback-reporting")
+        assert health is not None and health.status == "pending"
+        assert broker.feedback_reports == {}
+
+        fresh_authorized = authorize_feedback(
+            policy=policy, snapshot=raced,
+            path_locales={TARGET_PATH: "ru"}, changed_locales=("ru",),
+        )
+        fresh_revision = state.record_feedback_event(
+            fresh_authorized.events[0], observed_at=NOW
+        )
+        fresh_source = GuardianController._open_pull_authority_reference(
+            policy=policy, snapshot=raced, authorized=fresh_authorized,
+        )
+        controller._flush_feedback_reports(
+            policy=policy, snapshot=raced,
+            current=((fresh_authorized.events[0], fresh_revision),),
+            open_source=fresh_source, lease_owner="test-owner", policy_digest="policy",
+        )
+        health = state.latest_health("feedback-reporting")
+        assert health is not None and health.status == "ok"
+        assert len(broker.feedback_reports) == 1
 
 
 class FakeHistoricalSnapshotProvider:
@@ -1339,10 +1683,13 @@ class FakeWorkspace:
     sequence: list[str]
     commits: int = 0
     publications: int = 0
+    author_email: str | None = None
 
     def commit_validated_changes(self, **kwargs) -> CommitResult:
+        """Capture the signing contract and return the deterministic test commit."""
         self.sequence.append("commit")
         self.commits += 1
+        self.author_email = kwargs.get("author_email")
         assert kwargs["sign"] is True
         assert kwargs["expected_paths"] == (TARGET_PATH,)
         return CommitResult(
@@ -1621,12 +1968,40 @@ def test_historical_remediation_repository_order_rotates_after_last_publisher() 
 
 
 class FakeBroker:
+    web_base_url = "https://github.com"
     def __init__(self, sequence: list[str]) -> None:
+        """Record injected test dependencies without accessing external services."""
         self.sequence = sequence
         self.verify_calls = []
         self.verify_error_on_call: int | None = None
         self.reply_calls = []
+        self.posted_replies = []
         self.reply_error: Exception | None = None
+        self.feedback_reports = {}
+        self.feedback_summary = None
+        self.report_error = None
+
+    def post_feedback_report(self, **kwargs):
+        from types import SimpleNamespace
+        from localize.guardian.reporting import report_body
+        kwargs["before_create"]()
+        key = kwargs["report_id"]
+        if key not in self.feedback_reports:
+            body = report_body(kwargs["details"], repository="acme/widgets", feedback_id=kwargs["feedback_id"])
+            self.feedback_reports[key] = SimpleNamespace(
+                body=body, html_url=f"https://github.com/acme/widgets/pull/12#discussion_r{100 + len(self.feedback_reports)}")
+        if self.report_error:
+            raise self.report_error
+        return self.feedback_reports[key]
+
+    def post_feedback_summary(self, **kwargs):
+        from types import SimpleNamespace
+        from localize.guardian.reporting import summary_body
+        kwargs["before_create"]()
+        self.feedback_summary = SimpleNamespace(
+            body=summary_body(kwargs["reports"], repository="acme/widgets", pull_number=kwargs["pull_number"]),
+            html_url=f"https://github.com/acme/widgets/pull/{kwargs['pull_number']}#issuecomment-900")
+        return self.feedback_summary
 
     def verify_pull(self, **kwargs):
         self.sequence.append("verify")
@@ -1636,6 +2011,7 @@ class FakeBroker:
         return _pull()
 
     def post_commit_reply(self, **kwargs):
+        """Separate attempted replies from posts that pass the final authority callback."""
         self.sequence.append("reply")
         self.reply_calls.append(kwargs)
         if self.reply_error is not None:
@@ -1643,6 +2019,7 @@ class FakeBroker:
         kwargs["before_create"]()
         assert kwargs["expected_head_sha"] == COMMIT_SHA
         assert kwargs["commit_sha"] == COMMIT_SHA
+        self.posted_replies.append(kwargs)
         return object()
 
 
@@ -3012,6 +3389,7 @@ def test_recovers_successor_lineage_after_remediation_closes_without_reply(
 def test_refuses_to_infer_actor_or_lineage_for_a_legacy_prepared_push(
     tmp_path: Path,
 ) -> None:
+    """Legacy records must not gain inferred publication or successor authority."""
     sequence: list[str] = []
     broker = FakeBroker(sequence)
     database = tmp_path / "state.sqlite3"
@@ -3059,7 +3437,7 @@ def test_refuses_to_infer_actor_or_lineage_for_a_legacy_prepared_push(
             state._connection.execute(  # noqa: SLF001
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == 9
+            == 12
         )
         installed_triggers = {
             row["name"]
@@ -3125,6 +3503,7 @@ def test_refuses_to_infer_actor_or_lineage_for_a_legacy_prepared_push(
 def test_refuses_to_infer_actor_or_open_authority_for_a_legacy_publication(
     tmp_path: Path,
 ) -> None:
+    """Fail closed when a legacy publication lacks durable actor and PR evidence."""
     sequence: list[str] = []
     broker = FakeBroker(sequence)
     database = tmp_path / "state.sqlite3"
@@ -3169,7 +3548,7 @@ def test_refuses_to_infer_actor_or_open_authority_for_a_legacy_publication(
             state._connection.execute(  # noqa: SLF001
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == 9
+            == 12
         )
         installed_triggers = {
             row["name"]
@@ -3316,16 +3695,18 @@ def test_github_authentication_failure_stops_later_repositories(
     assert outcome.repositories_polled == 0
 
 
+@pytest.mark.parametrize("failure_type", [GitHubAuthenticationError, GitHubAPIError, ValueError])
 def test_publication_actor_preflight_blocks_every_remote_write(
     tmp_path: Path,
     runtime,
+    failure_type,
 ) -> None:
     base, head, checkout, provider, broker, _sequence = runtime
     policy = _historical_policy(remediation=True)
     remediation = FakeRemediationRunner()
 
     def fail_actor() -> None:
-        raise GitHubAuthenticationError("wrong credential actor")
+        raise failure_type("private preflight failure")
 
     with GuardianState(tmp_path / "state.sqlite3") as state:
         outcome = _controller(
@@ -3353,7 +3734,9 @@ def test_publication_actor_preflight_blocks_every_remote_write(
             publication_actor_preflight=fail_actor,
         ).poll_once()
 
-    assert outcome.authentication_circuit_open is True
+    assert outcome.authentication_circuit_open is (failure_type is not GitHubAPIError)
+    if failure_type is GitHubAPIError:
+        assert outcome.failures == ("GitHubAPIError",)
     assert outcome.repositories_polled == 0
     assert provider.calls == []
     assert broker.verify_calls == []
@@ -3363,16 +3746,18 @@ def test_publication_actor_preflight_blocks_every_remote_write(
     assert remediation.publish_calls == []
 
 
+@pytest.mark.parametrize("failure_type", [GitHubAuthenticationError, GitHubAPIError, ValueError])
 def test_publication_actor_preflight_blocks_prevention_orphan_recovery(
     tmp_path: Path,
     runtime,
+    failure_type,
 ) -> None:
     _base, _head, checkout, provider, broker, _sequence = runtime
     policy = replace(_policy(), prevention=_prevention_policy())
     prevention = FakePreventionRunner()
 
     def fail_actor() -> None:
-        raise GitHubAuthenticationError("wrong credential actor")
+        raise failure_type("private preflight failure")
 
     with GuardianState(tmp_path / "state.sqlite3") as state:
         outcome = _controller(
@@ -3387,7 +3772,9 @@ def test_publication_actor_preflight_blocks_prevention_orphan_recovery(
             publication_actor_preflight=fail_actor,
         ).poll_once()
 
-    assert outcome.authentication_circuit_open is True
+    assert outcome.authentication_circuit_open is (failure_type is not GitHubAPIError)
+    if failure_type is GitHubAPIError:
+        assert outcome.failures == ("GitHubAPIError",)
     assert outcome.repositories_polled == 0
     assert provider.calls == []
     assert broker.verify_calls == []
@@ -3422,11 +3809,12 @@ def test_incomplete_prevention_candidate_leaves_feedback_retryable(
             prevention_runner=prevention,
         ).poll_once()
 
-        assert outcome.runs_failed == 1
+        assert outcome.runs_completed == 1
         assert outcome.prevention_items_deferred == 1
         assert outcome.prevention_failures == ("PreventionPolicyError",)
-        assert outcome.failures == ("PreventionRuntimeError",)
-        assert sequence == ["prevention"]
+        assert outcome.failures == ()
+        assert outcome.applied_commits == (COMMIT_SHA,)
+        assert sequence.count("publish") == 1
         assert state.pending_event_revisions(mode=GuardianMode.PROPOSE_PREVENTION)
 
 
@@ -3872,6 +4260,7 @@ def test_edited_feedback_is_a_new_revision_and_reassessed(
 def test_mode_escalation_reuses_the_exact_cached_assessment(
     tmp_path: Path, runtime
 ) -> None:
+    """Reuse exact assessments when authorized mode escalation enables writes."""
     _base, _head, checkout, provider, broker, _sequence = runtime
     driver = FakeCodexDriver()
     with GuardianState(tmp_path / "state.sqlite3") as state:
@@ -3900,10 +4289,236 @@ def test_mode_escalation_reuses_the_exact_cached_assessment(
         assert state.pending_event_revisions(mode=GuardianMode.PREPARE) == ()
 
 
+def test_changed_edit_limit_retries_policy_rejection_without_rebilling(
+    tmp_path: Path, runtime
+) -> None:
+    """Reuse a paid assessment when changed policy permits a previously rejected patch."""
+    _base, _head, checkout, provider, broker, _sequence = runtime
+    driver = FakeCodexDriver()
+    config = _config(GuardianMode.APPLY_OWNED_TRANSLATIONS)
+    limited = replace(config, limits=replace(config.limits, max_value_edits_per_run=0))
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+
+        def poll(settings):
+            """Run the same retained evidence under a supplied policy configuration."""
+            return _controller(
+                tmp_path=tmp_path,
+                state=state,
+                config=settings,
+                checkout=checkout,
+                provider=provider,
+                driver=driver,
+                broker=broker,
+            ).poll_once()
+
+        assert poll(limited).applied_commits == ()
+        assert poll(limited).runs_started == 0
+        assert poll(config).applied_commits == (COMMIT_SHA,)
+        assert len(driver.calls) == 1
+
+
+@pytest.mark.parametrize("reply_fails", [False, True])
+def test_oversized_feedback_publishes_bounded_batch_and_keeps_remainder_pending(
+    tmp_path: Path, runtime, reply_fails: bool, monkeypatch,
+) -> None:
+    """Partial feedback stays retryable even after reply recovery and head movement."""
+    base, head, checkout, provider, broker, sequence = runtime
+    for root in (base, head):
+        with (root / "l10n/messages_en.properties").open("a") as stream:
+            stream.write("alpha=Alpha\n")
+        with (root / TARGET_PATH).open("a") as stream:
+            stream.write("alpha=Старый альфа\n")
+    config = _config(GuardianMode.APPLY_OWNED_TRANSLATIONS)
+    config = replace(config, limits=replace(config.limits, max_value_edits_per_run=1))
+    driver = TwoReplacementCodexDriver()
+    if reply_fails:
+        broker.reply_error = RuntimeError("reply transport failed")
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        controller = _controller(
+            tmp_path=tmp_path, state=state, config=config, checkout=checkout,
+            provider=provider, driver=driver, broker=broker,
+        )
+        first = controller.poll_once()
+        assert first.prepared_value_edits == 1
+        assert first.deferred_value_edits == 1
+        assert first.deferred_feedback_items == 1
+        assert sum(workspace.publications for workspace in checkout.workspaces) == 1
+        assert len(state.pending_event_revisions(mode=config.mode)) == 1
+        health = state.latest_health("guardian")
+        assert health.details["deferred_value_edits"] == 1
+        if reply_fails:
+            pending = state.pending_publications()[0]
+            # Replaying the real atomic finalizer must retain deferred status.
+            state.finalize_replied_publication(
+                publication_key=pending.publication_key,
+                summary="Recovered test publication", occurred_at=NOW,
+            )
+        assert len(state.pending_event_revisions(mode=config.mode)) == 1
+        assert state.status_snapshot(mode=config.mode).pending_revisions == 1
+
+        # Move to the exact published head, including the real applied bytes.
+        # Partial feedback must be reassessed and its remaining edit published.
+        target = head / TARGET_PATH
+        target.write_text(target.read_text().replace(
+            "Старый %0 был отклонён (%1). %2 %3",
+            "Отправка в %0 отклонена (%1). %2 %3",
+        ))
+        provider.snapshots = (_snapshot(pull=_pull(head_sha=COMMIT_SHA)),)
+        broker.reply_error = None
+        sequence.clear()
+        monkeypatch.setattr(__import__(__name__, fromlist=["COMMIT_SHA"]), "COMMIT_SHA", "d" * 40)
+
+        class RemainingDriver(TwoReplacementCodexDriver):
+            @staticmethod
+            def _with_alpha(result):
+                """Propose only the still-unfixed value at the new head."""
+                result = TwoReplacementCodexDriver._with_alpha(result)
+                return replace(result, feedback=(replace(
+                    result.feedback[0], replacements=result.feedback[0].replacements[1:],
+                ),))
+
+        second_driver = RemainingDriver()
+        second = _controller(
+            tmp_path=tmp_path, state=state, config=config, checkout=checkout,
+            provider=provider, driver=second_driver, broker=broker,
+        ).poll_once()
+        assert len(second_driver.calls) == 1
+        assert second.applied_commits == ("d" * 40,)
+        assert second.prepared_value_edits == 1
+        assert second.deferred_value_edits == 0
+        assert second.failures == ()
+        assert state.pending_event_revisions(mode=config.mode) == ()
+        assert state.status_snapshot(mode=config.mode).pending_revisions == 0
+        assert sum(workspace.publications for workspace in checkout.workspaces) == 2
+
+
+@pytest.mark.parametrize("count,limit", [(34, 30), (30, 30), (0, 0), (0, 30)])
+def test_bounded_replacements_account_for_every_unselected_value(count, limit) -> None:
+    """Selected and deferred values exactly partition a multi-feedback proposal."""
+    replacements = tuple(ProposedReplacement(
+        feedback_id=f"review_comment:{index // 3}", path=TARGET_PATH,
+        key=f"key{index}", locale="ru", source_value="Hello",
+        expected_value="Старое", proposed_value="Привет", confidence=0.99,
+        evidence=("Verified review text",),
+    ) for index in range(count))
+    selected, deferred = guardian_controller._bounded_replacements(replacements, max_changes=limit)
+    assert selected == replacements[:limit]
+    assert sum(deferred.values()) == max(count - limit, 0)
+    assert set(deferred) == {item.feedback_id for item in replacements[limit:]}
+
+
+def test_batch_cutoff_does_not_hide_conflicting_targets() -> None:
+    """An over-limit conflicting proposal cannot authorize its leading edit."""
+    replacement = ProposedReplacement(
+        feedback_id="review_comment:1", path=TARGET_PATH, key="greeting",
+        locale="ru", source_value="Hello", expected_value="Старое",
+        proposed_value="Привет", confidence=0.99, evidence="Verified review text",
+    )
+    with pytest.raises(guardian_controller.PatchPolicyError, match="duplicate"):
+        guardian_controller._bounded_replacements(
+            (replacement, replace(replacement, proposed_value="Иное")), max_changes=1,
+        )
+
+
+def test_prepare_does_not_repeat_a_nonretained_partial_batch(tmp_path: Path, runtime) -> None:
+    """Prepare keeps its bounded one-shot validation rather than inventing progress."""
+    base, head, checkout, provider, broker, _sequence = runtime
+    for root in (base, head):
+        with (root / "l10n/messages_en.properties").open("a") as stream:
+            stream.write("alpha=Alpha\n")
+        with (root / TARGET_PATH).open("a") as stream:
+            stream.write("alpha=Старый альфа\n")
+    config = _config(GuardianMode.PREPARE)
+    config = replace(config, limits=replace(config.limits, max_value_edits_per_run=1))
+    driver = TwoReplacementCodexDriver()
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        controller = _controller(
+            tmp_path=tmp_path, state=state, config=config, checkout=checkout,
+            provider=provider, driver=driver, broker=broker,
+        )
+        first = controller.poll_once()
+        second = controller.poll_once()
+        assert first.prepared_value_edits == 0
+        assert first.deferred_value_edits == 0
+        assert first.translation_policy_rejections == 1
+        assert second.runs_started == 0
+        assert len(driver.calls) == 1
+        assert all(workspace.publications == 0 for workspace in checkout.workspaces)
+
+
+@pytest.mark.parametrize("changed_file", ["config.yaml", "glossary.json"])
+def test_base_bundle_change_reconsiders_deterministic_patch_rejection(
+    tmp_path: Path, runtime, changed_file: str,
+) -> None:
+    """Bind rejected work to the actual trusted base config and glossary bytes."""
+    base, _head, checkout, provider, broker, _sequence = runtime
+    driver = FakeCodexDriver()
+    calls = []
+
+    def reject_first(**kwargs):
+        """Simulate a deterministic constraint that a config change corrects."""
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise guardian_controller.PatchPolicyError("test policy rejection")
+        return apply_replacements(**kwargs)
+
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        def poll():
+            """Reuse the durable rejection ledger across policy snapshots."""
+            controller = _controller(
+                tmp_path=tmp_path, state=state,
+                config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS),
+                checkout=checkout, provider=provider, driver=driver, broker=broker,
+                replacement_applier=reject_first,
+            )
+            return controller.poll_once()
+
+        assert poll().applied_commits == ()
+        assert poll().applied_commits == ()
+        assert len(calls) == 1
+        target = base / ".localize" / changed_file
+        target.write_text(target.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        assert poll().applied_commits == (COMMIT_SHA,)
+        assert len(calls) == 2
+
+
+def test_lint_policy_version_retries_rejection_without_repeating_model(
+    tmp_path: Path, runtime, monkeypatch,
+) -> None:
+    """Retry rejected patches after a validator fix through the normal ledger."""
+    _base, _head, checkout, provider, broker, _sequence = runtime
+    driver = FakeCodexDriver()
+    calls = []
+
+    def reject_first(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise guardian_controller.PatchPolicyError("old lint comparison rejected patch")
+        return apply_replacements(**kwargs)
+
+    monkeypatch.setattr(guardian_controller, "PATCH_VALIDATION_VERSION", 1, raising=False)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        def poll():
+            return _controller(
+                tmp_path=tmp_path, state=state,
+                config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS),
+                checkout=checkout, provider=provider, driver=driver, broker=broker,
+                replacement_applier=reject_first,
+            ).poll_once()
+
+        assert poll().translation_policy_rejections == 1
+        assert poll().runs_started == 0
+        monkeypatch.setattr(guardian_controller, "PATCH_VALIDATION_VERSION", 2)
+        assert poll().applied_commits == (COMMIT_SHA,)
+        assert len(calls) == 2
+        assert len(driver.calls) == 1
+
+
 def test_crash_after_model_success_reuses_durable_result_without_rebilling(
     tmp_path: Path,
     runtime,
 ) -> None:
+    """Recover a persisted model result without charging another session."""
     _base, _head, checkout, provider, broker, _sequence = runtime
     driver = FakeCodexDriver()
     with GuardianState(tmp_path / "state.sqlite3") as state:
@@ -4068,6 +4683,7 @@ def test_prepare_validates_in_ephemeral_checkout_without_remote_writes(
 def test_apply_signs_then_reverifies_immediately_before_normal_publish_and_reply(
     tmp_path: Path, runtime
 ) -> None:
+    """Bind signing, publication, and reply to their independent authority checks."""
     _base, _head, checkout, provider, broker, sequence = runtime
     driver = FakeCodexDriver()
     with GuardianState(tmp_path / "state.sqlite3") as state:
@@ -4083,6 +4699,9 @@ def test_apply_signs_then_reverifies_immediately_before_normal_publish_and_reply
 
         assert outcome.applied_commits == (COMMIT_SHA,)
         assert sequence == ["commit", "verify", "verify", "publish", "reply"]
+        assert [item.author_email for item in checkout.workspaces if item.commits] == [
+            "8+translation-service@users.noreply.github.com"
+        ]
         assert broker.verify_calls == [
             {
                 "pull_number": 12,
@@ -4492,11 +5111,14 @@ def test_repository_route_alias_preserves_open_authority_hashes() -> None:
 
 
 @pytest.mark.parametrize("race", ("edited", "deleted", "added"))
+@pytest.mark.parametrize("change_on_read", [1, 2, 3, 4])
 def test_recovery_never_replies_after_trusted_feedback_authority_changes(
     race: str,
+    change_on_read: int,
     tmp_path: Path,
     runtime,
 ) -> None:
+    """Preserve the published result while suppressing a now-unauthorized reply."""
     _base, _head, checkout, provider, broker, _sequence = runtime
     broker.reply_error = RuntimeError("connection dropped after publication")
     with GuardianState(tmp_path / "state.sqlite3") as state:
@@ -4544,7 +5166,21 @@ def test_recovery_never_replies_after_trusted_feedback_authority_changes(
             ),
             feedback=tuple(feedback),
         )
+        original_feedback = provider.snapshots[0].feedback
         provider.snapshots = (raced,)
+        if change_on_read > 1:
+            provider.snapshots = (replace(raced, feedback=original_feedback),)
+            revalidate = provider.revalidate_open_pull_request
+            reads = []
+
+            def change_second_read(*args):
+                """Race the final authority read without changing the pinned PR."""
+                reads.append(None)
+                if len(reads) == change_on_read:
+                    provider.snapshots = (raced,)
+                return revalidate(*args)
+
+            provider.revalidate_open_pull_request = change_second_read
         replies_before_recovery = len(broker.reply_calls)
         broker.reply_error = None
         assert state.acquire_lease(
@@ -4569,13 +5205,65 @@ def test_recovery_never_replies_after_trusted_feedback_authority_changes(
             lease_owner="test-owner",
         )
 
-        assert len(broker.reply_calls) == replies_before_recovery
+        assert len(broker.reply_calls) == replies_before_recovery + int(change_on_read >= 3)
+        assert broker.posted_replies == []
         assert state.pending_publications() == ()
+        assert state.get_run(pending.run_id).status == "completed"
+        assert state.publication_reply_terminal_reason(pending.publication_key) == (
+            "trusted_feedback_changed"
+        )
+
+
+@pytest.mark.parametrize("change_on_read", [1, 2])
+def test_feedback_edit_after_push_completes_commit_without_claiming_reply(
+    tmp_path: Path, runtime, change_on_read: int,
+) -> None:
+    """A bot acknowledgement race must not turn an applied commit into failed work."""
+    _base, _head, checkout, provider, broker, _sequence = runtime
+    original_reply = broker.post_commit_reply
+
+    def change_feedback_before_reply(**kwargs):
+        """Simulate a reviewer acknowledgement arriving after the signed push."""
+        revalidate = provider.revalidate_open_pull_request
+        reads = []
+
+        def changed_read(*args):
+            """Change only the review body on the selected post-push read."""
+            reads.append(None)
+            if len(reads) == change_on_read:
+                snapshot = provider.snapshots[0]
+                provider.snapshots = (replace(
+                    snapshot,
+                    feedback=(replace(snapshot.feedback[0], body="Fixed, thank you."),),
+                ),)
+            return revalidate(*args)
+
+        provider.revalidate_open_pull_request = changed_read
+        return original_reply(**kwargs)
+
+    broker.post_commit_reply = change_feedback_before_reply
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        outcome = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS),
+            checkout=checkout, provider=provider,
+            driver=FakeCodexDriver(), broker=broker,
+        ).poll_once()
+        assert outcome.runs_failed == 0
+        assert outcome.applied_commits == (COMMIT_SHA,)
+        assert state.pending_publications() == ()
+        assert state._connection.execute(
+            "SELECT COUNT(*) FROM publication_events WHERE phase='replied'"
+        ).fetchone()[0] == 0
+        assert state._connection.execute(
+            "SELECT reason FROM publication_reply_terminal_events"
+        ).fetchone()[0] == "trusted_feedback_changed"
 
 
 def test_recovery_abandons_publication_when_the_base_revision_moved(
     tmp_path: Path, runtime
 ) -> None:
+    """Keep a changed base fail-closed during publication recovery."""
     _base, _head, checkout, provider, broker, _sequence = runtime
     driver = FakeCodexDriver()
     broker.reply_error = RuntimeError("connection dropped after publication")
@@ -5267,6 +5955,117 @@ def test_head_checkout_failure_finishes_run_and_keeps_feedback_retryable(
         assert driver.calls == []
         assert state.pending_event_revisions(mode=GuardianMode.OBSERVE)
         assert state.reconcile_incomplete_runs(before=NOW + timedelta(days=1)) == ()
+
+
+@pytest.mark.parametrize(
+    ("published", "terminal_lineage"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_private_quality_uses_historical_original_head_after_guardian_push(
+    tmp_path: Path, runtime, published: bool, terminal_lineage: bool,
+) -> None:
+    base, head, checkout, provider, broker, _sequence = runtime
+    (head / TARGET_PATH).write_text(
+        "greeting=Push to %0 was rejected (%1). %2 %3\n",
+        encoding="utf-8",
+    )
+    policy = replace(
+        _policy(), quality_report_actor=TrustedActor("quality-reporter", 202, "User"),
+    )
+    live_head = COMMIT_SHA if published else HEAD_SHA
+    snapshot = _snapshot(pull=_pull(head_sha=live_head))
+    revisions: list[ExactRevision | HistoricalRevision] = []
+
+    @contextmanager
+    def checkout_at_live_ref(revision):
+        revisions.append(revision)
+        if isinstance(revision, ExactRevision) and revision.sha != live_head:
+            raise RuntimeError("remote ref did not resolve to the exact expected SHA")
+        with checkout(revision) as workspace:
+            yield workspace
+
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        if terminal_lineage:
+            event = authorize_feedback(
+                policy=policy, snapshot=_snapshot(),
+                path_locales={TARGET_PATH: "ru"}, changed_locales=("ru",),
+            ).events[0]
+            revision = state.record_feedback_event(event, observed_at=NOW)
+            run_id = state.start_run(
+                repository=policy.base_repo, locale="ru",
+                mode=GuardianMode.APPLY_OWNED_TRANSLATIONS, started_at=NOW,
+            )
+            publication = dict(
+                run_id=run_id, repository=policy.base_repo, pr_number=12,
+                original_head_sha=HEAD_SHA, base_sha=BASE_SHA,
+                commit_sha=COMMIT_SHA, publication_actor_id=8,
+                publication_actor_type="User",
+                event_revision_ids=(revision.revision_id,),
+                open_source=OpenPullAuthorityReference(
+                    repository=policy.base_repo, repository_id=42,
+                    pull_id=9001, pr_number=12,
+                    authority_digest="1" * 64, head_sha=HEAD_SHA,
+                    base_sha=BASE_SHA, feedback_digest="2" * 64,
+                ),
+            )
+            publication_key = state.record_publication_event(
+                **publication, phase="prepared",
+                completion_actions=(
+                    (revision.revision_id, "completed", {"outcome": "applied"}),
+                ),
+                occurred_at=NOW,
+            )
+            state.record_publication_event(
+                **publication, phase="published", occurred_at=NOW,
+            )
+            state.finalize_publication_reply_terminal(
+                publication_key=publication_key,
+                reason="trusted_feedback_changed",
+                summary="Feedback changed before reply.", occurred_at=NOW,
+            )
+        controller = _controller(
+            tmp_path=tmp_path,
+            state=state,
+            config=_config(GuardianMode.OBSERVE, policies=(policy,)),
+            checkout=checkout_at_live_ref,
+            provider=provider,
+            driver=FakeCodexDriver(),
+            broker=broker,
+        )
+        scope = guardian_controller._target_scope(
+            base_root=base, policy=policy, changed_files=snapshot.changed_files,
+        )
+        authorized = controller._authorize_open_feedback(
+            policy=policy, snapshot=snapshot, scope=scope,
+            evidence_head_sha=None if terminal_lineage else HEAD_SHA,
+        )
+        if not published or terminal_lineage:
+            # The commit transport must preserve the same anchor, including
+            # the prior head bound by the durable completed publication above.
+            urls, evidence_sha = controller._private_quality_commit_evidence(
+                policy=policy, snapshot=snapshot, events=authorized.events,
+            )
+            assert urls == (f"https://github.com/acme/widgets/commit/{HEAD_SHA}",)
+            assert evidence_sha == HEAD_SHA
+        else:
+            # Merely supplying an old evidence head is not durable authority.
+            with pytest.raises(ValueError, match="quality"):
+                controller._private_quality_commit_evidence(
+                    policy=policy, snapshot=snapshot, events=authorized.events,
+                )
+
+    assert len(revisions) == 1
+    if published:
+        assert isinstance(revisions[0], HistoricalRevision)
+        assert revisions[0].sha == HEAD_SHA
+        assert revisions[0].pull_number is None
+    else:
+        assert isinstance(revisions[0], ExactRevision)
+        assert revisions[0].sha == HEAD_SHA
+    findings = [event for event in authorized.events if event.kind == "quality_finding"]
+    assert len(findings) == 1
+    assert findings[0].head_sha == live_head
+    assert guardian_controller.parse_report(findings[0].body)["head_sha"] == HEAD_SHA
 
 
 def test_non_target_or_wrong_source_locale_pr_is_rejected_before_model(
@@ -7338,6 +8137,7 @@ def test_open_pull_processing_queries_only_its_pending_feedback_workset(
     runtime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Avoid cross-PR pending-work scans while processing an exact pull."""
     _base, _head, checkout, provider, broker, _sequence = runtime
     original = GuardianState.pending_event_revisions
     calls: list[int | None] = []
@@ -7349,8 +8149,11 @@ def test_open_pull_processing_queries_only_its_pending_feedback_workset(
         pr_number: int | None = None,
         locale: str | None = None,
         mode: GuardianMode | str | None = None,
+        policy_digest: str | None = None,
+        patch_validation_version: int | None = None,
         limit: int = 500,
     ):
+        """Record the exact PR boundary used for pending-feedback selection."""
         calls.append(pr_number)
         if repository is not None and pr_number is None:
             raise AssertionError("repository-wide pending feedback was loaded")
@@ -7360,6 +8163,8 @@ def test_open_pull_processing_queries_only_its_pending_feedback_workset(
             pr_number=pr_number,
             locale=locale,
             mode=mode,
+            policy_digest=policy_digest,
+            patch_validation_version=patch_validation_version,
             limit=limit,
         )
 
@@ -8776,6 +9581,8 @@ def test_transient_remediation_publication_failure_retries_without_new_model_cal
     tmp_path: Path,
     runtime,
 ) -> None:
+    from localize.guardian.diagnostics import failure_audit
+
     base, head, checkout, _provider, broker, _sequence = runtime
     pull = _pull(state="closed")
     provider = FakeHistoricalSnapshotProvider((_snapshot(pull=pull),))
@@ -8804,7 +9611,13 @@ def test_transient_remediation_publication_failure_retries_without_new_model_cal
             current_base_provider=FakeCurrentBaseProvider(),
             remediation_runner=remediation,
         )
-        first = controller.poll_once()
+        with failure_audit(state):
+            first = controller.poll_once()
+        diagnostic = state.latest_health("guardian-failure")
+        assert diagnostic.details["repository"] == pull.repository
+        assert diagnostic.details["pull_numbers"] == [pull.number]
+        assert diagnostic.details["run_id"]
+        assert "temporary draft failure" not in str(diagnostic.details)
         remediation.publish_error = None
         second = controller.poll_once()
 
@@ -9386,3 +10199,377 @@ def test_enabling_prevention_cap_revisits_prior_historical_recurrence(
     assert second.historical_pull_requests_completed == 1
     assert len(prevention.propose_calls) == 1
     assert len(driver.calls) == 1
+
+
+def test_open_prevention_receives_exact_real_data_corpus_for_impact_gate(
+    tmp_path: Path, runtime
+) -> None:
+    from localize.guardian.real_data_impact import RealDataCorpus
+
+    base, head, checkout, provider, broker, sequence = runtime
+    (head / TARGET_PATH).write_text(
+        "greeting=Новый %0 был отклонён (%1). %2 %3\n",
+        encoding="utf-8",
+    )
+    observed: dict[str, object] = {}
+
+    class CorpusRecordingPrevention(FakePreventionRunner):
+        def propose(self, **kwargs: object) -> PreventionBatchOutcome:
+            corpus = kwargs["real_data"]
+            assert isinstance(corpus, RealDataCorpus)
+            repo = corpus.root / "repo"
+            observed["target"] = (repo / TARGET_PATH).read_text(encoding="utf-8")
+            observed["source"] = (repo / "l10n/messages_en.properties").read_text(
+                encoding="utf-8"
+            )
+            observed["config"] = (corpus.root / "config.yaml").read_text(
+                encoding="utf-8"
+            )
+            observed["diff"] = (corpus.root / "diff.txt").read_text(encoding="utf-8")
+            observed["root"] = corpus.root
+            return super().propose(**kwargs)
+
+    prevention = CorpusRecordingPrevention(sequence=sequence)
+    policy = replace(_policy(), prevention=_prevention_policy())
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        _controller(
+            tmp_path=tmp_path,
+            state=state,
+            config=_config(GuardianMode.PROPOSE_PREVENTION, policies=(policy,)),
+            checkout=checkout,
+            provider=provider,
+            driver=RecurrenceCodexDriver(),
+            broker=broker,
+            prevention_runner=prevention,
+        ).poll_once()
+
+    assert observed["target"] == "greeting=Новый %0 был отклонён (%1). %2 %3\n"
+    # Source text and operator profile come from the trusted base, never head.
+    assert observed["source"] == (base / "l10n/messages_en.properties").read_text(
+        encoding="utf-8"
+    )
+    assert observed["config"] == (base / ".localize/config.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert f"+++ b/{TARGET_PATH}" in observed["diff"]
+    assert "-greeting=Старый" in observed["diff"]
+    assert "+greeting=Новый" in observed["diff"]
+    assert not Path(observed["root"]).exists()
+
+
+def test_historical_prevention_measures_current_base_real_data(
+    tmp_path: Path,
+    runtime,
+) -> None:
+    from localize.guardian.real_data_impact import RealDataCorpus
+
+    base, head, checkout, _provider, broker, _sequence = runtime
+    observed: dict[str, str] = {}
+
+    class CorpusRecordingPrevention(FakePreventionRunner):
+        def propose(self, **kwargs: object) -> PreventionBatchOutcome:
+            corpus = kwargs["real_data"]
+            assert isinstance(corpus, RealDataCorpus)
+            observed["target"] = (corpus.root / "repo" / TARGET_PATH).read_text(
+                encoding="utf-8"
+            )
+            observed["diff"] = (corpus.root / "diff.txt").read_text(encoding="utf-8")
+            return super().propose(**kwargs)
+
+    prevention = CorpusRecordingPrevention()
+    policy = replace(_historical_policy(), prevention=_prevention_policy())
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        _controller(
+            tmp_path=tmp_path,
+            state=state,
+            config=_config(GuardianMode.PROPOSE_PREVENTION, policies=(policy,)),
+            checkout=checkout,
+            provider=FakeSnapshotProvider(()),
+            driver=RecurrenceCodexDriver(),
+            broker=broker,
+            prevention_runner=prevention,
+            historical_snapshot_provider=FakeHistoricalSnapshotProvider(
+                (_snapshot(pull=_pull(state="closed")),)
+            ),
+            historical_checkout_factory=FakeHistoricalCheckoutFactory(
+                base,
+                head,
+                tmp_path,
+            ),
+            current_base_provider=FakeCurrentBaseProvider(),
+        ).poll_once()
+
+    assert len(prevention.propose_calls) == 1
+    assert observed["target"] == (base / TARGET_PATH).read_text(encoding="utf-8")
+    assert observed["diff"] == ""
+
+
+@pytest.mark.parametrize("withdrawal", [None, *range(9)])
+@pytest.mark.parametrize("history", ["none", "quiet", "quiet_pending", "held"])
+@pytest.mark.parametrize("real_feedback", [False, True])
+def test_clean_review_reporting_does_not_recreate_noop_comments(
+    tmp_path: Path, runtime, history: str, real_feedback: bool, withdrawal: int | None
+) -> None:
+    """Suppress clean-review retries without losing real feedback or audit rows."""
+    from tests.unit.test_guardian_reporting import (
+        CLEAN_CODERABBIT_SUMMARY, _clean_review_details,
+    )
+    from localize.guardian.reporting import report_body, report_key, summary_body
+
+    _base, _head, checkout, _provider, broker, _sequence = runtime
+    policy = replace(_policy(), trusted_bots={
+        "ru": (TrustedActor("coderabbitai[bot]", 999, "Bot"),),
+    })
+    feedback = replace(
+        _feedback(body=CLEAN_CODERABBIT_SUMMARY), kind=FeedbackKind.ISSUE_COMMENT,
+        author_login="coderabbitai[bot]", author_id=999, author_type="Bot",
+        path=None, line=None,
+    )
+    if withdrawal is not None:
+        replies = json.loads((Path(__file__).parent / "fixtures/guardian_5059_withdrawals.json").read_text())
+        feedback = replace(feedback, body=replies[withdrawal]["body"],
+                           kind=FeedbackKind.REVIEW_COMMENT, path=TARGET_PATH,
+                           in_reply_to_id=4162550637)
+    snapshot = _snapshot(feedback=(feedback, _feedback(source_id="45")) if real_feedback else (feedback,))
+    authorized = authorize_feedback(
+        policy=policy, snapshot=snapshot,
+        path_locales={TARGET_PATH: "ru"}, changed_locales=("ru",),
+    )
+    source = GuardianController._open_pull_authority_reference(
+        policy=policy, snapshot=snapshot, authorized=authorized,
+    )
+    # Match #1913: a clean review can still seed private prevention analysis.
+    details = _clean_review_details(report_policy_digest="policy",
+                                   recurrence_candidates=1, prevention_pending=True)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        event = authorized.events[0]
+        revision = state.record_feedback_event(event, observed_at=NOW)
+        run_id = state.start_run(repository=policy.base_repo, locale="ru",
+                                 mode=GuardianMode.APPLY_OWNED_TRANSLATIONS, started_at=NOW)
+        state.record_action(run_id=run_id, event_revision_id=revision.revision_id,
+                            action="assess", status="completed", details=details, occurred_at=NOW)
+        current = [(event, revision)]
+        if real_feedback:
+            human = authorized.events[1]
+            human_revision = state.record_feedback_event(human, observed_at=NOW)
+            state.record_action(
+                run_id=run_id, event_revision_id=human_revision.revision_id,
+                action="assess", status="completed", occurred_at=NOW,
+                details=details | {"outcome": "needs_human", "verdict": "needs_human",
+                                   "report_reason": "glossary_conflict", "decision_required": True},
+            )
+            current.append((human, human_revision))
+        assert state.acquire_lease(
+            name="guardian:poll", owner="test-owner", ttl_seconds=60, now=NOW
+        )
+        controller = _controller(
+            tmp_path=tmp_path, state=state,
+            config=replace(_config(GuardianMode.APPLY_OWNED_TRANSLATIONS), repositories=(policy,)),
+            checkout=checkout, provider=FakeSnapshotProvider((snapshot,)),
+            driver=FakeCodexDriver(), broker=broker,
+        )
+        if history != "none":
+            body = report_body(details, repository=policy.base_repo,
+                               feedback_id=event.feedback_id, pull_number=12)
+            key = report_key(repository_id=42, pull_number=12,
+                             feedback_id=event.feedback_id, body=body)
+            state.queue_feedback_report(key, {
+                "body": body, "repository_id": 42, "pr_number": 12,
+                "feedback_id": event.feedback_id,
+            })
+            url = "https://github.com/acme/widgets/pull/12#issuecomment-700"
+            state.finish_feedback_report(key, result={"url": url, "body": body})
+            prior_body = summary_body([{
+                "url": url, "disposition": "needs_human" if history == "held" else "not_applicable",
+                "decision_required": history == "held",
+            }], repository=policy.base_repo, pull_number=12)
+            summary_key = report_key(repository_id=42, pull_number=12,
+                                     feedback_id="summary", body=prior_body)
+            state.queue_feedback_report(summary_key, {
+                "summary": True, "body": prior_body, "repository_id": 42, "pr_number": 12,
+            })
+            if history != "quiet_pending":
+                state.finish_feedback_report(summary_key, result={
+                    "url": "https://github.com/acme/widgets/pull/12#issuecomment-701", "body": prior_body,
+                })
+
+        for _ in range(2):
+            controller._flush_feedback_reports(
+                policy=policy, snapshot=snapshot, current=current,
+                open_source=source, lease_owner="test-owner", policy_digest="policy",
+            )
+        assert len(broker.feedback_reports) == int(real_feedback)
+        if real_feedback:
+            assert "1 needs human" in broker.feedback_summary.body
+            assert "not applicable" not in broker.feedback_summary.body
+        elif history == "held":
+            assert "withdrawal does not approve" in broker.feedback_summary.body
+        else:
+            assert broker.feedback_summary is None
+        assert state.latest_feedback_report(revision.revision_id) == details
+        assert state.latest_health("feedback-reporting").status == "ok"
+        if history in {"quiet", "quiet_pending"}:
+            assert state.feedback_report_delivery(key)["status"] == "posted"
+            assert prior_body in state.feedback_summary_bodies(42, 12)
+        if history == "quiet_pending":
+            assert state.feedback_report_delivery(summary_key)["status"] == "superseded"
+            assert state.feedback_reporting_counts()[0] == 0
+
+
+def _private_commit_event(*, key="greeting", **overrides):
+    """Build the same identity-bound evidence as the private deterministic scanner."""
+    from localize.guardian.quality_reports import build_report, finding, render_report, value_digest
+
+    body = render_report(build_report(
+        _pull(), path=TARGET_PATH, locale="ru",
+        findings=[finding(key, "Hello world", "Hello world", "source_echo")],
+    ))
+    values = dict(
+        repository="acme/widgets", pr_number=12, kind="quality_finding",
+        event_id="internal:quality:" + value_digest(TARGET_PATH + "\x00" + key),
+        author="quality-reporter", author_id=202, author_type="User", body=body,
+        head_sha=HEAD_SHA, base_sha=BASE_SHA, locale="ru", path=TARGET_PATH,
+        html_url=f"https://github.com/acme/widgets/commit/{HEAD_SHA}",
+    )
+    values.update(overrides)
+    return FeedbackEvent(**values)
+
+
+def test_private_commit_evidence_deduplicates_anchor_without_losing_findings(tmp_path, runtime):
+    """Multiple authorized internal findings keep one source URL for their shared head."""
+    _base, _head, checkout, provider, broker, _sequence = runtime
+    policy = replace(_policy(), quality_report_actor=TrustedActor("quality-reporter", 202, "User"))
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        controller = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS, policies=(policy,)),
+            checkout=checkout, provider=provider, driver=FakeCodexDriver(), broker=broker,
+        )
+        event = _private_commit_event()
+        urls, anchor = controller._private_quality_commit_evidence(
+            policy=policy, snapshot=_snapshot(), events=(event, _private_commit_event(key="alpha")),
+        )
+    assert urls == (f"https://github.com/acme/widgets/commit/{HEAD_SHA}",)
+    assert anchor == HEAD_SHA
+
+
+@pytest.mark.parametrize("change", [
+    {"head_sha": "e" * 40}, {"base_sha": "e" * 40}, {"repository": "other/widgets"},
+    {"pr_number": 13}, {"author_id": 999}, {"author_type": "Bot"},
+    {"deleted": True}, {"path": "l10n/messages_de.properties"},
+    {"locale": "de"}, {"event_id": "forged-quality-event"},
+])
+def test_private_commit_evidence_rejects_stale_or_unbound_event(tmp_path, runtime, change):
+    """Only the current policy-bound local finding may supply private commit evidence."""
+    _base, _head, checkout, provider, broker, _sequence = runtime
+    policy = replace(_policy(), quality_report_actor=TrustedActor("quality-reporter", 202, "User"))
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        controller = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS, policies=(policy,)),
+            checkout=checkout, provider=provider, driver=FakeCodexDriver(), broker=broker,
+        )
+        with pytest.raises(ValueError, match="quality"):
+            controller._private_quality_commit_evidence(
+                policy=policy, snapshot=_snapshot(), events=(_private_commit_event(**change),),
+            )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_private_quality_publication_passes_separate_evidence_to_workspace(
+    tmp_path, runtime, monkeypatch, mixed,
+):
+    """Run the full publication flow with real URL validators for private and mixed input."""
+    from localize.guardian.workspace import _validate_feedback_urls, _validate_quality_finding_urls
+
+    base, head, checkout, provider, broker, _sequence = runtime
+    source = "Push to %0 was rejected (%1). %2 %3"
+    (head / TARGET_PATH).write_text(f"greeting={source}\nalpha=Старый альфа\n", encoding="utf-8")
+    source_path = base / "l10n/messages_en.properties"
+    source_path.write_text(source_path.read_text() + "alpha=Alpha message\n", encoding="utf-8")
+    policy = replace(_policy(), quality_report_actor=TrustedActor("quality-reporter", 202, "User"))
+    if not mixed:
+        provider.snapshots = (replace(_snapshot(), feedback=()),)
+
+    class QualityDriver(FakeCodexDriver):
+        def run(self, task, *, success_observer=None, **kwargs):
+            """Correct the exact source echo while preserving normal result persistence."""
+            def corrected(result):
+                """Return one correction per item without duplicate target keys."""
+                feedback_ids = json.loads((task.evidence_dir / "manifest.json").read_text())["feedback_ids"]
+                decision = result.feedback[0]
+                return replace(result, feedback=tuple(
+                    replace(decision, feedback_id=feedback_id, replacements=tuple(
+                        replace(replacement, expected_value=source)
+                        if feedback_id.startswith("quality_finding:") else
+                        replace(replacement, key="alpha", expected_value="Старый альфа",
+                                proposed_value="Исправленный альфа")
+                        for replacement in decision.replacements
+                    )) for feedback_id in feedback_ids
+                ))
+            def persist(attempt, usage, result):
+                """Persist the same corrected response returned to the controller."""
+                if success_observer is not None:
+                    success_observer(attempt, usage, corrected(result))
+            return corrected(super().run(task, success_observer=persist, **kwargs))
+
+    commit_calls = []
+    original_commit = FakeWorkspace.commit_validated_changes
+
+    def checked_commit(workspace, **kwargs):
+        """Enforce the real boundary rather than silently accepting arbitrary fake kwargs."""
+        commit_calls.append(kwargs)
+        revision = ExactRevision(
+            host="github.com", owner="contributor", repository="widgets",
+            ref="refs/heads/localize/russian", sha=workspace.original_sha,
+        )
+        assert kwargs["quality_finding_head_sha"] == HEAD_SHA
+        assert _validate_quality_finding_urls(
+            revision, kwargs["pull_number"], kwargs["quality_finding_urls"],
+            feedback_repository=kwargs["feedback_repository"],
+            quality_finding_head_sha=kwargs["quality_finding_head_sha"],
+        ) == (f"https://github.com/acme/widgets/commit/{HEAD_SHA}",)
+        if mixed:
+            assert _validate_feedback_urls(
+                revision, kwargs["pull_number"], kwargs["feedback_urls"],
+                feedback_repository=kwargs["feedback_repository"],
+            ) == ("https://github.com/acme/widgets/pull/12#discussion_r44",)
+        else:
+            assert kwargs["feedback_urls"] == ()
+        return original_commit(workspace, **kwargs)
+
+    monkeypatch.setattr(FakeWorkspace, "commit_validated_changes", checked_commit)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        outcome = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.APPLY_OWNED_TRANSLATIONS, policies=(policy,)),
+            checkout=checkout, provider=provider, driver=QualityDriver(), broker=broker,
+        ).poll_once()
+        assert outcome.failures == ()
+        assert outcome.applied_commits == (COMMIT_SHA,)
+        assert state.pending_publications() == ()
+    assert len(commit_calls) == 1
+
+
+@pytest.mark.parametrize("decline", [True, False])
+def test_prevention_disposition_controls_whole_poll_health(tmp_path, runtime, decline):
+    base, head, checkout, provider, broker, sequence = runtime
+    policy = replace(_historical_policy(remediation=True), prevention=_prevention_policy())
+    prevention = FakePreventionRunner(result=PreventionBatchOutcome(
+        declined=1 if decline else 0, failures=() if decline else ("PreventionPolicyError",)))
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        controller = _controller(
+            tmp_path=tmp_path, state=state,
+            config=_config(GuardianMode.PROPOSE_PREVENTION, policies=(policy,)),
+            checkout=checkout, provider=FakeSnapshotProvider(()), driver=RecurrenceCodexDriver(),
+            broker=broker, prevention_runner=prevention,
+            historical_snapshot_provider=FakeHistoricalSnapshotProvider((_snapshot(pull=_pull(state="closed")),)),
+            historical_checkout_factory=FakeHistoricalCheckoutFactory(base, head, tmp_path),
+            current_base_provider=FakeCurrentBaseProvider(), remediation_runner=FakeRemediationRunner(),
+        )
+        result = controller.poll_once()
+        audit = state.latest_health("guardian")
+        assert audit.status == ("ok" if decline else "failed")
+        assert result.prevention_items_declined == int(decline)
+        assert audit.details['prevention_items_declined'] == int(decline)
+        assert bool(result.prevention_failures) is not decline

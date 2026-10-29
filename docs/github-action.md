@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
-      - uses: bisq-network/localize-pipeline@v0.1.20
+      - uses: bisq-network/localize-pipeline@v0.1.21
         with:
           config-file: config.yaml
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -101,7 +101,7 @@ a dedicated machine user:
 5. Pass the signing inputs to the action:
 
 ```yaml
-      - uses: bisq-network/localize-pipeline@v0.1.20
+      - uses: bisq-network/localize-pipeline@v0.1.21
         with:
           config-file: config.yaml
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -162,12 +162,63 @@ localization_formats:
 The action, quality gate, semantic reviewer, and PR publisher all read the same
 profile list.
 
+The changed-entry gate also applies existing `semantic_quality_rules` to current
+targets whose source values changed since the action's `diff-base`, including
+source changes already committed upstream. It compares parsed values, so a
+formatting-only source edit does not audit unrelated keys. Ignored keys, locale
+filters and configured format/layout profiles still apply. These additional
+entries run configured rules only; they do not enable a full-tree heuristic or
+AI review. A run with no generated target edits still produces a deterministic
+report and fails if this source-change audit blocks.
+
+For the standalone command, supply a reachable, trusted Git baseline:
+
+```bash
+localize quality-gate --repo-root /path/to/repo \
+  --input-folder /path/to/repo/locales --config /path/to/config.yaml \
+  --validation-summary /path/to/validation.json \
+  --output-json /path/to/report.json --output-markdown /path/to/report.md \
+  --source-diff-base BASE_COMMIT
+```
+
+`--changed-files` remains required unless `--source-diff-base` explicitly enables
+this source audit. Use `HEAD` to check staged or working-tree source edits; use
+the pre-change commit for already-committed changes. The comparison uses the
+baseline's merge base with `HEAD`, matching translation change detection. A
+missing or invalid baseline fails the configured-rule audit. With no configured
+rules, source enumeration is skipped. This checks the stated rules, not general
+natural-language equivalence; use `semantic_qa_audit_scope: all` for an intentional
+full audit.
+
+## Reviewed source-identical values
+
+Some complete UI values legitimately match English in a particular locale.
+After human review, the quality gate can exempt those exact values:
+
+```yaml
+quality_gate:
+  source_identical_allowlist:
+    cs: ["Internet"]
+```
+
+Matching ignores surrounding whitespace and case, but not words within a phrase:
+`Internet` does not exempt `Internet connection`. Locale codes must match the
+configured codes exactly; `"*"` applies to every locale and should be used sparingly.
+The default is empty. Prefer locale-specific values, not broad exceptions.
+
+This affects only the quality gate's source-identical classification. Unlisted
+values still face the existing thresholds and overwrite checks; placeholder,
+encoding and other validation failures still block publication. It does not
+change per-key translation validation, repair existing translations, or fix the
+source-overwrite defect addressed separately in #177. Do not add exemptions merely
+to make a failing run green.
+
 ## Local Or Self-Hosted Models
 
 Use `api-base-url` for any OpenAI-compatible endpoint:
 
 ```yaml
-      - uses: bisq-network/localize-pipeline@v0.1.20
+      - uses: bisq-network/localize-pipeline@v0.1.21
         with:
           config-file: config.yaml
           api-base-url: http://localhost:11434/v1
@@ -186,7 +237,7 @@ For custom adapters, install the package and list the adapter modules with the
 first-class plugin inputs:
 
 ```yaml
-      - uses: bisq-network/localize-pipeline@v0.1.20
+      - uses: bisq-network/localize-pipeline@v0.1.21
         with:
           config-file: config.yaml
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -218,7 +269,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
-      - uses: bisq-network/localize-pipeline@v0.1.20
+      - uses: bisq-network/localize-pipeline@v0.1.21
         with:
           config-file: config.yaml
           diff-base: ${{ github.event.pull_request.base.sha }}

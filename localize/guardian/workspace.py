@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 from localize.guardian.deadline import PollDeadline
 from localize.guardian.deadline import PollDeadlineExceeded
+from localize.guardian.diagnostics import git_failure
 from localize.guardian.executable_trust import require_absolute_trusted_executable
 from localize.guardian.filesystem_trust import resolve_trusted_private_directory
 from localize.guardian.models import SigningFormat
@@ -479,13 +480,19 @@ class _GitRunner:
                 except PollDeadlineExceeded:
                     raise
             operation = arguments[0] if arguments else "command"
-            raise WorkspaceError(f"git {operation} timed out") from exc
+            raise git_failure(WorkspaceError(f"git {operation} timed out"),
+                              operation=operation, reason="timeout") from exc
         except OSError as exc:
             operation = arguments[0] if arguments else "command"
-            raise WorkspaceError(f"git {operation} could not start") from exc
+            raise git_failure(WorkspaceError(f"git {operation} could not start"),
+                              operation=operation, reason="could_not_start") from exc
         if check and completed.returncode != 0:
             operation = arguments[0] if arguments else "command"
-            raise WorkspaceError(f"git {operation} failed with exit code {completed.returncode}")
+            raise git_failure(
+                WorkspaceError(f"git {operation} failed with exit code {completed.returncode}"),
+                operation=operation, returncode=completed.returncode,
+                output=completed.stderr + completed.stdout,
+            )
         return completed
 
     def revision(self, expression: str) -> str:
@@ -527,6 +534,7 @@ def _split_nul_paths(output: str) -> tuple[str, ...]:
 
 
 def _porcelain_status(runner: _GitRunner) -> tuple[tuple[str, str], ...]:
+    """Decode NUL-delimited tracked, untracked, and ignored working-tree status."""
     output = runner.run(
         ("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching")
     ).stdout
@@ -550,7 +558,22 @@ def _porcelain_status(runner: _GitRunner) -> tuple[tuple[str, str], ...]:
     return tuple(entries)
 
 
+def _initialize_exact_checkout(runner: _GitRunner) -> None:
+    """Create a checkout whose Git attributes preserve exact repository bytes."""
+    runner.run(("init", "--quiet"))
+    if runner.deadline is not None:
+        runner.deadline.require_remaining()
+    # Review and commit stored blob bytes, not transformations selected by
+    # untrusted repository attributes. In particular, text attributes added
+    # without renormalization can make a fresh checkout appear dirty.
+    # info/attributes takes precedence without changing any tracked file.
+    attributes = runner.path / ".git" / "info" / "attributes"
+    with attributes.open("x", encoding="utf-8") as stream:
+        stream.write("* -text -filter -ident -working-tree-encoding\n")
+
+
 def _validate_regular_tracked_file(root: Path, runner: _GitRunner, relative_path: str) -> None:
+    """Reject links and non-regular paths before accepting a tracked file."""
     current = root
     for index, component in enumerate(PurePosixPath(relative_path).parts):
         current = current / component
@@ -633,17 +656,12 @@ def _validate_regular_candidate_file(
     return True
 
 
-def _validate_feedback_urls(
-    revision: ExactRevision,
-    pull_number: int,
-    feedback_urls: Sequence[str],
-    *,
-    feedback_repository: str | None = None,
-) -> tuple[str, ...]:
+def _feedback_repository_parts(
+    revision: ExactRevision, pull_number: int, feedback_repository: str | None,
+) -> tuple[str, str]:
+    """Validate the PR number and repository shared by both evidence channels."""
     if isinstance(pull_number, bool) or not isinstance(pull_number, int) or pull_number <= 0:
         raise ValueError("pull_number must be a positive integer")
-    if not feedback_urls:
-        raise ValueError("at least one feedback URL is required")
     if feedback_repository is None:
         feedback_owner = revision.owner
         feedback_name = revision.repository
@@ -655,6 +673,22 @@ def _validate_feedback_urls(
             feedback_name
         ):
             raise ValueError("feedback_repository must use owner/name form")
+    return feedback_owner, feedback_name
+
+
+def _validate_feedback_urls(
+    revision: ExactRevision,
+    pull_number: int,
+    feedback_urls: Sequence[str],
+    *,
+    feedback_repository: str | None = None,
+) -> tuple[str, ...]:
+    """Accept only canonical reviewer-comment links for the exact pull request."""
+    feedback_owner, feedback_name = _feedback_repository_parts(
+        revision, pull_number, feedback_repository,
+    )
+    if not feedback_urls:
+        raise ValueError("at least one feedback URL is required")
     expected_paths = {
         f"/{feedback_owner}/{feedback_name}/pull/{pull_number}",
         f"/{feedback_owner}/{feedback_name}/issues/{pull_number}",
@@ -682,6 +716,33 @@ def _validate_feedback_urls(
     if len(set(normalized)) != len(normalized):
         raise ValueError("feedback URLs must be unique")
     return tuple(sorted(normalized))
+
+
+def _validate_quality_finding_urls(
+    revision: ExactRevision,
+    pull_number: int,
+    quality_finding_urls: Sequence[str],
+    *,
+    feedback_repository: str | None,
+    quality_finding_head_sha: str | None,
+) -> tuple[str, ...]:
+    """Bind private evidence to the controller's exact authorized source anchor.
+
+    The controller derives this anchor from current immutable evidence or its
+    durable Guardian publication lineage. Public feedback never uses this path.
+    """
+    owner, name = _feedback_repository_parts(revision, pull_number, feedback_repository)
+    if not quality_finding_urls:
+        if quality_finding_head_sha is not None:
+            raise ValueError("private quality anchor requires finding URLs")
+        return ()
+    if (not isinstance(quality_finding_head_sha, str)
+            or not _SHA_RE.fullmatch(quality_finding_head_sha)):
+        raise ValueError("private quality findings require an exact evidence SHA")
+    expected = f"https://{revision.host}/{owner}/{name}/commit/{quality_finding_head_sha}"
+    if any(url != expected for url in quality_finding_urls):
+        raise ValueError("private quality URL does not match the exact evidence anchor")
+    return (expected,)
 
 
 def _validate_historical_feedback_urls(
@@ -1002,6 +1063,8 @@ class GuardianWorkspace:
         pull_number: int,
         feedback_urls: Sequence[str],
         feedback_repository: str | None = None,
+        quality_finding_urls: Sequence[str] = (),
+        quality_finding_head_sha: str | None = None,
         sign: bool = True,
         signing_key: str | None = None,
         signing_environment: Mapping[str, str] | None = None,
@@ -1025,11 +1088,17 @@ class GuardianWorkspace:
         normalized_paths = tuple(sorted(_normalize_relative_path(path) for path in expected_paths))
         if not normalized_paths or len(set(normalized_paths)) != len(normalized_paths):
             raise ValueError("expected_paths must contain unique changed files")
-        normalized_feedback = _validate_feedback_urls(
-            self.revision,
-            pull_number,
-            feedback_urls,
+        normalized_quality = _validate_quality_finding_urls(
+            self.revision, pull_number, quality_finding_urls,
             feedback_repository=feedback_repository,
+            quality_finding_head_sha=quality_finding_head_sha,
+        )
+        normalized_feedback = (
+            _validate_feedback_urls(
+                self.revision, pull_number, feedback_urls,
+                feedback_repository=feedback_repository,
+            )
+            if feedback_urls or not normalized_quality else ()
         )
 
         if self._runner.revision("HEAD^{commit}") != self.original_sha:
@@ -1051,10 +1120,16 @@ class GuardianWorkspace:
             "",
             "Created by the Localize Guardian bot.",
             "",
-            "Validated feedback:",
-            *(f"- {url}" for url in normalized_feedback),
-            "",
         ]
+        if normalized_feedback:
+            message_lines.extend((
+                "Validated feedback:", *(f"- {url}" for url in normalized_feedback), "",
+            ))
+        if normalized_quality:
+            message_lines.extend((
+                "Validated quality findings:",
+                *(f"- {url}" for url in normalized_quality), "",
+            ))
         return self._stage_commit_and_verify(
             normalized_paths=normalized_paths,
             message="\n".join(message_lines),
@@ -1570,7 +1645,7 @@ def materialize_exact_checkout(
             timeout_seconds=float(timeout_seconds),
             deadline=deadline,
         )
-        runner.run(("init", "--quiet"))
+        _initialize_exact_checkout(runner)
         runner.run(("remote", "add", "origin", validated_remote))
 
         fetch_environment: dict[str, str] = {}
@@ -1665,7 +1740,7 @@ def materialize_historical_checkout(
             timeout_seconds=float(timeout_seconds),
             deadline=deadline,
         )
-        runner.run(("init", "--quiet"))
+        _initialize_exact_checkout(runner)
         runner.run(("remote", "add", "origin", validated_remote))
 
         fetch_environment: dict[str, str] = {}

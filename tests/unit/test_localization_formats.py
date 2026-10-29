@@ -2,7 +2,7 @@
 
 import pytest
 
-from localize.localization_formats import (
+from localize.formats.metadata import (
     JSON_FORMAT,
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,

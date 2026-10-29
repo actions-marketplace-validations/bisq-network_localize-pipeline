@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -807,6 +809,126 @@ def _event(
             f"https://github.test/{repository}/pull/{pr_number}#discussion_r{event_id}"
         ),
     )
+
+
+def test_project_policy_proposal_concurrent_recovery_is_atomic(tmp_path, monkeypatch):
+    database = tmp_path / 'guardian.sqlite3'
+    occurred_at = datetime(2026, 8, 30, 12, tzinfo=timezone(timedelta(hours=2)))
+    with GuardianState(database) as state:
+        revision_id = state.record_feedback_event(_event()).revision_id
+        run_id = state.start_run(repository='acme/widgets', locale='ru',
+                                 mode=GuardianMode.PROPOSE_PREVENTION)
+    ready = Barrier(2)
+    split_insert = Barrier(2)
+    original_record_action = GuardianState.record_action
+
+    def synchronize_split_insert(self, **kwargs):
+        # Expose the old SELECT/record_action race deterministically. Atomic SQL
+        # never enters this split insertion path.
+        split_insert.wait(timeout=10)
+        return original_record_action(self, **kwargs)
+
+    monkeypatch.setattr(GuardianState, 'record_action', synchronize_split_insert)
+
+    def recover():
+        with GuardianState(database) as state:
+            ready.wait(timeout=10)
+            state.record_project_policy_proposal(
+                run_id=run_id, event_revision_id=revision_id, proposal_id='a' * 64,
+                path='/private/policy/café', evidence_status='needs_operator_review',
+                occurred_at=occurred_at,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(recover) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=20)
+    with GuardianState(database) as state:
+        rows = state._connection.execute(
+            "SELECT run_id,event_revision_id,status,details_json,occurred_at FROM actions "
+            "WHERE action='project_policy_proposal'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert tuple(rows[0]) == (
+            run_id, revision_id, 'pending',
+            '{"decision_required":true,"outcome":"needs_operator_review",'
+            '"path":"/private/policy/café","proposal_id":"' + 'a' * 64 + '"}',
+            '2026-08-30T10:00:00.000000Z',
+        )
+
+
+def test_policy_rejections_only_resolve_the_same_effective_policy(
+    tmp_path: Path,
+) -> None:
+    """A deterministic rejection is terminal only under its matching policy digest."""
+    with GuardianState(tmp_path / "guardian.sqlite3") as state:
+        revision = state.record_feedback_event(_event())
+        run_id = state.start_run(
+            repository="acme/widgets",
+            locale="ru",
+            mode=GuardianMode.APPLY_OWNED_TRANSLATIONS,
+        )
+        state.record_action(
+            run_id=run_id,
+            event_revision_id=revision.revision_id,
+            action="apply-owned-translations",
+            status="skipped",
+            details={"outcome": "deterministic_policy_rejection"},
+        )
+        assert state.pending_event_revisions() == ()
+        assert state.pending_event_revisions(policy_digest="a" * 64)
+        state.record_action(
+            run_id=run_id,
+            event_revision_id=revision.revision_id,
+            action="apply-owned-translations",
+            status="skipped",
+            details={
+                "outcome": "deterministic_policy_rejection",
+                "policy_digest": "a" * 64,
+            },
+        )
+        assert state.pending_event_revisions(policy_digest="a" * 64) == ()
+        assert state.pending_event_revisions(policy_digest="b" * 64)
+        state.record_action(
+            run_id=run_id,
+            event_revision_id=revision.revision_id,
+            action="apply-owned-translations",
+            status="completed",
+            details={"outcome": "applied"},
+        )
+        assert state.pending_event_revisions(policy_digest="b" * 64) == ()
+
+
+def test_validation_upgrade_retries_only_rejected_patches(tmp_path: Path) -> None:
+    with GuardianState(tmp_path / "guardian.sqlite3") as state:
+        rejected = state.record_feedback_event(_event())
+        held = state.record_feedback_event(replace(_event(), event_id="held"))
+        run_id = state.start_run(
+            repository="acme/widgets", locale="ru", mode=GuardianMode.APPLY_OWNED_TRANSLATIONS,
+        )
+        state.record_action(
+            run_id=run_id, event_revision_id=rejected.revision_id,
+            action="apply-owned-translations", status="skipped",
+            details={"outcome": "deterministic_policy_rejection", "policy_digest": "a" * 64},
+        )
+        state.record_action(
+            run_id=run_id, event_revision_id=held.revision_id,
+            action="apply-owned-translations", status="skipped",
+            details={"decision_required": True, "report_policy_digest": "a" * 64},
+        )
+        assert state.pending_event_revisions(policy_digest="a" * 64) == ()
+        assert [r.revision_id for r in state.pending_event_revisions(
+            policy_digest="a" * 64, patch_validation_version=2,
+        )] == [rejected.revision_id]
+        state.record_action(
+            run_id=run_id, event_revision_id=rejected.revision_id,
+            action="apply-owned-translations", status="skipped",
+            details={"outcome": "deterministic_policy_rejection", "policy_digest": "a" * 64,
+                     "patch_validation_version": 2},
+        )
+        assert state.pending_event_revisions(
+            policy_digest="a" * 64, patch_validation_version=2,
+        ) == ()
 
 
 def test_exact_duplicate_is_not_pending_but_edits_and_sha_changes_are(
@@ -2141,6 +2263,7 @@ def test_historical_completion_rejects_invalid_metadata(
 def test_state_migrates_v1_database_to_historical_completion_schema(
     tmp_path: Path,
 ) -> None:
+    """Preserve released v1 state while introducing historical completion tracking."""
     database = tmp_path / "guardian.sqlite3"
     _create_exact_v1_database(database, populated=True)
 
@@ -2162,7 +2285,7 @@ def test_state_migrates_v1_database_to_historical_completion_schema(
         )
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
 
 
 def test_populated_v1_event_remains_idempotent_after_migration(
@@ -2270,6 +2393,7 @@ def test_v1_migration_seals_candidate_against_already_open_writer(
 def test_v2_remediation_edit_table_gains_target_mapping_column(
     tmp_path: Path,
 ) -> None:
+    """Upgrade legacy remediation edits with explicit target identity storage."""
     database = tmp_path / "guardian.sqlite3"
     _create_v2_migration_fixture(database)
 
@@ -2283,12 +2407,13 @@ def test_v2_remediation_edit_table_gains_target_mapping_column(
         assert "target_hash" in columns
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
 
 
 def test_v3_pending_retry_survives_upgrade_and_gains_resolution_ledger(
     tmp_path: Path,
 ) -> None:
+    """Keep pending historical retries across the resolution-ledger migration."""
     database = tmp_path / "guardian.sqlite3"
     _create_v3_migration_fixture(database)
 
@@ -2307,7 +2432,7 @@ def test_v3_pending_retry_survives_upgrade_and_gains_resolution_ledger(
         )
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
         assert (
             connection.execute(
                 "SELECT COUNT(*) FROM historical_pull_retry_events"
@@ -2322,7 +2447,20 @@ def test_v3_pending_retry_survives_upgrade_and_gains_resolution_ledger(
         )
 
 
-def test_empty_v0_database_upgrades_to_v9(tmp_path: Path) -> None:
+def test_held_report_ignores_legacy_action_without_report_reason(tmp_path):
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        revision = state.record_feedback_event(_event())
+        run_id = state.start_run(repository="acme/widgets", locale="de", mode=GuardianMode.OBSERVE)
+        state.record_action(
+            run_id=run_id, event_revision_id=revision.revision_id,
+            action=GuardianMode.OBSERVE.value, status="completed",
+            details={"decision_required": True, "report_policy_digest": "a" * 64},
+        )
+        assert state.held_feedback_report_for_revision(revision.revision_id, "a" * 64) is None
+
+
+def test_empty_v0_database_upgrades_to_v12(tmp_path: Path) -> None:
+    """Initialize an empty database at the current supported schema version."""
     database = tmp_path / "guardian.sqlite3"
     with sqlite3.connect(database):
         pass
@@ -2332,7 +2470,27 @@ def test_empty_v0_database_upgrades_to_v9(tmp_path: Path) -> None:
         assert state.status_snapshot(mode=GuardianMode.OBSERVE).pending_revisions == 0
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+
+
+def test_v10_upgrade_preserves_audit_and_refuses_old_resolution_semantics(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Semantic schema migration preserves history and blocks old readers."""
+    database = tmp_path / "guardian.sqlite3"
+    with GuardianState(database) as state:
+        revision = state.record_feedback_event(_event())
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA user_version = 10")
+    with GuardianState(database) as state:
+        assert state.get_event_revision(revision.revision_id) is not None
+        assert state.status_snapshot(mode=GuardianMode.PROPOSE_PREVENTION).pending_revisions == 1
+    monkeypatch.setattr(guardian_state, "_SUPPORTED_SCHEMA_VERSIONS", frozenset(range(11)))
+    with pytest.raises(RuntimeError, match="Unsupported guardian state schema version 12"):
+        GuardianState(database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
 
 
 def test_assessment_cache_and_cost_settlement_are_one_transaction(
@@ -3986,6 +4144,7 @@ def test_new_prepared_publication_requires_exact_open_authority(
 def test_published_remediation_reply_can_be_terminalized_separately(
     tmp_path: Path,
 ) -> None:
+    """Complete published remediation without inventing a reply on a closed PR."""
     now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
     with GuardianState(tmp_path / "guardian.sqlite3") as state:
         metadata = _remediation_metadata(state, now=now)
@@ -4089,6 +4248,60 @@ def test_published_remediation_reply_can_be_terminalized_separately(
                 "UPDATE publication_reply_terminal_events SET reason = "
                 "'remediation_merged'"
             )
+
+    # Recreate the released v9 enum with a genuine completed terminal row.
+    database = tmp_path / "guardian.sqlite3"
+    _restore_v9_reply_terminal_table(database)
+    with GuardianState(database) as migrated:
+        assert migrated.publication_reply_terminal_reason(intent.publication_key) == (
+            "remediation_closed_unmerged"
+        )
+        assert migrated.pending_publications() == ()
+        with pytest.raises(sqlite3.IntegrityError, match="reply terminals"):
+            migrated._connection.execute("DELETE FROM publication_reply_terminal_events")
+
+
+def _restore_v9_reply_terminal_table(database: Path) -> None:
+    """Build the previous enum while retaining exact terminal evidence rows."""
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE publication_reply_terminal_events RENAME TO terminals_new")
+        connection.execute("""
+            CREATE TABLE publication_reply_terminal_events (
+                publication_key TEXT PRIMARY KEY,
+                reason TEXT NOT NULL CHECK (reason IN (
+                    'remediation_closed_unmerged', 'remediation_merged'
+                )),
+                occurred_at TEXT NOT NULL
+            )
+        """)
+        connection.execute("INSERT INTO publication_reply_terminal_events SELECT * FROM terminals_new")
+        connection.execute("DROP TABLE terminals_new")
+        connection.execute("PRAGMA user_version = 9")
+
+
+def test_v9_reply_enum_migration_rolls_back_on_later_failure(tmp_path, monkeypatch):
+    """A failed upgrade must retain the old schema without a partial table swap."""
+    database = tmp_path / "guardian.sqlite3"
+    with GuardianState(database):
+        pass
+    _restore_v9_reply_terminal_table(database)
+
+    def fail_after_migration(_self):
+        """Inject a later failure to verify the entire schema upgrade rolls back."""
+        raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(GuardianState, "_install_publication_reply_triggers", fail_after_migration)
+    with pytest.raises(RuntimeError, match="injected migration failure"):
+        GuardianState(database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='publication_reply_terminal_events'"
+        ).fetchone()[0]
+        assert "trusted_feedback_changed" not in sql
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='publication_reply_terminal_events_v10'"
+        ).fetchone()[0] == 0
 
 
 def test_publication_completion_action_is_exact_and_idempotent(
@@ -4285,6 +4498,7 @@ def test_v1_replied_publication_never_matches_a_current_actor(tmp_path: Path) ->
 def test_v7_publication_actor_migration_is_explicit_and_fails_closed(
     tmp_path: Path,
 ) -> None:
+    """Do not synthesize publication actor authority during legacy migration."""
     database = tmp_path / "guardian.sqlite3"
     now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
     with GuardianState(database) as state:
@@ -4363,7 +4577,7 @@ def test_v7_publication_actor_migration_is_explicit_and_fails_closed(
             state._connection.execute(  # noqa: SLF001
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == 9
+            == 12
         )
         for table in (
             "publication_events",
@@ -5809,6 +6023,7 @@ def test_migration_accepts_each_remediation_write_run_mode(
     tmp_path: Path,
     mode: GuardianMode,
 ) -> None:
+    """Retain valid historical publications from either authorized write mode."""
     database = tmp_path / "guardian.sqlite3"
     _create_v4_migration_fixture(database)
     run_id = "00000000-0000-4000-8000-000000000099"
@@ -5865,7 +6080,7 @@ def test_migration_accepts_each_remediation_write_run_mode(
             state._connection.execute(  # noqa: SLF001
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == 9
+            == 12
         )
 
 
@@ -6738,6 +6953,92 @@ def test_current_evidence_requires_the_latest_assessment_for_the_policy(
         )
 
 
+@pytest.mark.parametrize("case", [
+    "bot", "reviewer", "no_policy", "wrong_id", "wrong_type", "wrong_locale",
+    "wrong_repository", "wrong_repository_id", "outside_path", "machine_report",
+    "missing_feedback", "stale_feedback", "deleted_feedback",
+])
+def test_historical_cross_locale_evidence_requires_exact_target_authority(
+    tmp_path: Path, case: str,
+) -> None:
+    """A multi-file comment authorizes another locale only under exact policy."""
+    from localize.guardian.models import (
+        AllowedHeadRepository, RepositoryPolicy, TrustedActor,
+    )
+    from localize.guardian.quality_reports import MARKER
+
+    actor = TrustedActor("reviewer", 202, "Bot")
+    author = TrustedActor("translator", 7, "User")
+    policy = RepositoryPolicy(
+        base_repo="acme/widgets", base_repo_id=42, base_branch="main",
+        allowed_pr_authors=(author,), allowed_head_owners=(author,),
+        allowed_head_repositories=(AllowedHeadRepository("translator/widgets", 84),),
+        allowed_branch_globs=("translation-*",),
+        allowed_path_globs=("l10n/*.properties",),
+        pipeline_config_path="config.yaml", source_locale="en",
+        trusted_reviewers={"ru": (author,), "hi": (author,)},
+        trusted_bots={"ru": (actor,), "hi": (actor,)},
+    )
+    event = _event(pr_number=12)
+    if case == "reviewer":
+        actor = replace(actor, type="User")
+        event = replace(event, author_type="User")
+        policy = replace(policy, trusted_reviewers={"hi": (actor,)}, trusted_bots={})
+    elif case == "wrong_id":
+        policy = replace(policy, trusted_bots={"hi": (replace(actor, id=203),)})
+    elif case == "wrong_type":
+        policy = replace(policy, trusted_reviewers={"hi": (replace(actor, type="User"),)}, trusted_bots={})
+    elif case == "wrong_locale":
+        policy = replace(policy, trusted_bots={"ru": (actor,)})
+    elif case == "wrong_repository":
+        policy = replace(policy, base_repo="other/widgets")
+    elif case == "wrong_repository_id":
+        policy = replace(policy, base_repo_id=43)
+    elif case == "machine_report":
+        event = replace(event, body=MARKER + "{}")
+        policy = replace(policy, quality_report_actor=actor)
+    elif case == "no_policy":
+        policy = None
+    proposal = ProposedReplacement(
+        feedback_id=event.feedback_id, path="l10n/messages_hi.properties", key="hello",
+        locale="hi", expected_value="old", proposed_value="new", confidence=0.99,
+        evidence=("The comment covers Russian and Hindi files.",), source_value="Hello",
+    )
+    if case == "outside_path":
+        proposal = replace(proposal, path="outside/messages_hi.properties")
+    elif case == "missing_feedback":
+        proposal = replace(proposal, feedback_id="review_comment:missing")
+    source = HistoricalPullReference(
+        repository="acme/widgets", repository_id=42, pull_id=500, pr_number=12,
+        pull_revision_digest="1" * 64, authority_digest="4" * 64,
+        policy_digest="2" * 64, head_sha="a" * 40, base_sha="b" * 40,
+    )
+    with GuardianState(tmp_path / "guardian.sqlite3") as state:
+        revision = state.record_feedback_event(event)
+        state.record_historical_pull_completion(
+            repository=source.repository, repository_id=source.repository_id,
+            pull_id=source.pull_id, pr_number=source.pr_number,
+            pull_revision_digest=source.pull_revision_digest,
+            policy_digest=source.policy_digest, head_sha=source.head_sha,
+            base_sha=source.base_sha, event_revision_ids=(revision.revision_id,),
+            authority_scope=HistoricalCheckScope.ASSESSMENT,
+        )
+        if case in {"stale_feedback", "deleted_feedback"}:
+            state.record_feedback_event(replace(
+                event, body="Changed review", deleted=case == "deleted_feedback",
+                updated_at="2026-08-31T08:00:00Z",
+            ))
+        kwargs = dict(
+            source_pulls=(source,), event_revision_ids=(revision.revision_id,),
+            replacements=(proposal,), repository_policy=policy,
+        )
+        if case in {"bot", "reviewer"}:
+            assert state.validate_current_historical_remediation_evidence(**kwargs)
+        else:
+            with pytest.raises(ValueError):
+                state.validate_current_historical_remediation_evidence(**kwargs)
+
+
 def test_remediation_evidence_binds_stored_urls_and_replacement_feedback_ids(
     tmp_path: Path,
 ) -> None:
@@ -7574,6 +7875,7 @@ def test_remediation_draft_rejects_ambiguous_historical_pull_identities(
 
 
 def test_state_migrates_v1_database_to_remediation_ledger(tmp_path: Path) -> None:
+    """Upgrade released v1 history without granting unattested remediation authority."""
     database = tmp_path / "guardian.sqlite3"
     _create_exact_v1_database(database)
 
@@ -7586,7 +7888,7 @@ def test_state_migrates_v1_database_to_remediation_ledger(tmp_path: Path) -> Non
         assert len(state.pending_remediation_drafts()) == 1
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
 
 
 def test_state_migrates_successor_publication_actor_columns_fail_closed(
@@ -9866,6 +10168,7 @@ def test_v1_legacy_authority_sentinel_preserves_evidence_and_draft_identity(
 def test_v4_migration_keeps_unattested_completion_upgradeable_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
+    """Preserve upgradeable legacy completion evidence across repeated migrations."""
     database = tmp_path / "guardian.sqlite3"
     _create_v4_migration_fixture(database)
     (
@@ -9981,7 +10284,7 @@ def test_v4_migration_keeps_unattested_completion_upgradeable_and_is_idempotent(
             state._connection.execute(  # noqa: SLF001
                 "PRAGMA user_version"
             ).fetchone()[0]
-            == 9
+            == 12
         )
         assert "branch_identity_version" in {
             row["name"]
@@ -10546,3 +10849,135 @@ def test_remediation_source_authority_rejects_more_than_one_hundred_pulls(
                 },
                 phase="validated",
             )
+
+
+def test_daily_prevention_publication_slots_are_durable_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "guardian.sqlite3"
+    morning = datetime(2026, 9, 29, 8, 0, tzinfo=UTC)
+    with GuardianState(database) as state:
+        assert state.prevention_publication_slots_for_day(morning.date()) == 0
+        assert state.try_reserve_prevention_publication_slot(
+            draft_key="draft-1",
+            daily_limit=1,
+            reserved_at=morning,
+        )
+        # Retrying the same in-flight candidate never consumes a second slot.
+        assert state.try_reserve_prevention_publication_slot(
+            draft_key="draft-1",
+            daily_limit=1,
+            reserved_at=morning + timedelta(hours=1),
+        )
+        assert not state.try_reserve_prevention_publication_slot(
+            draft_key="draft-2",
+            daily_limit=1,
+            reserved_at=morning + timedelta(hours=2),
+        )
+
+    # A crash after reservation leaves the slot committed for that UTC day.
+    with GuardianState(database) as state:
+        assert state.prevention_publication_slots_for_day(morning.date()) == 1
+        assert not state.try_reserve_prevention_publication_slot(
+            draft_key="draft-2",
+            daily_limit=1,
+            reserved_at=morning + timedelta(hours=15, minutes=59),
+        )
+        next_day = morning + timedelta(days=1)
+        assert state.try_reserve_prevention_publication_slot(
+            draft_key="draft-2",
+            daily_limit=1,
+            reserved_at=next_day,
+        )
+        # A candidate reserved yesterday is recovered without counting today.
+        assert state.try_reserve_prevention_publication_slot(
+            draft_key="draft-1",
+            daily_limit=1,
+            reserved_at=next_day,
+        )
+        assert state.prevention_publication_slots_for_day(next_day.date()) == 1
+
+
+@pytest.mark.parametrize("limit", (0, -1, True))
+def test_daily_prevention_publication_zero_or_invalid_limit_never_reserves(
+    tmp_path: Path,
+    limit: int,
+) -> None:
+    with GuardianState(tmp_path / "guardian.sqlite3") as state:
+        if limit == 0 and limit is not True:
+            assert not state.try_reserve_prevention_publication_slot(
+                draft_key="draft-1",
+                daily_limit=limit,
+                reserved_at=datetime(2026, 9, 29, 8, 0, tzinfo=UTC),
+            )
+        else:
+            with pytest.raises(ValueError):
+                state.try_reserve_prevention_publication_slot(
+                    draft_key="draft-1",
+                    daily_limit=limit,
+                    reserved_at=datetime(2026, 9, 29, 8, 0, tzinfo=UTC),
+                )
+        assert (
+            state.prevention_publication_slots_for_day(date(2026, 9, 29)) == 0
+        )
+
+
+def _record_prevention_decline(
+    state: GuardianState, decline_key: str, explanation: str
+) -> None:
+    state.record_health(
+        component="prevention-author",
+        status="declined",
+        message="Prevention author declined a generic patch.",
+        details={
+            "schema_version": 1,
+            "decline_key": decline_key,
+            "outcome": "declined",
+            "reason": "project_policy",
+            "explanation": explanation,
+            "inspected_paths": ["localize/rules.py"],
+        },
+    )
+
+
+def test_prevention_decline_lookup_uses_index_added_to_v12_in_place(
+    tmp_path: Path,
+) -> None:
+    """Index an existing v12 database at open without a schema-version bump."""
+    database = tmp_path / "guardian.sqlite3"
+    key, other = "a" * 64, "b" * 64
+    with GuardianState(database) as state:
+        _record_prevention_decline(state, key, "First disposition.")
+        _record_prevention_decline(state, other, "Other evidence.")
+        _record_prevention_decline(state, key, "Latest disposition.")
+        state.record_health(
+            component="prevention-author", status="ok",
+            message="Unrelated row.", details={"decline_key": key},
+        )
+    # A database written before this index existed is still version 12.
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX health_prevention_decline_key")
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+
+    with GuardianState(database) as state:
+        plan = " ".join(
+            str(row["detail"])
+            for row in state._connection.execute(  # noqa: SLF001
+                "EXPLAIN QUERY PLAN " + guardian_state._PREVENTION_DECLINE_SQL,
+                (key,),
+            )
+        )
+        assert "USING INDEX health_prevention_decline_key" in plan
+        assert "TEMP B-TREE" not in plan
+        latest = state.prevention_decline(key)
+        assert latest is not None
+        assert latest["explanation"] == "Latest disposition."
+        assert state.prevention_decline(other)["explanation"] == "Other evidence."
+        assert state.prevention_decline("c" * 64) is None
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'health_prevention_decline_key'"
+        ).fetchone()[0] == 1

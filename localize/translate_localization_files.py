@@ -39,21 +39,21 @@ from localize.json_response import (
     chat_reasoning_effort_kwargs,
     loads_json_object,
 )
-from localize.localization_adapters import (
+from localize.formats.adapters import (
     get_localization_adapter,
     lint_properties_file as lint_properties_file,
 )
-from localize.localization_formats import LocalizationFormat
-from localize.localization_layouts import LocalizationLayout
-from localize.localization_profiles import LocalizationProfile
-from localize.model_provider import OpenAICompatibleProvider
-from localize.placeholder_rules import (
+from localize.formats.metadata import JAVA_PROPERTIES_FORMAT, LocalizationFormat
+from localize.formats.layouts import LocalizationLayout
+from localize.formats.profiles import LocalizationProfile
+from localize.providers.models import OpenAICompatibleProvider
+from localize.formats.placeholders import (
     extract_placeholder_tokens,
     protect_placeholders,
     restore_placeholders as restore_protected_placeholders,
     set_placeholder_profile,
 )
-from localize.pipeline_core import (
+from localize.core.pipeline import (
     RUN_METRIC_KEYS,
     TranslationPipelineOptions,
     TranslationPipelinePaths,
@@ -61,12 +61,13 @@ from localize.pipeline_core import (
     run_translation_pipeline,
 )
 from localize.translation_prompts import build_translation_system_prompt
+from localize.source_identical_acceptance import is_accepted_source_identical
 from localize.translation_memory import (
     TranslationMemory,
     load_translation_memory,
     save_translation_memory,
 )
-from localize.translation_validator import (
+from localize.formats.validation import (
     check_placeholder_parity,
     check_encoding_and_mojibake,
     find_glossary_mismatches,
@@ -110,6 +111,7 @@ RATE_LIMIT_PER_MINUTE = config.rate_limit_per_minute
 LANGUAGE_CODES = config.language_codes
 NAME_TO_CODE = config.name_to_code
 RETRANSLATE_IDENTICAL_SOURCE_STRINGS = config.retranslate_identical_source_strings
+ACCEPTED_SOURCE_IDENTICAL_TRANSLATIONS = config.accepted_source_identical_translations
 STYLE_RULES = config.style_rules
 PRECOMPUTED_STYLE_RULES_TEXT = config.precomputed_style_rules_text
 BRAND_GLOSSARY = config.brand_glossary
@@ -473,6 +475,10 @@ def apply_translation_memory(
             format_id=format_id,
             context_fingerprint=context_fingerprint,
         )
+        if cached is not None and is_accepted_source_identical(
+            locale, key, text, text, ACCEPTED_SOURCE_IDENTICAL_TRANSLATIONS,
+        ) and cached != text:
+            cached = None
         if cached is not None:
             if normalize_value(cached) == normalize_value(text):
                 logger.warning("Ignoring source-identical translation memory entry for key '%s'.", key)
@@ -512,7 +518,11 @@ def update_translation_memory(
         target_value = final_translations.get(key)
         if source_value is None or target_value is None:
             continue
-        if not target_value.strip() or normalize_value(source_value) == normalize_value(target_value):
+        if not target_value.strip():
+            continue
+        if normalize_value(source_value) == normalize_value(target_value) and not is_accepted_source_identical(
+            locale, key, source_value, target_value, ACCEPTED_SOURCE_IDENTICAL_TRANSLATIONS,
+        ):
             continue
         memory.record(
             source_value,
@@ -532,6 +542,7 @@ def extract_texts_to_translate(
         retranslate_identical_existing: bool = False,
         ignore_key_patterns: Optional[List[Pattern[str]]] = None,
         selection_metrics: Optional[Dict[str, int]] = None,
+        accepted_source_identical_keys: Optional[Set[str]] = None,
 ) -> Tuple[List[str], List[int], List[str]]:
     """
     Identifies which texts need to be translated. A text needs translation if:
@@ -570,6 +581,8 @@ def extract_texts_to_translate(
         if line['type'] == 'entry':
             key = line['key']
             if is_ignored_key(key, ignore_key_patterns):
+                continue
+            if key in (accepted_source_identical_keys or set()):
                 continue
             target_value = line.get('value', '')
             source_value = source_translations.get(key)
@@ -1270,6 +1283,7 @@ def run_post_translation_validation(
                     source_value,
                     target_value,
                     translation_glossary,
+                    decode_properties_whitespace=effective_format.id == JAVA_PROPERTIES_FORMAT.id,
                 )
                 if glossary_mismatches:
                     required = ", ".join(
@@ -1320,6 +1334,12 @@ def run_per_key_validation_with_summary(
         filename: str,
         ignore_key_patterns: Optional[List[Pattern[str]]] = None,
         translation_glossary: Optional[Mapping[str, str]] = None,
+        existing_translations: Optional[Mapping[str, str]] = None,
+        file_ledger_entries: Optional[Mapping[str, Mapping[str, str]]] = None,
+        selected_keys: Optional[Set[str]] = None,
+        locale: str = "",
+        accepted_source_identical_translations: Optional[Mapping[str, Mapping[str, str]]] = None,
+        decode_properties_whitespace: bool = False,
 ) -> Tuple[Dict[str, str], Dict[str, object]]:
     """
     Validates each translation key individually and selectively reverts failed keys.
@@ -1333,6 +1353,14 @@ def run_per_key_validation_with_summary(
         final_translations: Dictionary of translated key-value pairs to validate
         source_translations: Dictionary of source (English) key-value pairs
         filename: Name of the file being validated (for logging)
+        existing_translations: Original target values, used to preserve a
+            localized value when generated output falls back to the source.
+        file_ledger_entries: Baseline hashes proving that both the source and
+            previous target are unchanged.
+        selected_keys: Keys translated in this run. Source echoes for these
+            keys stay failed even if the original target was also the source.
+        decode_properties_whitespace: Treat raw Java Properties whitespace
+            escapes as separators in glossary checks; leave false for decoded formats.
 
     Returns:
         Tuple containing:
@@ -1345,8 +1373,11 @@ def run_per_key_validation_with_summary(
     placeholder_mismatch_keys = []
     empty_target_keys = []
     glossary_mismatch_keys = []
+    source_identical_keys = []
     ignore_key_patterns = ignore_key_patterns or []
     translation_glossary = translation_glossary or {}
+    existing_translations = existing_translations or {}
+    selected_keys = selected_keys or set()
 
     for key, target_value in final_translations.items():
         source_value = source_translations.get(key, "")
@@ -1363,6 +1394,36 @@ def run_per_key_validation_with_summary(
             )
             valid_translations[key] = source_value
             continue
+        existing_value = _ledger_verified_existing_translation(
+            key, source_translations, existing_translations, file_ledger_entries or {}
+        )
+        original_value = existing_translations.get(key)
+        if (
+                source_value.strip()
+                and normalize_value(source_value) == normalize_value(target_value)
+                and not is_accepted_source_identical(
+                    locale, key, source_value, target_value,
+                    accepted_source_identical_translations or {},
+                )
+                and (
+                    key in selected_keys
+                    or (
+                        isinstance(original_value, str)
+                        and original_value.strip()
+                        and normalize_value(original_value) != normalize_value(source_value)
+                    )
+                )
+        ):
+            failed_keys.append(key)
+            source_identical_keys.append(key)
+            logger.warning(
+                "Key '%s' failed validation in '%s' - generated value matches the "
+                "source; only a ledger-verified target may be reused after validation.",
+                key,
+                filename,
+            )
+            if existing_value is not None:
+                target_value = existing_value
         control_character_findings = find_disallowed_control_characters(target_value)
 
         if control_character_findings:
@@ -1382,6 +1443,7 @@ def run_per_key_validation_with_summary(
             source_value,
             target_value,
             translation_glossary,
+            decode_properties_whitespace=decode_properties_whitespace,
         )
         if glossary_mismatches:
             failed_keys.append(key)
@@ -1422,11 +1484,13 @@ def run_per_key_validation_with_summary(
             # Use source value for this failed key
             valid_translations[key] = source_value
 
+    # A rejected source echo and an invalid fallback can flag the same key.
+    failed_keys = list(dict.fromkeys(failed_keys))
     # Log summary if any keys failed
     if failed_keys:
         logger.warning(
             f"Validation failed for {len(failed_keys)} out of {len(final_translations)} keys in '{filename}'. "
-            f"Failed keys reverted to source: {', '.join(failed_keys[:5])}"
+            f"Failed keys retained a validated baseline or reverted to source: {', '.join(failed_keys[:5])}"
             f"{' ...' if len(failed_keys) > 5 else ''}"
         )
         logger.info(
@@ -1441,11 +1505,13 @@ def run_per_key_validation_with_summary(
         "placeholder_mismatch_keys": placeholder_mismatch_keys,
         "empty_target_keys": empty_target_keys,
         "glossary_mismatch_keys": glossary_mismatch_keys,
+        "source_identical_keys": source_identical_keys,
         "reverted_keys_count": len(failed_keys),
         "control_character_findings_count": len(control_character_keys),
         "placeholder_failures_count": len(placeholder_mismatch_keys),
         "empty_target_failures_count": len(empty_target_keys),
         "glossary_failures_count": len(glossary_mismatch_keys),
+        "source_identical_failures_count": len(source_identical_keys),
     }
     return valid_translations, summary
 
@@ -1693,11 +1759,19 @@ def _prefer_glossary_compliant_draft(
     draft_value: str,
     reviewed_value: str,
     translation_glossary: Mapping[str, str],
+    *,
+    decode_properties_whitespace: bool = False,
 ) -> str:
     """Keep a compliant draft when holistic review breaks a required mapping."""
     if (
-        find_glossary_mismatches(source_value, reviewed_value, translation_glossary)
-        and not find_glossary_mismatches(source_value, draft_value, translation_glossary)
+        find_glossary_mismatches(
+            source_value, reviewed_value, translation_glossary,
+            decode_properties_whitespace=decode_properties_whitespace,
+        )
+        and not find_glossary_mismatches(
+            source_value, draft_value, translation_glossary,
+            decode_properties_whitespace=decode_properties_whitespace,
+        )
     ):
         return draft_value
     return reviewed_value
@@ -2133,7 +2207,9 @@ def is_source_localization_file(
 
 def copy_translated_files_back(
         translated_queue_folder: str,
-        input_folder_path: str
+        input_folder_path: str,
+        *,
+        skipped_files: Optional[Dict[str, List[str]]] = None,
 ):
     """
     Copy translated translation files back to the input folder, overwriting existing ones and preserving subdirectories.
@@ -2141,10 +2217,13 @@ def copy_translated_files_back(
     Args:
         translated_queue_folder (str): The folder containing translated files.
         input_folder_path (str): The input folder path.
+        skipped_files: Inputs that must not be overwritten by stale queue output.
     """
     for root, _dirs, files in os.walk(translated_queue_folder):
         for name in files:
             rel_path = os.path.relpath(os.path.join(root, name), translated_queue_folder)
+            if rel_path.replace('\\', '/') in (skipped_files or {}):
+                continue
             if is_target_localization_file(rel_path):
                 translated_file_path = os.path.join(translated_queue_folder, rel_path)
                 dest_path = os.path.join(input_folder_path, rel_path)
@@ -2470,6 +2549,7 @@ async def process_translation_queue(
         Run metrics are attached to the result as ``result.run_metrics``.
     """
     localization_files: List[Tuple[str, LocalizationProfile]] = []
+    skipped_files: Dict[str, List[str]] = {}
     for root, dirs, files in os.walk(translation_queue_folder):
         dirs.sort()
         for name in files:
@@ -2480,6 +2560,11 @@ async def process_translation_queue(
             profile = find_target_localization_profile(relative_path)
             if profile:
                 localization_files.append((relative_path, profile))
+            elif not is_source_localization_file(relative_path) and any(
+                item.localization_format.is_supported_file(relative_path)
+                for item in _iter_localization_profiles()
+            ):
+                skipped_files[relative_path] = ["No supported target locale profile."]
     localization_files.sort(key=lambda item: item[0])
 
     # Load the glossary from the JSON file
@@ -2501,8 +2586,6 @@ async def process_translation_queue(
     processed_filenames: List[str] = []
     total_keys_translated = 0
     run_metrics = new_run_metrics()
-    skipped_files: Dict[str, List[str]] = {}
-
     for translation_file, localization_profile in localization_files:
         try:
             localization_format = localization_profile.localization_format
@@ -2516,11 +2599,13 @@ async def process_translation_queue(
             )
             if not language_code:
                 logger.warning(f"Skipping file {translation_file}: unable to extract language code.")
+                skipped_files[translation_file] = ["Unable to extract language code."]
                 continue
             # 4) Now we find the "friendly name" from the dictionary
             target_language = language_code_to_name(language_code)
             if not target_language:
                 logger.warning(f"Skipping file {translation_file}: unsupported language code '{language_code}'.")
+                skipped_files[translation_file] = [f"Unsupported language code: {language_code}."]
                 continue
             style_rules_text_for_review = PRECOMPUTED_STYLE_RULES_TEXT.get(language_code, "")
             raw_language_glossary = glossary.get(language_code, {})
@@ -2552,6 +2637,7 @@ async def process_translation_queue(
 
             if not os.path.exists(source_file_path):
                 logger.warning(f"Source file '{source_file_name}' not found in '{INPUT_FOLDER}'. Skipping.")
+                skipped_files[translation_file] = [f"Source file not found: {source_file_name}."]
                 continue
 
             logger.info(f"Processing file '{translation_file}' for language '{target_language}'...")
@@ -2607,13 +2693,33 @@ async def process_translation_queue(
                 key for key in newly_added_keys if is_ignored_key(key, IGNORE_KEY_PATTERNS)
             )
 
+            accepted_keys = {
+                key for key, source in source_translations.items()
+                if file_ledger_entries.get(key, {}).get("status") != "failed"
+                and is_accepted_source_identical(
+                    language_code, key, source, target_translations.get(key, ""),
+                    ACCEPTED_SOURCE_IDENTICAL_TRANSLATIONS,
+                )
+            }
+            if translation_memory is not None and not DRY_RUN:
+                for key in accepted_keys:
+                    # Conflict-safe recording quarantines an obsolete cached
+                    # alternative rather than promoting this value globally.
+                    translation_memory.record(
+                        source_translations[key], target_translations[key],
+                        locale=language_code, format_id=localization_format.id,
+                        context_fingerprint=memory_context_fingerprint,
+                    )
+                if accepted_keys:
+                    save_translation_memory(TRANSLATION_MEMORY_FILE_PATH, translation_memory)
+
             # Extract texts to translate
             git_changed_keys = raw_git_changed_keys
             # Only re-translate git-dirty keys if their English source actually changed.
             # This prevents an infinite cycle where Transifex community translations
             # are overwritten by AI, then Transifex re-serves the community version.
             git_changed_keys = filter_git_changed_keys_by_source(
-                git_changed_keys,
+                git_changed_keys - accepted_keys,
                 source_translations,
                 file_ledger_entries,
                 target_translations=target_translations
@@ -2621,7 +2727,7 @@ async def process_translation_queue(
             newly_synchronized_keys = newly_added_keys.union(git_changed_keys)
             if git_changed_keys:
                 logger.info(
-                    "Detected %d git-diff key updates in '%s' with changed source; treating them as newly synchronized.",
+                    "Detected %d eligible git-diff key updates in '%s'; treating them as newly synchronized.",
                     len(git_changed_keys),
                     translation_file
                 )
@@ -2634,6 +2740,7 @@ async def process_translation_queue(
                 retranslate_identical_existing=RETRANSLATE_IDENTICAL_SOURCE_STRINGS,
                 ignore_key_patterns=IGNORE_KEY_PATTERNS,
                 selection_metrics=run_metrics,
+                accepted_source_identical_keys=accepted_keys,
             )
             if not texts_to_translate:
                 # Refresh ledger baseline even when no translation was required.
@@ -2911,6 +3018,7 @@ async def process_translation_queue(
                                 draft_translations.get(key, ""),
                                 value,
                                 enforced_language_glossary,
+                                decode_properties_whitespace=localization_format.id == JAVA_PROPERTIES_FORMAT.id,
                             )
                             if selected_value != value:
                                 logger.warning(
@@ -3016,6 +3124,12 @@ async def process_translation_queue(
                 translation_file,
                 ignore_key_patterns=IGNORE_KEY_PATTERNS,
                 translation_glossary=enforced_language_glossary,
+                existing_translations=original_target_translations,
+                file_ledger_entries=file_ledger_entries,
+                selected_keys=set(keys_to_translate),
+                locale=language_code,
+                accepted_source_identical_translations=ACCEPTED_SOURCE_IDENTICAL_TRANSLATIONS,
+                decode_properties_whitespace=localization_format.id == JAVA_PROPERTIES_FORMAT.id,
             )
             failed_keys = set(per_key_summary["failed_keys"]).union(model_failed_keys)
             increment_run_metric(run_metrics, "model_translation_failed_count", len(failed_keys))
@@ -3023,6 +3137,37 @@ async def process_translation_queue(
             per_key_summary["model_translation_failed_keys"] = sorted(model_failed_keys)
             if validation_summary is not None:
                 validation_summary[translation_file] = per_key_summary
+
+            # A rejected candidate is not permission to replace localized text
+            # with English. Without a valid current-source baseline, withhold
+            # the file rather than publish stale text or a source fallback.
+            blocked_regressions = sorted(
+                key for key in failed_keys
+                if original_target_translations.get(key, "").strip()
+                and normalize_value(original_target_translations[key])
+                != normalize_value(source_translations.get(key, ""))
+                and normalize_value(valid_translations.get(key, ""))
+                == normalize_value(source_translations.get(key, ""))
+                and not is_ignored_key(key, IGNORE_KEY_PATTERNS)
+            )
+            if blocked_regressions:
+                per_key_summary["blocked_source_regression_keys"] = blocked_regressions
+                skipped_files[translation_file] = [
+                    "Rejected translation would overwrite existing localized values "
+                    "with source text; file withheld for retry."
+                ]
+                # Preserve old evidence, including its absence. Do not stamp a
+                # potentially stale target as matching the new source merely
+                # because publication was blocked. Retry every selected key in
+                # this withheld file, including otherwise successful candidates.
+                retry_entries = dict(file_ledger_entries)
+                for key in keys_to_translate:
+                    retry_entries[key] = {**retry_entries.get(key, {}), "status": "failed"}
+                key_ledger[translation_file] = retry_entries
+                save_translation_key_ledger(TRANSLATION_KEY_LEDGER_FILE_PATH, key_ledger)
+                logger.error("Withholding '%s': source fallback would replace %d localized value(s).",
+                             translation_file, len(blocked_regressions))
+                continue
 
             # Apply validated translations (valid translations + reverted source for failed keys)
             for line in draft_lines:
@@ -3214,6 +3359,7 @@ def write_translation_validation_summary(
     """Write structured validation data consumed by the PR quality gate."""
     summary = {
         "files": validation_files,
+        "skipped_files": sorted(skipped_files),
         "pipeline_warnings": [
             {"file": filename, "errors": errors}
             for filename, errors in sorted(skipped_files.items())

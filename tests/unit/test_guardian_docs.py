@@ -188,8 +188,8 @@ def test_guardian_guide_covers_operator_ownership_and_authority_modes():
     guide = _guide_text()
     normalized = _normalized_guide()
 
-    assert "operator runs" in normalized
-    assert "supplies their own codex/chatgpt plan" in normalized
+    assert "each project supplies its own machine" in normalized
+    assert "codex/chatgpt plan" in normalized
     assert "explicitly opts into api billing" in normalized
     assert "not a hosted service" in normalized
     for mode in (
@@ -278,7 +278,6 @@ def test_guardian_guide_documents_hardened_codex_boundary():
 def test_guardian_docs_publish_exact_prevention_collection_and_text_bounds():
     guide = _normalized_guide()
     example = " ".join(_example_text().casefold().split())
-    readme = " ".join(README.read_text(encoding="utf-8").casefold().split())
 
     for text in (guide, example):
         assert "100 code globs" in text
@@ -296,9 +295,6 @@ def test_guardian_docs_publish_exact_prevention_collection_and_text_bounds():
         assert "60 kib" in text
         assert "fingerprint" in text
 
-    assert "100 code globs" in readme
-    assert "4096 utf-8 bytes" in readme
-    assert "60 kib" in readme
     assert "`gpt-5.6-terra` with reasoning effort `high`" in guide
 
 
@@ -344,6 +340,7 @@ def test_guardian_guide_documents_untrusted_inputs_and_secret_brokerage():
 
 
 def test_guardian_guide_documents_audit_cost_retention_and_safe_prevention():
+    """Document audit retention, session accounting, and prevention authority."""
     guide = _guide_text()
     lowered = _normalized_guide()
 
@@ -353,7 +350,10 @@ def test_guardian_guide_documents_audit_cost_retention_and_safe_prevention():
     assert "raw_retention_days" in guide
     assert "logically deleted from the active sqlite tables" in lowered
     assert "not a secure-erasure guarantee" in lowered
-    assert "draft pull request" in lowered
+    assert "pull request ready for review" in lowered
+    assert "never reopens or converts an existing pr" in lowered
+    assert "at most 8 kib" in lowered
+    assert "not proof of its author's identity or authority" in lowered
     assert "regression test" in lowered
     assert "failing on the base" in lowered
     assert "passing with the draft" in lowered
@@ -378,7 +378,16 @@ def test_guardian_guide_documents_audit_cost_retention_and_safe_prevention():
     assert "consume another call slot" in lowered
     assert "max_model_calls_per_day >= max_attempts" in guide
     assert "max_attempts *" in guide
-    assert "(1 + max_prevention_drafts_per_run)" in guide
+    assert "(1 + drafts_per_poll)" in guide
+    assert "`max_prevention_drafts_per_run` and `max_prevention_drafts_per_day`" in guide
+    assert "durable utc-day cap" in lowered
+    assert "slots are never refunded" in lowered
+    assert "`limits.max_new_real_data_findings` (default 5)" in guide
+    assert "with or without a new blocking reason" in lowered
+    assert "adds a blocking reason with at most that many new findings" in lowered
+    assert "or timeout also rejects the candidate" in lowered
+    assert "max_prevention_drafts_per_day: 1" in _example_text()
+    assert "max_new_real_data_findings: 5" in _example_text()
     assert "daily_cost_limit_usd >= model_call_reservation_usd" in guide
     assert "report-only example pins the cap to zero" in lowered
     assert "cap provides two full" in _example_text()
@@ -389,6 +398,7 @@ def test_guardian_guide_documents_audit_cost_retention_and_safe_prevention():
 
 
 def test_guardian_guide_documents_bounded_closed_pr_history_without_legacy_writes():
+    """Distinguish bounded historical intake from new ready correction PRs."""
     guide = _guide_text()
     normalized = _normalized_guide()
 
@@ -445,10 +455,10 @@ def test_guardian_guide_documents_bounded_closed_pr_history_without_legacy_write
     assert "conflicting proposals for the same target" in normalized
     assert "unsafe cases remain deferred" in normalized
     assert "uncovered and selected for remediation" in normalized
-    assert "published only through a new bot-marked draft correction pr" in normalized
+    assert "published only through a new bot-marked, ready-for-review correction pr" in normalized
     assert "closed source pr and validated feedback" in normalized
     assert "leaves the historical pr and its branch untouched" in normalized
-    assert "separate from any optional pipeline-prevention draft" in normalized
+    assert "separate from any optional pipeline-prevention proposal" in normalized
     assert "observe` and `prepare` perform no github writes" in normalized
     assert "nested remediation policy may remain configured" in normalized
     assert "changing mode is the authority ceiling" in normalized
@@ -456,7 +466,9 @@ def test_guardian_guide_documents_bounded_closed_pr_history_without_legacy_write
     assert "zero is also the schema default" in normalized
     assert "one remediation batch per repository per poll" in normalized
     assert "global per-poll cap" in normalized
-    assert "new bot-marked draft pull request" in normalized
+    assert "new bot-marked pull request ready for human and automated review" in normalized
+    assert "bounded current-base correction prs ready for review" in normalized
+    assert "bounded current-base correction drafts" not in normalized
     assert "`[localize guardian bot]`" in normalized
     assert "title prefix and body text identify it as bot-generated" in normalized
     assert "signed commit" in normalized
@@ -548,30 +560,42 @@ def test_guardian_guide_has_consistent_cli_and_launchd_catch_up_instructions():
 def test_guardian_is_discoverable_without_implying_a_hosted_service():
     readme = README.read_text(encoding="utf-8")
     llms = LLMS.read_text(encoding="utf-8")
+    guide = _guide_text()
+    guardian_block = readme.split("## Optional Self-Hosted PR Guardian", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    normalized_readme = " ".join(guardian_block.casefold().split())
 
-    for text in (readme, llms):
+    assert "docs/guardian.md#install-and-configure" in guardian_block
+    assert "current pr and future runs" in normalized_readme
+    assert "human reviewers" in normalized_readme
+    assert "coderabbit" in normalized_readme
+    assert "signed commit" in normalized_readme
+    assert "regression test" in normalized_readme
+    assert "ready for review" in normalized_readme
+    assert "guardian never merges prs" in normalized_readme
+    assert "never silently approves" in normalized_readme
+    assert "self-hosted" in readme.casefold()
+    assert "each project runs its own guardian" in normalized_readme
+    assert "not a hosted service" in normalized_readme
+    assert "operator" in normalized_readme
+    assert "**`observe`**, the default" in normalized_readme
+    assert "without commits, pushes, or github comments" in normalized_readme
+    why_use = readme.split("## Why Use It", 1)[1].split("\n## ", 1)[0]
+    assert "Guardian" in why_use
+
+    # Operational reference details belong in the guide and agent index, not
+    # in the short README introduction. Dedicated guide tests cover recovery.
+    for text in (guide, llms):
         normalized = " ".join(text.split())
-        assert "docs/guardian.md" in text
         assert "examples/guardian.config.yaml" in text
         assert "self-hosted" in text.casefold()
         assert "operator" in text.casefold()
         assert "gpt-5.6-terra" in text
         assert "LOCALIZE_PLUGIN_MODULES" in text
         assert "manual `guardian run`" in normalized
-    assert "not a service run" in readme.casefold()
+    assert "docs/guardian.md" in llms
     assert "does not operate the guardian" in llms.casefold()
-    normalized_readme = " ".join(readme.casefold().split())
-    assert "new draft correction pr" in normalized_readme
-    assert "draft links the still-valid closed feedback" in normalized_readme
-    assert "never writes to the closed pr" in normalized_readme
-    assert "not an atomic snapshot" in normalized_readme
-    assert "completion requires a quiescent pass" in normalized_readme
-    assert "100 pages or 10,000 entries fails visibly" in normalized_readme
-    assert "three immediate hydration attempts" in normalized_readme
-    assert "multi-source recovery batch remains bounded and all-or-nothing" in normalized_readme
-    assert "destination and source observations are necessarily sequential" in normalized_readme
-    assert "discovery window admits new evidence only" in normalized_readme
-    assert "published branch cannot age out before reconciliation" in normalized_readme
 
 
 def test_guardian_public_files_stay_generic_and_have_no_project_runner():

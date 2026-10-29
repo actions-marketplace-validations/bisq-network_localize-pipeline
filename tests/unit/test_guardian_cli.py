@@ -729,6 +729,31 @@ def test_doctor_validates_local_dependencies_and_exact_github_identities(
     github_probe.assert_called_once()
 
 
+@pytest.mark.parametrize("split", [False, True])
+def test_doctor_reports_effective_prevention_model_without_claiming_availability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], split: bool,
+) -> None:
+    config_path = _init_config(tmp_path)
+    config = _prevention_doctor_config(config_path)
+    config = replace(config, runtime=replace(
+        config.runtime, codex_model="gpt-6-sol", codex_reasoning_effort="high",
+        prevention_model="gpt-6-astra" if split else None,
+        prevention_reasoning_effort="medium" if split else None,
+    ))
+    monkeypatch.setattr(cli, "_load_config_or_raise", lambda _: config)
+    monkeypatch.setattr(cli, "_command_available", lambda _: True)
+    monkeypatch.setattr(cli, "_probe_github", lambda _: ())
+    monkeypatch.setattr(cli, "_signing_key_configured", lambda *a, **kw: True)
+    monkeypatch.setattr(cli, "_prevention_sandbox_probe", lambda _: True)
+
+    assert cli.main(["doctor", "--config", str(config_path)]) == 0
+    output = capsys.readouterr().out
+    expected = "gpt-6-astra / medium" if split else "gpt-6-sol / high"
+    assert f"Prevention model/effort: configured {expected} (not capability-validated)" in output
+    assert "Codex model/effort: configured gpt-6-sol / high" in output
+
+
 def test_doctor_fails_when_codex_permission_canary_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1392,6 +1417,7 @@ def test_signing_probe_signs_and_verifies_with_exact_key_in_isolated_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify signing uses only the configured identity in its isolated context."""
     gnupg_home = tmp_path / "gnupg"
     gnupg_home.mkdir()
     gnupg_home.chmod(0o700)
@@ -1403,6 +1429,7 @@ def test_signing_probe_signs_and_verifies_with_exact_key_in_isolated_context(
     fingerprint = "A" * 40
 
     def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        """Record the signing probe invocation and return its configured test result."""
         calls.append((argv, dict(kwargs["env"])))  # type: ignore[arg-type]
         stderr = f"[GNUPG:] VALIDSIG {fingerprint}\n" if "verify-commit" in argv else ""
         return subprocess.CompletedProcess(argv, 0, "", stderr)
@@ -1480,12 +1507,14 @@ def test_ssh_signing_probe_uses_frozen_key_and_agent_only_for_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Confine signing material to the probe commit and approved snapshot path."""
     fingerprint = "SHA256:" + "A" * 43
     calls: list[tuple[list[str], dict[str, str]]] = []
     captured_snapshot: dict[str, object] = {}
 
     @contextmanager
     def fake_snapshot(**kwargs: object):
+        """Yield frozen SSH signing material without exposing a real private key."""
         captured_snapshot.update(kwargs)
         root = Path(kwargs["temporary_root"])
         yield SSHSigningMaterial(
@@ -1537,12 +1566,16 @@ def test_ssh_signing_probe_uses_frozen_key_and_agent_only_for_commit(
     assert any(argument.startswith("-S") for argument in commit_call[0])
     assert captured_snapshot["public_key_path"] == "/keys/guardian.pub"
     assert captured_snapshot["expected_fingerprint"] == fingerprint
+    # Match the runtime layout: an extra nested probe directory can exceed
+    # macOS's Unix-socket path limit for the pinned agent socket.
+    assert captured_snapshot["temporary_root"] == tmp_path
 
 
 def test_ssh_signing_probe_rejects_wrong_verified_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Reject a successful signature made by an unexpected SSH identity."""
     fingerprint = "SHA256:" + "A" * 43
 
     @contextmanager
@@ -2164,10 +2197,43 @@ def test_run_refuses_a_group_writable_authority_config(
     assert "GuardianCLIError" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("option,value", [
+    ("--human-evidence-limit", "0"), ("--human-evidence-limit", "-1"),
+    ("--human-evidence-limit", "101"), ("--human-evidence-limit", "not-an-integer"),
+    ("--human-evidence-after", "-1"), ("--human-evidence-after", "not-an-integer"),
+    ("--human-evidence-after", "9223372036854775808"),
+])
+def test_status_rejects_invalid_human_evidence_pages_before_state_access(monkeypatch, capsys, option, value):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Invalid pagination must be rejected before config or state access")
+
+    monkeypatch.setattr(cli, "_load_config_or_raise", forbidden)
+    monkeypatch.setattr(cli, "_locked_existing_state", forbidden)
+    with pytest.raises(SystemExit) as error:
+        cli.main(["status", "--config", "/unused/policy.yaml", option, value])
+    assert error.value.code == 2
+    output = capsys.readouterr()
+    assert "usage:" in output.err and option in output.err
+    assert "state is unavailable" not in output.err
+
+
+@pytest.mark.parametrize("limit,cursor", [(1, 0), (100, 7), (20, 9223372036854775807)])
+def test_status_accepts_human_evidence_page_boundaries(limit, cursor):
+    args = cli._build_parser().parse_args(["status", "--config", "/unused/policy.yaml",
+        "--human-evidence-limit", str(limit), "--human-evidence-after", str(cursor)])
+    assert (args.human_evidence_limit, args.human_evidence_after) == (limit, cursor)
+
+
+def test_status_preserves_default_human_evidence_page():
+    args = cli._build_parser().parse_args(["status", "--config", "/unused/policy.yaml"])
+    assert (args.human_evidence_limit, args.human_evidence_after) == (20, 0)
+
+
 def test_status_summarizes_audit_metadata_without_raw_bodies_or_messages(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """Keep human-readable status useful without exposing stored review text."""
     config_path = _init_config(tmp_path)
     capsys.readouterr()
     state_path = cli.guardian_state_path(config_path)
@@ -2220,6 +2286,7 @@ def test_status_summarizes_audit_metadata_without_raw_bodies_or_messages(
     assert "Guardian status" in output
     assert "mode: observe" in output
     assert "last completed run: 2026-08-30T09:01:00" in output
+    assert "last successful poll: none" in output
     assert "pending feedback revisions: 0" in output
     assert "actions: completed=1" in output
     assert "health: github=ok" in output
@@ -2231,10 +2298,49 @@ def test_status_summarizes_audit_metadata_without_raw_bodies_or_messages(
     assert secret not in output
 
 
+def test_status_distinguishes_last_successful_poll_from_later_failure(tmp_path, capsys):
+    """Do not let a later failed attempt replace the successful-poll timestamp."""
+    config_path = _init_config(tmp_path)
+    capsys.readouterr()
+    with GuardianState(cli.guardian_state_path(config_path)) as state:
+        state.record_health(
+            component="guardian", status="ok", message="Poll completed",
+            checked_at=datetime(2026, 9, 8, 8, 0, tzinfo=UTC),
+        )
+        state.record_health(
+            component="guardian", status="failed", message="Poll failed",
+            checked_at=datetime(2026, 9, 9, 8, 0, tzinfo=UTC),
+        )
+    assert cli.main(["status", "--config", str(config_path)]) == 0
+    output = capsys.readouterr().out
+    assert "last successful poll: 2026-09-08T08:00:00" in output
+    assert "health: guardian=failed" in output
+
+
+def test_status_exposes_private_failure_reference_without_raw_exception(tmp_path, capsys):
+    from localize.guardian.diagnostics import failure_audit, git_failure, record_failure
+    from localize.guardian.workspace import WorkspaceError
+
+    config_path = _init_config(tmp_path)
+    capsys.readouterr()
+    with GuardianState(cli.guardian_state_path(config_path)) as state, failure_audit(state):
+        record_failure(git_failure(WorkspaceError("secret /Users/private"),
+                                   operation="push", returncode=128,
+                                   output="Permission denied: secret /Users/private"))
+    assert cli.main(["status", "--config", str(config_path)]) == 0
+    output = capsys.readouterr().out
+    assert "last failure diagnostic: #" in output
+    assert '"stage": "push"' in output
+    assert '"exit_code": 128' in output
+    assert "secret" not in output
+    assert "/Users/" not in output
+
+
 def test_status_is_read_only_when_no_state_database_exists(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """Do not create state merely to report that Guardian has not run."""
     config_path = _init_config(tmp_path)
     capsys.readouterr()
     state_path = cli.guardian_state_path(config_path)
@@ -3104,3 +3210,16 @@ def test_guardian_result_schema_is_declared_as_wheel_package_data() -> None:
     ]
     schema = project_root / "localize/guardian/schemas/guardian-result.schema.json"
     assert json.loads(schema.read_text(encoding="utf-8"))["type"] == "object"
+
+
+def test_status_exposes_decline_reference_without_untrusted_rationale(tmp_path, capsys):
+    config_path = _init_config(tmp_path)
+    capsys.readouterr()
+    with GuardianState(cli.guardian_state_path(config_path)) as state:
+        state.record_health(component="prevention-author", status="declined",
+                            message="private", details={"reason": "project_policy", "explanation": "private-untrusted-prose"})
+    assert cli.main(["status", "--config", str(config_path)]) == 0
+    output = capsys.readouterr().out
+    assert "latest prevention decline: #" in output
+    assert "project_policy" in output and "not repair proof" in output
+    assert "private-untrusted-prose" not in output

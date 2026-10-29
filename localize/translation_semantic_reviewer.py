@@ -23,7 +23,7 @@ from localize.json_response import (
     chat_reasoning_effort_kwargs,
     loads_json_object,
 )
-from localize.model_provider import (
+from localize.providers.models import (
     ChatModelProvider,
     DEFAULT_MODEL_PROVIDER,
     ModelProviderConfigurationError,
@@ -31,7 +31,7 @@ from localize.model_provider import (
     create_model_provider,
     normalize_reasoning_effort,
 )
-from localize.placeholder_rules import (
+from localize.formats.placeholders import (
     DEFAULT_PLACEHOLDER_PROFILE,
     set_placeholder_profile,
     validate_placeholder_profile,
@@ -108,6 +108,24 @@ def build_semantic_review_messages(
         "Do not infer or restore details, constraints, numbers, or behavior that are absent "
         "from source_value, even if they seem plausible from the key or product domain. "
         "A shorter or more generic target is correct when the source is equally generic. "
+        'Return {"findings": []} if all provided translations are correct. '
+        "Correct translations must not receive a finding or a suggested correction. "
+        "Use severity error only for a material discrepancy supported by source_value, "
+        "such as a changed actor, action, trigger, condition, negation, obligation, "
+        "quantity, or brand identity. Faithful paraphrases, synonyms, and natural "
+        "target-language grammar are correct; stylistic preferences are not errors. "
+        "Warnings may identify a concrete violation of the supplied style_rules that "
+        "does not change meaning; personal stylistic preferences alone are not findings. "
+        "Every error reason must identify the source meaning and the specific target "
+        "discrepancy; do not invent a discrepancy to fill the response schema. "
+        "For each change, compare who performs each action, what event triggers it, and "
+        "every condition or threshold attached to that event. Report an error if the target "
+        "omits or changes an action trigger, even when it preserves a numeric threshold. "
+        "Do not flag a paraphrase that preserves both the trigger and its conditions. "
+        "For .properties files, keep suggested_value on one physical line: represent "
+        "value whitespace with literal backslash escapes such as \\n, \\r, or \\t, "
+        "never actual CR/LF characters. This rule applies only to .properties; preserve "
+        "the native value representation for other file formats. "
         f"Keep suggested_value under {SEMANTIC_REVIEW_SUGGESTED_VALUE_MAX_CHARS} characters."
     )
     user_payload = {
@@ -116,6 +134,8 @@ def build_semantic_review_messages(
         "style_rules": list(style_rules),
         "brand_glossary": list(brand_glossary),
         "allowed_severities": ["error", "warning"],
+        "no_issues_response": {"findings": []},
+        "properties_suggestion_example": r"First line\nSecond line",
         "response_schema": {
             "findings": [
                 {

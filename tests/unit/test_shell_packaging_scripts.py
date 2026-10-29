@@ -99,11 +99,12 @@ def test_dockerfile_uses_orchestration_default_command():
 
 
 def test_dockerfile_builds_go_tools_with_fixed_dependencies():
+    """Require pinned Go toolchains, source revisions, and verified dependency versions."""
     dockerfile = (REPO_ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
 
     go_builder = (
-        "FROM golang:1.26.6-bookworm@"
-        "sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36"
+        "FROM golang:1.26.10-bookworm@"
+        "sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af"
     )
     assert dockerfile.count(go_builder) == 4
     assert "ARG GH_VERSION=2.96.0" in dockerfile
@@ -116,22 +117,27 @@ def test_dockerfile_builds_go_tools_with_fixed_dependencies():
     assert "ARG GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513" in dockerfile
     assert "ARG X_SYS_VERSION=0.46.0" in dockerfile
     assert "ARG GRPC_VERSION=1.83.2" in dockerfile
-    assert "ARG X_MOD_VERSION=0.40.0" in dockerfile
+    assert "ARG COMPRESS_VERSION=1.18.7" in dockerfile
+    assert "ARG X_MOD_VERSION=0.41.0" in dockerfile
     assert "ARG GO_GIT_VERSION=5.19.2" in dockerfile
-    assert "ARG X_CRYPTO_VERSION=0.55.0" in dockerfile
-    assert "ARG X_TEXT_VERSION=0.41.0" in dockerfile
-    assert "ARG X_TEXT_VERSION=0.40.0" in dockerfile
+    assert "ARG X_CRYPTO_VERSION=0.57.0" in dockerfile
+    assert dockerfile.count("ARG X_TEXT_VERSION=0.42.0") == 2
+    assert dockerfile.count("ARG X_NET_VERSION=0.60.0") == 3
     assert 'test "$(git rev-parse HEAD)" = "$GH_COMMIT"' in dockerfile
     assert 'test "$(git rev-parse HEAD)" = "$YQ_COMMIT"' in dockerfile
     assert 'test "$(git rev-parse HEAD)" = "$TX_COMMIT"' in dockerfile
     assert 'test "$(git rev-parse HEAD)" = "$GOSU_COMMIT"' in dockerfile
     assert 'go get "google.golang.org/grpc@v${GRPC_VERSION}"' in dockerfile
+    assert 'go get "github.com/klauspost/compress@v${COMPRESS_VERSION}"' in dockerfile
     assert 'go get "golang.org/x/mod@v${X_MOD_VERSION}"' in dockerfile
     assert 'go get "github.com/go-git/go-git/v5@v${GO_GIT_VERSION}"' in dockerfile
     assert 'go get "golang.org/x/crypto@v${X_CRYPTO_VERSION}"' in dockerfile
     assert 'go get "golang.org/x/sys@v${X_SYS_VERSION}"' in dockerfile
     assert dockerfile.count('go get "golang.org/x/text@v${X_TEXT_VERSION}"') == 2
+    assert dockerfile.count('go get "golang.org/x/net@v${X_NET_VERSION}"') == 3
+    assert dockerfile.count("golang[.]org/x/net[[:space:]]+v${X_NET_VERSION}") == 3
     assert "golang[.]org/x/mod[[:space:]]+v${X_MOD_VERSION}" in dockerfile
+    assert "github[.]com/klauspost/compress[[:space:]]+v${COMPRESS_VERSION}" in dockerfile
     assert "golang[.]org/x/crypto[[:space:]]+v${X_CRYPTO_VERSION}" in dockerfile
     assert "COPY --from=yq-builder /out/yq /usr/bin/yq" in dockerfile
     assert "COPY --from=tx-builder /out/tx /usr/local/bin/tx" in dockerfile

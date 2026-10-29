@@ -60,6 +60,12 @@ from localize.guardian.prevention_runtime import (
     PreventionSourceAuthorityError,
     SandboxedTestRunner,
 )
+from localize.guardian.real_data_impact import (
+    QualityGateSummary,
+    RealDataCorpus,
+    RealDataImpactResult,
+    RealDataImpactRun,
+)
 from localize.guardian.remediation import RemediationSourceAuthorityError
 from localize.guardian.state import (
     GuardianState,
@@ -79,6 +85,7 @@ CANDIDATE_SHA = "b" * 40
 TOKEN = "github-token-never-log"
 PUBLICATION_ACTOR = TrustedActor("guardian-publisher", 301, "User")
 OPEN_SOURCE_REVISION_ID = 1
+REAL_DATA = RealDataCorpus(root=Path("/nonexistent/guardian-real-data"), file_count=1)
 
 
 class _FakeClock:
@@ -169,6 +176,7 @@ def _open_source_kwargs() -> dict[str, object]:
         "open_source": _open_source(),
         "source_event_revision_ids": (OPEN_SOURCE_REVISION_ID,),
         "require_exact_open_source_authority": _open_source_authority,
+        "real_data": REAL_DATA,
     }
 
 
@@ -283,7 +291,9 @@ def test_prevention_broker_binds_credential_to_publication_actor(
     authenticated_actor: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Reject publication credentials belonging to a different numeric actor."""
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve pinned GitHub actor and repository responses for the broker test."""
         if request.url.path == "/user":
             return _response(request, authenticated_actor)
         raise AssertionError("repository authority must not be read for a wrong actor")
@@ -303,6 +313,7 @@ def test_prevention_broker_binds_credential_to_publication_actor(
 def test_prevention_broker_does_not_treat_mutable_actor_login_as_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Allow account renames without relaxing numeric actor authorization."""
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/user":
             return _response(
@@ -324,6 +335,9 @@ def test_prevention_broker_does_not_treat_mutable_actor_login_as_authority(
     )
 
     assert broker.capture_base().revision.sha == BASE_SHA
+    assert broker.publication_author_email() == (
+        "301+renamed-guardian-bot@users.noreply.github.com"
+    )
 
 
 @pytest.mark.parametrize(
@@ -548,7 +562,9 @@ def _recovery_broker(
     exact_pull: dict[str, object],
     event_pages: dict[int, list[object]] | None = None,
     listed_pull: dict[str, object] | None = None,
+    create_as_draft: bool = True,
 ) -> PreventionGitHubBroker:
+    """Mock exact remote PR metadata and paginated lifecycle recovery events."""
     pull_number = int((listed_pull or exact_pull)["number"])
     event_pages = event_pages or {1: []}
 
@@ -577,21 +593,32 @@ def _recovery_broker(
         token_command=("credential-helper",),
         base_url="https://api.github.test",
         transport=httpx.MockTransport(handler),
+        create_as_draft=create_as_draft,
     )
+
+
+def _write_author_decision(argv):
+    path = Path(argv[argv.index("-o") + 1])
+    path.write_text(json.dumps({"schema_version": 1, "outcome": "patch", "reason": "",
+                                "explanation": "Implemented the generic correction and regression test.",
+                                "inspected_paths": ["localize/rules.py"]}))
 
 
 def test_prevention_author_uses_workspace_write_stdin_and_scrubs_write_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Limit authoring to its workspace and keep publication credentials absent."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     observed: dict[str, object] = {}
 
     def fake_run(argv, **kwargs):
+        """Return controlled subprocess output without executing external commands."""
         observed["argv"] = list(argv)
         observed["kwargs"] = kwargs
         observed["launch_environment"] = dict(kwargs["env"])
+        _write_author_decision(argv)
         return subprocess.CompletedProcess(
             argv,
             0,
@@ -617,12 +644,13 @@ def test_prevention_author_uses_workspace_write_stdin_and_scrubs_write_credentia
         auth_mode=CodexAuthMode.API_KEY,
         timeout_seconds=17,
     )
+    policy = replace(_prevention_policy(), max_changed_files=2, max_changed_bytes=32_768)
     result = author.run(
         workspace=workspace,
         scope="pipeline_code",
         summary="Preserve indexed placeholders in the validator",
         evidence_feedback_ids=("review_comment:42:revision-7",),
-        policy=_prevention_policy(),
+        policy=policy,
         api_key="explicit-model-key",
     )
 
@@ -643,8 +671,19 @@ def test_prevention_author_uses_workspace_write_stdin_and_scrubs_write_credentia
     assert kwargs["input"].startswith("You are preparing")
     assert "Preserve indexed placeholders" in kwargs["input"]
     assert "Preserve indexed placeholders" not in argv
+    instructions, request_json = kwargs["input"].split("UNTRUSTED_REQUEST_JSON\n", 1)
+    request = json.loads(request_json)
+    assert request["max_changed_files"] == 2
+    assert request["max_changed_bytes"] == 32_768
+    assert "full" in instructions and "before" in instructions and "after" in instructions
+    assert "not diff" in instructions
+    assert "unpatched base" in instructions
+    assert "fail by assertion" in instructions
+    assert "exit code 1" in instructions and "exit code 0" in instructions
+    assert "top-level imports of newly added helpers" in instructions
     assert kwargs["timeout"] == 17
     assert kwargs["limits"].require_linux_cgroup is True
+    assert kwargs["limits"].max_file_size_bytes == 128 * 1024 * 1024
     launch_environment = observed["launch_environment"]
     assert isinstance(launch_environment, dict)
     assert launch_environment["CODEX_API_KEY"] == "explicit-model-key"
@@ -658,6 +697,8 @@ def test_prevention_author_uses_workspace_write_stdin_and_scrubs_write_credentia
         "SSH_AUTH_SOCK",
     ):
         assert forbidden not in kwargs["env"]
+    assert result.decision.outcome == "patch"
+    assert "--output-schema" in argv
     assert result.usage == CodexUsage(input_tokens=12, output_tokens=3, cost_usd=0.02)
 
 
@@ -775,6 +816,7 @@ def test_prevention_author_never_inherits_a_host_model_credential(
 
     def fake_run(argv, **kwargs):
         observed_environment.update(kwargs["env"])
+        _write_author_decision(argv)
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(prevention_runtime, "run_bounded_process", fake_run)
@@ -815,6 +857,7 @@ def test_prevention_author_clamps_process_to_remaining_poll_deadline(
 
     def fake_run(argv, **kwargs):
         observed_timeout.append(kwargs["timeout"])
+        _write_author_decision(argv)
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(prevention_runtime, "run_bounded_process", fake_run)
@@ -1428,9 +1471,12 @@ def test_sandboxed_runner_fails_closed_if_parent_cannot_create_canary(
     assert subprocess_calls == 0
 
 
+@pytest.mark.parametrize("create_as_draft", [True, False])
 def test_github_broker_revalidates_numeric_identities_and_opens_draft_only(
     monkeypatch: pytest.MonkeyPatch,
+    create_as_draft: bool,
 ) -> None:
+    """Keep publication guards identical for draft and ready creation."""
     branch = "guardian/prevention-" + "d" * 64
     evidence_hash = "d" * 64
     marker = PreventionGitHubBroker._marker(evidence_hash, CANDIDATE_SHA)
@@ -1453,7 +1499,7 @@ def test_github_broker_revalidates_numeric_identities_and_opens_draft_only(
         if path == "/repos/guardian/pipeline/pulls" and request.method == "POST":
             assert lease_checks == 2
             payload = json.loads(request.content)
-            assert payload["draft"] is True
+            assert payload["draft"] is create_as_draft
             assert payload["maintainer_can_modify"] is False
             assert payload["head"] == f"guardian:{branch}"
             assert marker in payload["body"]
@@ -1463,7 +1509,7 @@ def test_github_broker_revalidates_numeric_identities_and_opens_draft_only(
                     number=17,
                     branch=branch,
                     body=payload["body"],
-                    draft=True,
+                    draft=create_as_draft,
                 ),
                 status=201,
             )
@@ -1479,6 +1525,7 @@ def test_github_broker_revalidates_numeric_identities_and_opens_draft_only(
         token_command=("credential-helper",),
         base_url="https://api.github.test",
         transport=httpx.MockTransport(handler),
+        create_as_draft=create_as_draft,
     )
     base = broker.capture_base()
     assert base.revision == _base_revision()
@@ -1533,8 +1580,8 @@ def test_github_broker_revalidates_numeric_identities_and_opens_draft_only(
 @pytest.mark.parametrize(
     ("state", "draft", "closed_at", "actor_id", "message"),
     [
-        ("closed", True, "2026-09-03T09:00:00Z", PUBLICATION_ACTOR.id, "open draft"),
-        ("open", False, None, PUBLICATION_ACTOR.id, "open draft"),
+        ("closed", True, "2026-09-03T09:00:00Z", PUBLICATION_ACTOR.id, "requested draft state"),
+        ("open", False, None, PUBLICATION_ACTOR.id, "requested draft state"),
         ("open", True, None, 999, "exact policy"),
     ],
     ids=("closed", "ready", "wrong-author"),
@@ -2022,13 +2069,16 @@ def test_github_broker_stable_observation_is_json_type_sensitive(
     ],
     ids=("untouched-draft", "ready", "closed-draft", "ready-then-closed"),
 )
+@pytest.mark.parametrize("create_as_draft", [True, False])
 def test_github_broker_recovers_only_allowed_terminal_lifecycles(
     state: str,
     draft: bool,
     events: list[object],
     closed_at: str | None,
     monkeypatch: pytest.MonkeyPatch,
+    create_as_draft: bool,
 ) -> None:
+    """Recover only exact legacy-draft lifecycle states under either creation mode."""
     branch = "guardian/prevention-" + "1" * 64
     evidence_hash = "1" * 64
     marker = PreventionGitHubBroker._marker(evidence_hash, CANDIDATE_SHA)
@@ -2047,6 +2097,7 @@ def test_github_broker_recovers_only_allowed_terminal_lifecycles(
         branch=branch,
         exact_pull=pull,
         event_pages={1: events},
+        create_as_draft=create_as_draft,
     )
 
     recovered = broker.open_draft(
@@ -2121,6 +2172,7 @@ def test_github_broker_recovers_only_allowed_terminal_lifecycles(
         "merged",
     ),
 )
+@pytest.mark.parametrize("create_as_draft", [True, False])
 def test_github_broker_rejects_modified_or_reopened_lifecycle(
     state: str,
     draft: bool,
@@ -2128,7 +2180,9 @@ def test_github_broker_rejects_modified_or_reopened_lifecycle(
     merged_at: str | None,
     closed_at: str | None,
     monkeypatch: pytest.MonkeyPatch,
+    create_as_draft: bool,
 ) -> None:
+    """Reject redrafted, reopened, or merged prevention PRs in either mode."""
     branch = "guardian/prevention-" + "2" * 64
     evidence_hash = "2" * 64
     marker = PreventionGitHubBroker._marker(evidence_hash, CANDIDATE_SHA)
@@ -2148,6 +2202,7 @@ def test_github_broker_rejects_modified_or_reopened_lifecycle(
         branch=branch,
         exact_pull=pull,
         event_pages={1: events},
+        create_as_draft=create_as_draft,
     )
 
     with pytest.raises(PreventionRemoteConflictError, match="lifecycle"):
@@ -2160,6 +2215,39 @@ def test_github_broker_rejects_modified_or_reopened_lifecycle(
             body="Validated body\n",
             before_create=lambda: pytest.fail("recovery must not create a PR"),
         )
+
+
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("annotated", [False, True])
+def test_ready_created_prevention_recovers_without_a_draft_transition(
+    monkeypatch, closed, annotated
+):
+    """Recover a lost ready-creation response without a second publication."""
+    evidence_hash = "1" * 64
+    branch = "guardian/prevention-" + evidence_hash
+    marker = PreventionGitHubBroker._marker(evidence_hash, CANDIDATE_SHA)
+    pull = _pull_payload(
+        number=41, branch=branch, body=f"{marker}\nValidated body\n", draft=False,
+        state="closed" if closed else "open",
+        closed_at="2026-09-03T09:00:00Z" if closed else None,
+    )
+    if annotated:
+        pull["body"] += (
+            "\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->"
+            "\n\n## Summary by CodeRabbit\n\n- Clarified translation behavior.\n\n"
+            "<!-- end of auto-generated comment: release notes by coderabbit.ai -->"
+        )
+    broker = _recovery_broker(
+        monkeypatch, branch=branch, exact_pull=pull, create_as_draft=False,
+        event_pages={1: [_issue_event(1, "closed")] if closed else []},
+    )
+    result = broker.open_draft(
+        branch=branch, expected_base_sha=BASE_SHA, candidate_sha=CANDIDATE_SHA,
+        evidence_hash=evidence_hash, title=str(pull["title"]), body="Validated body\n",
+        before_create=lambda: pytest.fail("recovery must not publish"),
+    )
+    assert result.number == 41
+    assert result.created is False
 
 
 @pytest.mark.parametrize(
@@ -2808,6 +2896,8 @@ class _FakeWorkspace:
         self.published = False
 
     def commit_prevention_changes(self, *, expected_paths, evidence_hash, **_kwargs):
+        """Assert the prevention signer uses the broker-authenticated account identity."""
+        assert _kwargs["author_email"] == self.broker.publication_author_email()
         assert set(expected_paths) == {"localize/rules.py", "tests/unit/test_rules.py"}
         assert len(evidence_hash) == 64
         return CommitResult(
@@ -2873,7 +2963,31 @@ class _FakeAuthor:
         )
 
 
+def _impact(
+    base: QualityGateSummary | None = QualityGateSummary((), 0),
+    candidate: QualityGateSummary | None = QualityGateSummary((), 0),
+    *,
+    candidate_outcome: TestOutcome = TestOutcome.PASSED,
+) -> RealDataImpactResult:
+    return RealDataImpactResult(
+        base=RealDataImpactRun(TestOutcome.PASSED, 0, base),
+        candidate=RealDataImpactRun(
+            candidate_outcome,
+            0 if candidate_outcome is TestOutcome.PASSED else 3,
+            candidate if candidate_outcome is TestOutcome.PASSED else None,
+        ),
+    )
+
+
 class _FakeTestRunner:
+    def __init__(self, impact: RealDataImpactResult | None = None) -> None:
+        self.impact = impact or _impact()
+        self.impact_calls: list[dict[str, object]] = []
+
+    def run_real_data_impact(self, **kwargs) -> RealDataImpactResult:
+        self.impact_calls.append(dict(kwargs))
+        return self.impact
+
     def run_pair(
         self,
         *,
@@ -2913,12 +3027,18 @@ class _FakeBroker:
         private: bool = False,
         mutation_order: list[str] | None = None,
     ) -> None:
+        """Initialize a publication spy with independent actor and remote state."""
         self.private = private
         self.mutation_order = mutation_order
         self.branch_shas: dict[str, str] = {}
         self.capture_calls = 0
         self.verify_calls = 0
         self.open_calls = 0
+        self.actor_login = "guardian-publisher"
+
+    def publication_author_email(self) -> str:
+        """Return the test broker's current authenticated noreply identity."""
+        return f"301+{self.actor_login}@users.noreply.github.com"
 
     def capture_base(self) -> PreventionBaseSnapshot:
         self.capture_calls += 1
@@ -2991,6 +3111,8 @@ def _coordinator(
     max_drafts: int = 1,
     api_billed: bool = True,
     max_model_calls_per_day: int = 4,
+    max_drafts_per_day: int = 10,
+    max_new_real_data_findings: int = 5,
     model_credential_provider=lambda: "model-key",
     test_runner: _FakeTestRunner | None = None,
     now=lambda: datetime(2026, 8, 30, 12, 0, tzinfo=UTC),
@@ -3017,6 +3139,8 @@ def _coordinator(
         signing_key="signing-key",
         signing_environment=None,
         max_drafts=max_drafts,
+        max_drafts_per_day=max_drafts_per_day,
+        max_new_real_data_findings=max_new_real_data_findings,
         reservation_usd=1.0 if api_billed else None,
         daily_limit_usd=5.0 if api_billed else None,
         max_model_calls_per_day=max_model_calls_per_day,
@@ -3486,9 +3610,12 @@ def _historical_prevention_source(
     return source, revision.revision_id
 
 
+@pytest.mark.parametrize("actor_login", ["guardian-publisher", "renamed-publisher"])
 def test_coordinator_authors_proves_signs_publishes_draft_and_deduplicates(
     tmp_path: Path,
+    actor_login: str,
 ) -> None:
+    """Exercise signed prevention publication, renamed actors, and duplicate suppression."""
     now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
     with GuardianState(tmp_path / "state.sqlite3") as state:
         run_id = state.start_run(
@@ -3498,6 +3625,7 @@ def test_coordinator_authors_proves_signs_publishes_draft_and_deduplicates(
             started_at=now,
         )
         broker = _FakeBroker()
+        broker.actor_login = actor_login
         author = _FakeAuthor()
         coordinator = _coordinator(
             state=state,
@@ -3691,6 +3819,7 @@ def test_new_proposal_reconciles_exact_pr_before_base_or_branch_revalidation(
             broker=broker,
             author=author,
         ).propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
@@ -3875,6 +4004,7 @@ def test_coordinator_rejects_swapped_feedback_revision_bindings_before_model(
         )
 
         outcome = coordinator.propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(candidate,),
             evidence_revision_ids={
@@ -3935,6 +4065,7 @@ def test_coordinator_rejects_deleted_exact_source_before_model(
         )
 
         outcome = coordinator.propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": deleted.revision_id},
@@ -4055,6 +4186,7 @@ def test_coordinator_requires_current_base_callback_on_both_entry_points(
             )
         with pytest.raises(TypeError, match="require_current_base_unchanged"):
             coordinator.propose(
+                real_data=REAL_DATA,
                 policy=_repository_policy(),
                 recurrence_candidates=(),
                 evidence_revision_ids={},
@@ -4128,6 +4260,7 @@ def test_coordinator_revalidates_current_base_at_remote_and_terminal_boundaries(
                 "login": "guardian-publisher",
                 "type": "User",
             },
+            "quality_report_actor": None,
             "prevention": {
                 "allowed_code_path_globs": ["localize/*.py"],
                 "allowed_test_path_globs": ["tests/**/*.py"],
@@ -4248,6 +4381,7 @@ def test_historical_prevention_revalidates_sources_at_push_post_and_completion(
             order.append("source")
 
         outcome = coordinator.propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": revision_id},
@@ -4298,6 +4432,7 @@ def test_open_prevention_revalidates_exact_source_at_push_post_and_completion(
             order.append("source")
 
         outcome = coordinator.propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
@@ -4347,6 +4482,7 @@ def test_successful_post_is_durable_before_source_authority_is_revoked(
                 raise PreventionSourceAuthorityError("source was deleted after POST")
 
         first = coordinator.propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
@@ -4452,6 +4588,7 @@ def test_source_edit_racing_post_response_cannot_orphan_created_pr(
             )
 
         outcome = coordinator.propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
@@ -4572,6 +4709,7 @@ def test_prevention_rejects_evidence_outside_exact_source_before_authoring(
             broker=broker,
             author=author,
         ).propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
@@ -4694,6 +4832,7 @@ def test_open_source_authority_veto_prevents_branch_publication(
             broker=broker,
             author=author,
         ).propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
@@ -4940,6 +5079,7 @@ def test_pending_exact_pr_recovery_precedes_new_intake_validation(
 
         with pytest.raises((TypeError, ValueError)):
             coordinator.propose(
+                real_data=REAL_DATA,
                 policy=_repository_policy(),
                 recurrence_candidates=candidates,
                 evidence_revision_ids={},
@@ -5180,6 +5320,7 @@ def test_transient_open_source_revalidation_does_not_starve_new_intake(
             broker=ExistingPullBroker(),
             author=author,
         ).propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(_candidate(),),
             evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
@@ -5378,6 +5519,7 @@ def test_removed_prevention_policy_still_reconciles_pending_remote_state(
             )
         else:
             outcome = coordinator.propose(
+                real_data=REAL_DATA,
                 policy=revoked_policy,
                 recurrence_candidates=(_candidate(),),
                 evidence_revision_ids={},
@@ -5948,6 +6090,7 @@ def test_recovery_workset_runs_only_once_per_repository_per_poll(
             require_exact_open_source_authority=_open_source_authority,
         )
         second = coordinator.propose(
+            real_data=REAL_DATA,
             policy=_repository_policy(),
             recurrence_candidates=(),
             evidence_revision_ids={},
@@ -7208,7 +7351,8 @@ def test_coordinator_accounts_author_retries_on_their_actual_utc_days(
 ) -> None:
     first_day = datetime(2026, 8, 30, 23, 59, tzinfo=UTC)
     second_day = datetime(2026, 8, 31, 0, 1, tzinfo=UTC)
-    timestamps = iter((first_day, first_day, second_day, second_day))
+    # The final read charges the daily prevention publication slot.
+    timestamps = iter((first_day, first_day, second_day, second_day, second_day))
 
     class RetryingAuthor(_FakeAuthor):
         max_attempts = 2
@@ -7250,7 +7394,7 @@ def test_coordinator_accounts_author_retries_on_their_actual_utc_days(
         assert float(state.budget_committed_for_day(second_day.date())) == 0.01
 
 
-def test_coordinator_skips_project_specific_scope_and_requires_private_opt_in(
+def test_coordinator_holds_missing_policy_context_and_requires_private_opt_in(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
@@ -7283,7 +7427,8 @@ def test_coordinator_skips_project_specific_scope_and_requires_private_opt_in(
             require_current_base_unchanged=_current_base,
             **_open_source_kwargs(),
         )
-        assert outcome.skipped == 1
+        assert outcome.policy_proposals == ()
+        assert outcome.failures == ("PolicyProposalError",)
         assert author.calls == 0
 
     private_root = tmp_path / "private"
@@ -7449,6 +7594,7 @@ def test_source_preflight_generic_error_preserves_lease_loss(
 
         with pytest.raises(prevention_runtime.PreventionLeaseLostError):
             coordinator.propose(
+                real_data=REAL_DATA,
                 policy=_repository_policy(),
                 recurrence_candidates=(_candidate(),),
                 evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
@@ -8675,3 +8821,661 @@ def test_orphan_recovery_defensively_caps_global_workset_at_one_hundred(
         assert outcome == prevention_runtime.PreventionBatchOutcome()
         assert requested_limits == [100]
         assert record_reads == 100
+
+
+def _propose_once(
+    coordinator: PreventionCoordinator,
+    state: GuardianState,
+    *,
+    now: datetime,
+    summary: str = "Placeholder validation omitted one token family",
+    **overrides: object,
+):
+    run_id = state.start_run(
+        repository="acme/translations",
+        locale="ru",
+        mode=GuardianMode.PROPOSE_PREVENTION,
+        started_at=now,
+    )
+    kwargs = {**_open_source_kwargs(), **overrides}
+    return coordinator.propose(
+        policy=_repository_policy(),
+        recurrence_candidates=(_candidate(summary),),
+        evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
+        run_id=run_id,
+        observed_at=now,
+        require_live_lease=_live_lease,
+        require_current_base_unchanged=_current_base,
+        **kwargs,
+    )
+
+
+def _prevention_event_count(state: GuardianState) -> int:
+    return state._connection.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM prevention_draft_events"
+    ).fetchone()[0]
+
+
+def test_candidate_flagging_many_existing_real_entries_is_never_published(
+    tmp_path: Path,
+) -> None:
+    from localize.guardian.diagnostics import failure_audit
+
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    # PR #192 shape: the base gate passes on bisq2#5017 data, while the new
+    # rule flags hundreds of markup/placeholder-only values as blocking errors.
+    runner = _FakeTestRunner(
+        _impact(
+            QualityGateSummary((), 3),
+            QualityGateSummary(
+                ("Semantic translation QA findings require manual resolution.",),
+                259,
+            ),
+        )
+    )
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=_FakeAuthor(),
+            test_runner=runner,
+        )
+        with failure_audit(state):
+            outcome = _propose_once(coordinator, state, now=now)
+        diagnostic = state.latest_health("guardian-failure")
+
+        assert outcome.drafts == ()
+        assert outcome.failures == ("PreventionPolicyError",)
+        assert broker.open_calls == 0
+        assert broker.verify_calls == 0
+        assert coordinator.checkout_factory.publications == 0
+        assert _prevention_event_count(state) == 0
+        assert (
+            state.prevention_publication_slots_for_day(coordinator.now().date())
+            == 0
+        )
+        assert len(runner.impact_calls) == 1
+        call = runner.impact_calls[0]
+        assert call["corpus"] is REAL_DATA
+        assert call["base_workspace"] != call["candidate_workspace"]
+        assert diagnostic is not None
+        assert diagnostic.details["stage"] == "real-data-impact"
+        assert diagnostic.details["reason"] == "new_blocking_reasons"
+        assert diagnostic.details["base_findings"] == 3
+        assert diagnostic.details["candidate_findings"] == 259
+        assert diagnostic.details["new_blocking_reasons"] == 1
+
+
+def test_candidate_exceeding_new_real_data_finding_bound_is_rejected(
+    tmp_path: Path,
+) -> None:
+    from localize.guardian.diagnostics import failure_audit
+
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    runner = _FakeTestRunner(
+        _impact(QualityGateSummary((), 10), QualityGateSummary((), 16))
+    )
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=_FakeAuthor(),
+            test_runner=runner,
+            max_new_real_data_findings=5,
+        )
+        with failure_audit(state):
+            outcome = _propose_once(coordinator, state, now=now)
+        diagnostic = state.latest_health("guardian-failure")
+
+    assert outcome.drafts == ()
+    assert outcome.failures == ("PreventionPolicyError",)
+    assert broker.open_calls == 0
+    assert diagnostic.details["reason"] == "findings_increase"
+
+
+def test_narrow_candidate_within_real_data_bound_is_published(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    runner = _FakeTestRunner(
+        _impact(
+            QualityGateSummary(("Existing reason",), 10),
+            QualityGateSummary(("Existing reason",), 15),
+        )
+    )
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=_FakeAuthor(),
+            test_runner=runner,
+        )
+        outcome = _propose_once(coordinator, state, now=now)
+
+        assert len(outcome.drafts) == 1
+        assert outcome.failures == ()
+        assert broker.open_calls == 1
+        assert (
+            state.prevention_publication_slots_for_day(coordinator.now().date())
+            == 1
+        )
+
+
+def test_real_data_impact_is_measured_on_frozen_base_and_candidate_trees(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    observed: dict[str, str] = {}
+
+    class TreeRecordingRunner(_FakeTestRunner):
+        def run_real_data_impact(self, **kwargs):
+            observed["base"] = (kwargs["base_workspace"] / "localize/rules.py").read_text(
+                encoding="utf-8"
+            )
+            observed["candidate"] = (
+                kwargs["candidate_workspace"] / "localize/rules.py"
+            ).read_text(encoding="utf-8")
+            return super().run_real_data_impact(**kwargs)
+
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=_FakeBroker(),
+            author=_FakeAuthor(),
+            test_runner=TreeRecordingRunner(),
+        )
+        outcome = _propose_once(coordinator, state, now=now)
+
+    assert len(outcome.drafts) == 1
+    assert observed == {
+        "base": "def preserve(value):\n    return value\n",
+        "candidate": "def preserve(value):\n    return value.strip()\n",
+    }
+
+
+@pytest.mark.parametrize(
+    "candidate_outcome",
+    (TestOutcome.ERROR, TestOutcome.TIMED_OUT),
+)
+def test_real_data_impact_error_or_timeout_rejects_candidate(
+    tmp_path: Path,
+    candidate_outcome: TestOutcome,
+) -> None:
+    from localize.guardian.diagnostics import failure_audit
+
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    runner = _FakeTestRunner(_impact(candidate_outcome=candidate_outcome))
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=_FakeAuthor(),
+            test_runner=runner,
+        )
+        with failure_audit(state):
+            outcome = _propose_once(coordinator, state, now=now)
+        diagnostic = state.latest_health("guardian-failure")
+
+    assert outcome.drafts == ()
+    assert outcome.failures == ("PreventionPolicyError",)
+    assert broker.open_calls == 0
+    assert diagnostic.details["reason"] == "impact_run_failed"
+
+
+def test_missing_real_data_rejects_candidate_before_model_call(
+    tmp_path: Path,
+) -> None:
+    from localize.guardian.diagnostics import failure_audit
+
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        author = _FakeAuthor()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=author,
+        )
+        with failure_audit(state):
+            outcome = _propose_once(coordinator, state, now=now, real_data=None)
+        diagnostic = state.latest_health("guardian-failure")
+
+    assert outcome.drafts == ()
+    assert outcome.failures == ("PreventionPolicyError",)
+    assert author.calls == 0
+    assert broker.open_calls == 0
+    assert diagnostic.details["reason"] == "real_data_unavailable"
+
+
+def test_daily_prevention_cap_blocks_second_publication_until_next_utc_day(
+    tmp_path: Path,
+) -> None:
+    morning = datetime(2026, 9, 29, 8, 0, tzinfo=UTC)
+    clock = {"now": morning}
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        author = _FakeAuthor()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=author,
+            max_drafts=1,
+            max_drafts_per_day=1,
+            max_model_calls_per_day=10,
+            now=lambda: clock["now"],
+        )
+
+        first = _propose_once(coordinator, state, now=morning, summary="First rule gap")
+        coordinator.begin_poll()
+        clock["now"] = morning + timedelta(hours=1)
+        second = _propose_once(
+            coordinator,
+            state,
+            now=clock["now"],
+            summary="Second rule gap",
+        )
+        coordinator.begin_poll()
+        clock["now"] = morning + timedelta(days=1)
+        third = _propose_once(
+            coordinator,
+            state,
+            now=clock["now"],
+            summary="Second rule gap",
+        )
+
+        assert len(first.drafts) == 1
+        assert second.drafts == ()
+        assert second.deferred == 1
+        assert second.failures == ()
+        assert len(third.drafts) == 1
+        # The capped poll never spends a model call on unpublishable work.
+        assert author.calls == 2
+        assert broker.open_calls == 2
+
+
+def test_zero_daily_prevention_cap_is_a_publication_kill_switch(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 29, 8, 0, tzinfo=UTC)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        author = _FakeAuthor()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=author,
+            max_drafts_per_day=0,
+        )
+        outcome = _propose_once(coordinator, state, now=now)
+
+    assert outcome.drafts == ()
+    assert outcome.skipped == 1
+    assert author.calls == 0
+    assert broker.capture_calls == 0
+
+
+def test_interrupted_publication_keeps_its_daily_slot(tmp_path: Path) -> None:
+    morning = datetime(2026, 9, 29, 8, 0, tzinfo=UTC)
+    clock = {"now": morning}
+
+    class LostPushWorkspace(_FakeWorkspace):
+        def publish_prevention_branch(self, commit, **kwargs):
+            kwargs["before_push"]()
+            raise PreventionRuntimeError("push response lost")
+
+    class LostPushCheckoutFactory(_FakeCheckoutFactory):
+        @contextmanager
+        def __call__(self, revision: ExactRevision):
+            self.calls += 1
+            target = self.root / f"checkout-{self.calls}"
+            shutil.copytree(self.base_tree, target)
+            yield LostPushWorkspace(target, revision, self.broker, self)
+
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        author = _FakeAuthor()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=author,
+            max_drafts=1,
+            max_drafts_per_day=1,
+            max_model_calls_per_day=10,
+            now=lambda: clock["now"],
+        )
+        coordinator.checkout_factory = LostPushCheckoutFactory(
+            coordinator.checkout_factory.base_tree,
+            coordinator.checkout_factory.root,
+            broker,
+        )
+
+        interrupted = _propose_once(
+            coordinator, state, now=morning, summary="First rule gap"
+        )
+        assert interrupted.failures == ("PreventionRuntimeError",)
+        assert state.prevention_publication_slots_for_day(morning.date()) == 1
+
+        # A restarted Guardian later the same UTC day cannot author or publish
+        # a different candidate while the ambiguous publication holds the slot.
+        restarted = _coordinator(
+            state=state,
+            tmp_path=tmp_path / "restart",
+            broker=broker,
+            author=author,
+            max_drafts=1,
+            max_drafts_per_day=1,
+            max_model_calls_per_day=10,
+            now=lambda: clock["now"],
+        )
+        clock["now"] = morning + timedelta(hours=3)
+        second = _propose_once(
+            restarted, state, now=clock["now"], summary="Second rule gap"
+        )
+
+        assert second.drafts == ()
+        assert author.calls == 1
+        assert broker.open_calls == 0
+        assert state.prevention_publication_slots_for_day(morning.date()) == 1
+
+
+@pytest.mark.parametrize("bound", (0, 3))
+def test_prevention_author_is_told_about_real_data_impact_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bound: int,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    observed: dict[str, str] = {}
+
+    def fake_run(argv, **kwargs):
+        observed["prompt"] = kwargs["input"]
+        _write_author_decision(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {"type": "turn.completed", "usage": {"input_tokens": 1}}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(prevention_runtime, "run_bounded_process", fake_run)
+    PreventionCodexAuthor(
+        model="gpt-5.6-sol",
+        reasoning_effort="max",
+        max_new_real_data_findings=bound,
+    ).run(
+        workspace=workspace,
+        scope="pipeline_code",
+        summary="Flag untranslated prose",
+        evidence_feedback_ids=("review_comment:42:revision-7",),
+        policy=_prevention_policy(),
+        api_key=None,
+    )
+
+    prompt = observed["prompt"]
+    instructions = prompt.split("UNTRUSTED_REQUEST_JSON", 1)[0]
+    assert "real repository localization data" in instructions
+    assert "whether or not they add a new\nblocking reason" in instructions
+    assert f"more than {bound} new findings" in instructions
+    assert "narrow" in instructions
+
+
+def test_daily_cap_defers_later_candidates_within_one_poll_before_authoring(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        run_id = state.start_run(
+            repository="acme/translations",
+            locale="ru",
+            mode=GuardianMode.PROPOSE_PREVENTION,
+            started_at=now,
+        )
+        broker = _FakeBroker()
+        author = _FakeAuthor()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=author,
+            max_drafts=2,
+            max_drafts_per_day=1,
+            max_model_calls_per_day=10,
+        )
+
+        outcome = coordinator.propose(
+            policy=_repository_policy(),
+            recurrence_candidates=(
+                _candidate("First distinct pipeline recurrence"),
+                _candidate("Second distinct pipeline recurrence"),
+            ),
+            evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
+            run_id=run_id,
+            observed_at=now,
+            require_live_lease=_live_lease,
+            require_current_base_unchanged=_current_base,
+            **_open_source_kwargs(),
+        )
+
+        assert len(outcome.drafts) == 1
+        assert outcome.deferred == 1
+        assert outcome.failures == ()
+        assert author.calls == 1
+        assert broker.open_calls == 1
+
+
+def test_narrow_candidate_adding_blocking_reason_within_bound_is_published(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    # The rule correctly flags the reported defect on the PR head, which
+    # makes the gate block, but adds only a bounded number of findings.
+    runner = _FakeTestRunner(
+        _impact(
+            QualityGateSummary((), 22),
+            QualityGateSummary(
+                ("Semantic translation QA findings require manual resolution.",),
+                24,
+            ),
+        )
+    )
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        broker = _FakeBroker()
+        coordinator = _coordinator(
+            state=state,
+            tmp_path=tmp_path,
+            broker=broker,
+            author=_FakeAuthor(),
+            test_runner=runner,
+        )
+        outcome = _propose_once(coordinator, state, now=now)
+
+    assert len(outcome.drafts) == 1
+    assert outcome.failures == ()
+    assert broker.open_calls == 1
+
+
+@pytest.mark.parametrize("kind", ["declined", "empty", "patch_empty", "changed_decline", "missing_reference"])
+def test_prevention_decline_requires_explicit_result_and_unchanged_tree(tmp_path, kind):
+    from localize.guardian.prevention_decision import PreventionDecision
+
+    class DecliningAuthor(_FakeAuthor):
+        def run(self, *, workspace, **kwargs):
+            self.calls += 1
+            if kind == "changed_decline":
+                (workspace / "localize/rules.py").write_text("changed = True\n")
+            decision = None if kind == "empty" else PreventionDecision(
+                outcome="patch" if kind == "patch_empty" else "declined",
+                reason="" if kind == "patch_empty" else "project_policy",
+                explanation="This is a project wording rule rather than a generic engine defect.",
+                inspected_paths=("missing.py" if kind == "missing_reference" else "localize/rules.py",),
+            )
+            return PreventionAuthorResult(attempts=1, usage=None, decision=decision)
+
+    now = datetime(2026, 8, 30, 12, tzinfo=UTC)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        run_id = state.start_run(repository="acme/translations", locale="ru",
+                                 mode=GuardianMode.PROPOSE_PREVENTION, started_at=now)
+        author = DecliningAuthor()
+        broker = _FakeBroker()
+        coordinator = _coordinator(state=state, tmp_path=tmp_path, broker=broker, author=author)
+        kwargs = dict(policy=_repository_policy(), recurrence_candidates=(_candidate(),),
+                      evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
+                      run_id=run_id, observed_at=now, require_live_lease=_live_lease,
+                      require_current_base_unchanged=_current_base, **_open_source_kwargs())
+        outcome = coordinator.propose(**kwargs)
+        assert not outcome.drafts and broker.open_calls == 0 and broker.verify_calls == 0
+        if kind == "declined":
+            assert outcome.failures == () and outcome.declined == 1
+            receipt = state.latest_health("prevention-author")
+            assert receipt.status == "declined"
+            assert receipt.details['reason'] == "project_policy"
+            assert receipt.details['base_sha'] == BASE_SHA
+            assert receipt.details['explanation'].startswith("This is a project")
+            coordinator.begin_poll()
+            again = coordinator.propose(**kwargs)
+            assert again.failures == () and again.declined == 1 and author.calls == 1
+            # New evidence must not reuse the old disposition.
+            coordinator.begin_poll()
+            changed = coordinator.propose(**dict(kwargs, recurrence_candidates=(_candidate("A different defect"),)))
+            assert changed.declined == 1 and author.calls == 2
+        else:
+            assert outcome.failures and outcome.declined == 0
+            assert state.latest_health("prevention-author") is None
+
+
+def test_real_author_requires_a_disposition_even_after_exit_zero(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(prevention_runtime, "run_bounded_process",
+                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
+    with pytest.raises(CodexOutputError, match="disposition"):
+        PreventionCodexAuthor(model="gpt-test", reasoning_effort="high").run(
+            workspace=workspace, scope="pipeline_code", summary="Possible defect",
+            evidence_feedback_ids=("review_comment:42",), policy=_prevention_policy(), api_key=None)
+
+
+def test_real_author_returns_structured_decline(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    def fake_run(argv, **kw):
+        Path(argv[argv.index("-o") + 1]).write_text(json.dumps({
+            "schema_version": 1, "outcome": "declined", "reason": "no_generic_defect",
+            "explanation": "The inspected engine already preserves the required source context.",
+            "inspected_paths": ["localize/rules.py"]}))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    monkeypatch.setattr(prevention_runtime, "run_bounded_process", fake_run)
+    result = PreventionCodexAuthor(model="gpt-test", reasoning_effort="high").run(
+        workspace=workspace, scope="pipeline_code", summary="Possible defect",
+        evidence_feedback_ids=("review_comment:42",), policy=_prevention_policy(), api_key=None)
+    assert result.decision.reason == "no_generic_defect"
+
+
+def test_decline_persistence_survives_restart_and_new_base_invalidates_it(tmp_path):
+    from localize.guardian.prevention_decision import PreventionDecision
+    class DecliningAuthor(_FakeAuthor):
+        def run(self, **kwargs):
+            self.calls += 1
+            return PreventionAuthorResult(attempts=1, usage=None, decision=PreventionDecision(
+                "declined", "already_covered", "The inspected implementation already handles this case.",
+                ("localize/rules.py",)))
+    now = datetime(2026, 8, 30, 12, tzinfo=UTC)
+    author = DecliningAuthor()
+    broker = _FakeBroker()
+    database = tmp_path / "state.sqlite3"
+    def execute(state, directory, policy=None):
+        coordinator = _coordinator(state=state, tmp_path=directory, broker=broker, author=author)
+        run_id = state.start_run(repository="acme/translations", locale="ru",
+                                 mode=GuardianMode.PROPOSE_PREVENTION, started_at=now)
+        return coordinator.propose(policy=policy or _repository_policy(), recurrence_candidates=(_candidate(),),
+            evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID}, run_id=run_id,
+            observed_at=now, require_live_lease=_live_lease, require_current_base_unchanged=_current_base,
+            **_open_source_kwargs())
+    with GuardianState(database) as state:
+        assert execute(state, tmp_path / "first").declined == 1
+    with GuardianState(database) as state:
+        assert execute(state, tmp_path / "restart").declined == 1
+        assert author.calls == 1
+        original = broker.capture_base
+        broker.capture_base = lambda: replace(original(), revision=replace(_base_revision(), sha="c" * 40))
+        assert execute(state, tmp_path / "new-base").declined == 1
+        assert author.calls == 2
+        policy = _repository_policy()
+        policy = replace(policy, prevention=replace(policy.prevention, max_changed_files=3))
+        assert execute(state, tmp_path / "new-policy", policy).declined == 1
+        assert author.calls == 3
+
+
+@pytest.mark.parametrize("error", ["source_authority", "authentication"])
+def test_decline_revalidation_failure_is_isolated_per_candidate(
+    tmp_path, monkeypatch, error
+):
+    from localize.guardian.prevention_decision import PreventionDecision
+
+    class DecliningAuthor(_FakeAuthor):
+        def run(self, **kwargs):
+            self.calls += 1
+            return PreventionAuthorResult(attempts=1, usage=None, decision=PreventionDecision(
+                "declined", "project_policy", "This is a project wording rule.",
+                ("localize/rules.py",)))
+
+    recorded = []
+    monkeypatch.setattr(
+        prevention_runtime, "record_failure",
+        lambda exc, **context: recorded.append(type(exc).__name__),
+    )
+    author = DecliningAuthor()
+    raised = False
+
+    def revoke_after_first_decline(_source, _revisions):
+        nonlocal raised
+        if author.calls == 1 and not raised:
+            raised = True
+            if error == "authentication":
+                raise GitHubAuthenticationError("redacted GitHub authentication failure")
+            raise PreventionSourceAuthorityError("source changed after decline")
+
+    now = datetime(2026, 8, 30, 12, tzinfo=UTC)
+    with GuardianState(tmp_path / "state.sqlite3") as state:
+        run_id = state.start_run(repository="acme/translations", locale="ru",
+                                 mode=GuardianMode.PROPOSE_PREVENTION, started_at=now)
+        coordinator = _coordinator(state=state, tmp_path=tmp_path, broker=_FakeBroker(),
+                                   author=author, max_drafts=2)
+        kwargs = dict(_open_source_kwargs(),
+                      require_exact_open_source_authority=revoke_after_first_decline)
+        propose = lambda: coordinator.propose(  # noqa: E731
+            policy=_repository_policy(),
+            recurrence_candidates=(_candidate(), _candidate("A different defect")),
+            evidence_revision_ids={"review_comment:42": OPEN_SOURCE_REVISION_ID},
+            run_id=run_id, observed_at=now, require_live_lease=_live_lease,
+            require_current_base_unchanged=_current_base, **kwargs)
+        if error == "authentication":
+            with pytest.raises(GitHubAuthenticationError):
+                propose()
+            assert author.calls == 1
+            assert state.latest_health("prevention-author") is None
+            return
+        outcome = propose()
+        assert raised and author.calls == 2
+        assert outcome.failures == ("PreventionSourceAuthorityError",)
+        assert recorded == ["PreventionSourceAuthorityError"]
+        assert outcome.declined == 1
+        rows = state._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM health WHERE component = 'prevention-author'"
+        ).fetchone()[0]
+        assert rows == 1

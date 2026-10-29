@@ -23,14 +23,25 @@ from localize.guardian.models import (
     GuardianMode,
     HistoricalCheckScope,
     ProposedReplacement,
+    RepositoryPolicy,
 )
 from localize.guardian.json_safety import loads_bounded_json
 from localize.guardian.prevention import TestCommandResult, TestOutcome
+from localize.guardian.path_globs import matches_any_path_glob
+from localize.guardian.quality_reports import MARKER as QUALITY_REPORT_MARKER
 
 
 _UTC = timezone.utc
-_SCHEMA_VERSION = 9
+# Version 11 prevents older runtimes from mistaking skipped partial batches for
+# resolved feedback. The ledger shape is unchanged; its resolution semantics are not.
+_SCHEMA_VERSION = 12
 _SUPPORTED_SCHEMA_VERSIONS = frozenset(range(_SCHEMA_VERSION + 1))
+# Must match the partial expression index health_prevention_decline_key.
+_PREVENTION_DECLINE_SQL = (
+    "SELECT details_json FROM health WHERE component='prevention-author' "
+    "AND status='declined' AND json_extract(details_json, '$.decline_key')=? "
+    "ORDER BY health_id DESC LIMIT 1"
+)
 _TERMINAL_ACTION_STATUSES = frozenset({"completed", "skipped"})
 _ACTION_STATUSES = _TERMINAL_ACTION_STATUSES | {"failed", "pending"}
 _RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -70,7 +81,7 @@ _REMEDIATION_DRAFT_RUN_MODES = frozenset(
     }
 )
 _PUBLICATION_REPLY_TERMINAL_REASONS = frozenset(
-    {"remediation_closed_unmerged", "remediation_merged"}
+    {"remediation_closed_unmerged", "remediation_merged", "trusted_feedback_changed"}
 )
 _MAX_RUN_ID_BYTES = 128
 _MAX_REPOSITORY_BYTES = 512
@@ -652,9 +663,11 @@ class GuardianStateStatus:
     remote_closed_unmerged_remediations: int
     remote_not_found_remediations: int
     remote_conflict_remediations: int
+    last_successful_poll: str | None = None
 
 
 def _now() -> datetime:
+    """Return an aware UTC timestamp for audit operations."""
     return datetime.now(_UTC)
 
 
@@ -1703,9 +1716,11 @@ class GuardianState:
         self.close()
 
     def close(self) -> None:
+        """Release this audit database connection."""
         self._connection.close()
 
     def _initialize_schema(self, *, previous_version: int) -> None:
+        """Upgrade and verify the audit schema without partial migration commits."""
         self._connection.executescript(
             """
             BEGIN IMMEDIATE;
@@ -1783,6 +1798,13 @@ class GuardianState:
                 FOREIGN KEY (run_id) REFERENCES runs(run_id),
                 FOREIGN KEY (event_revision_id)
                     REFERENCES event_revisions(revision_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS feedback_report_deliveries (
+                report_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                result_json TEXT,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'posted', 'superseded'))
             );
 
             CREATE TABLE IF NOT EXISTS costs (
@@ -1914,6 +1936,12 @@ class GuardianState:
                 occurred_at TEXT NOT NULL,
                 UNIQUE (draft_key, phase),
                 FOREIGN KEY (run_id) REFERENCES runs(run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS prevention_publication_slots (
+                slot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_key TEXT NOT NULL UNIQUE CHECK (length(draft_key) > 0),
+                reserved_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS prevention_candidate_attestations (
@@ -2491,7 +2519,8 @@ class GuardianState:
                 reason TEXT NOT NULL CHECK (
                     reason IN (
                         'remediation_closed_unmerged',
-                        'remediation_merged'
+                        'remediation_merged',
+                        'trusted_feedback_changed'
                     )
                 ),
                 occurred_at TEXT NOT NULL
@@ -2523,10 +2552,15 @@ class GuardianState:
                 ON budget_reservations(reserved_at, status);
             CREATE INDEX IF NOT EXISTS model_call_reservations_reserved_at
                 ON model_call_reservations(reserved_at, status);
+            CREATE INDEX IF NOT EXISTS prevention_publication_slots_reserved_at
+                ON prevention_publication_slots(reserved_at);
             CREATE INDEX IF NOT EXISTS assessment_results_created_at
                 ON assessment_results(created_at);
             CREATE INDEX IF NOT EXISTS health_component_checked
                 ON health(component, checked_at DESC, health_id DESC);
+            CREATE INDEX IF NOT EXISTS health_prevention_decline_key
+                ON health(json_extract(details_json, '$.decline_key'))
+                WHERE component = 'prevention-author' AND status = 'declined';
             CREATE INDEX IF NOT EXISTS publication_events_pending
                 ON publication_events(repository, pr_number, publication_key,
                                       publication_event_id DESC);
@@ -2902,53 +2936,6 @@ class GuardianState:
             )
             BEGIN
                 SELECT RAISE(ABORT, 'abandoned publication requires failed plan');
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS publication_reply_terminals_no_update
-            BEFORE UPDATE ON publication_reply_terminal_events
-            BEGIN
-                SELECT RAISE(ABORT, 'publication reply terminals are immutable');
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS publication_reply_terminals_no_delete
-            BEFORE DELETE ON publication_reply_terminal_events
-            BEGIN
-                SELECT RAISE(ABORT, 'publication reply terminals are immutable');
-            END;
-
-            DROP TRIGGER IF EXISTS publication_reply_terminals_published;
-
-            CREATE TRIGGER publication_reply_terminals_published
-            BEFORE INSERT ON publication_reply_terminal_events
-            WHEN NOT EXISTS (
-                SELECT 1
-                FROM publication_events AS publication
-                JOIN remediation_successor_publications AS successor
-                  ON successor.publication_key = publication.publication_key
-                JOIN runs AS run ON run.run_id = publication.run_id
-                WHERE publication.publication_key = NEW.publication_key
-                  AND publication.phase = 'published'
-                  AND run.status = 'completed'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM publication_completion_plan_items AS plan
-                      WHERE plan.publication_key = publication.publication_key
-                        AND NOT EXISTS (
-                            SELECT 1 FROM actions AS action
-                            WHERE action.run_id = plan.run_id
-                              AND action.event_revision_id
-                                  = plan.event_revision_id
-                              AND action.action = plan.action
-                              AND action.status = plan.status
-                              AND action.details_json = plan.details_json
-                        )
-                  )
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT,
-                    'publication reply terminal requires published successor'
-                );
             END;
 
             CREATE TRIGGER IF NOT EXISTS prevention_draft_events_no_update
@@ -4949,6 +4936,24 @@ class GuardianState:
                 FROM prevention_draft_events
                 """
             )
+        if previous_version < 10:
+            # Widen only the reply-terminal reason enum, preserving every row.
+            for statement in (
+                """CREATE TABLE publication_reply_terminal_events_v10 (
+                    publication_key TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL CHECK (reason IN (
+                        'remediation_closed_unmerged', 'remediation_merged',
+                        'trusted_feedback_changed'
+                    )),
+                    occurred_at TEXT NOT NULL
+                )""",
+                "INSERT INTO publication_reply_terminal_events_v10 "
+                "SELECT * FROM publication_reply_terminal_events",
+                "DROP TABLE publication_reply_terminal_events",
+                "ALTER TABLE publication_reply_terminal_events_v10 "
+                "RENAME TO publication_reply_terminal_events",
+            ):
+                self._connection.execute(statement)
         if previous_version < 8:
             self._audit_draft_event_ledgers()
         if previous_version < 5:
@@ -5020,9 +5025,52 @@ class GuardianState:
             END
             """
         )
+        self._install_publication_reply_triggers()
         self._verify_database_integrity()
         self._connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         self._connection.commit()
+
+    def _install_publication_reply_triggers(self) -> None:
+        """Protect terminal accounting after transactional table migration."""
+        for operation in ("UPDATE", "DELETE"):
+            self._connection.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS publication_reply_terminals_no_{operation.lower()}
+                BEFORE {operation} ON publication_reply_terminal_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'publication reply terminals are immutable');
+                END
+            """)
+        self._connection.execute("DROP TRIGGER IF EXISTS publication_reply_terminals_published")
+        self._connection.execute("""
+            CREATE TRIGGER publication_reply_terminals_published
+            BEFORE INSERT ON publication_reply_terminal_events
+            WHEN NOT EXISTS (
+                SELECT 1 FROM publication_events AS publication
+                LEFT JOIN remediation_successor_publications AS successor
+                  ON successor.publication_key = publication.publication_key
+                JOIN runs AS run ON run.run_id = publication.run_id
+                WHERE publication.publication_key = NEW.publication_key
+                  AND publication.phase = 'published'
+                  AND run.status = 'completed'
+                  AND (NEW.reason = 'trusted_feedback_changed'
+                       OR successor.publication_key IS NOT NULL)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM publication_completion_plan_items AS plan
+                      WHERE plan.publication_key = publication.publication_key
+                        AND NOT EXISTS (
+                            SELECT 1 FROM actions AS action
+                            WHERE action.run_id = plan.run_id
+                              AND action.event_revision_id = plan.event_revision_id
+                              AND action.action = plan.action
+                              AND action.status = plan.status
+                              AND action.details_json = plan.details_json
+                        )
+                  )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'publication reply terminal requires published successor');
+            END
+        """)
 
     def _backfill_publication_repository_ids(self) -> None:
         """Recover only bounded, exact modern publication repository IDs."""
@@ -5693,6 +5741,8 @@ class GuardianState:
         pr_number: int | None = None,
         locale: str | None = None,
         mode: GuardianMode | str | None = None,
+        policy_digest: str | None = None,
+        patch_validation_version: int | None = None,
         limit: int = _MAX_PENDING_EVENT_WORKSET,
     ) -> tuple[EventRevision, ...]:
         """Return a bounded unresolved workset, oldest first.
@@ -5717,6 +5767,16 @@ class GuardianState:
         ):
             raise ValueError("pr_number must be a positive integer.")
 
+        if policy_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", policy_digest
+        ):
+            raise ValueError("policy_digest must be a lowercase SHA-256 digest.")
+        if patch_validation_version is not None and (
+            isinstance(patch_validation_version, bool)
+            or not isinstance(patch_validation_version, int)
+            or patch_validation_version < 1
+        ):
+            raise ValueError("patch_validation_version must be a positive integer.")
         terminal_statuses = tuple(sorted(_TERMINAL_ACTION_STATUSES))
         terminal_placeholders = ", ".join("?" for _ in terminal_statuses)
         parameters: list[Any] = list(terminal_statuses)
@@ -5728,13 +5788,80 @@ class GuardianState:
             placeholders = ", ".join("?" for _ in resolving_modes)
             mode_filter = f" AND r.mode IN ({placeholders})"
             parameters.extend(item.value for item in resolving_modes)
+        policy_filter = ""
+        if policy_digest is not None:
+            policy_filter = """ AND (
+                a.status != 'skipped'
+                OR json_extract(a.details_json, '$.outcome')
+                    IS NOT 'deterministic_policy_rejection'
+                OR json_extract(a.details_json, '$.policy_digest') IS ?
+            )"""
+            parameters.append(policy_digest)
+            policy_filter += """ AND (
+                json_extract(a.details_json, '$.decision_required') IS NOT 1
+                OR json_extract(a.details_json, '$.report_policy_digest') IS ?
+            )"""
+            parameters.append(policy_digest)
+        if patch_validation_version is not None:
+            # Validator repairs retry rejected patches without reopening held
+            # human decisions or changing their report-policy identity.
+            policy_filter += """ AND (
+                a.status != 'skipped'
+                OR json_extract(a.details_json, '$.outcome')
+                    IS NOT 'deterministic_policy_rejection'
+                OR json_extract(a.details_json, '$.patch_validation_version') IS ?
+            )"""
+            parameters.append(patch_validation_version)
+        # Human-owned thread evidence is terminal only while its exact root
+        # decision remains current. Policy/config changes reopen it normally.
+        policy_filter += """ AND (
+            json_extract(a.details_json, '$.outcome') IS NOT 'thread_human_review'
+            OR (
+                a.action_id = (SELECT MAX(latest.action_id) FROM actions latest
+                               WHERE latest.event_revision_id = a.event_revision_id)
+                AND json_extract(a.details_json, '$.thread_hold.root_action_id') = (
+                    SELECT MAX(root_action.action_id) FROM actions root_action
+                    WHERE root_action.event_revision_id =
+                        json_extract(a.details_json, '$.thread_hold.root_revision_id'))
+                AND json_extract(a.details_json, '$.thread_hold.root_revision_id') = (
+                    SELECT new_root.event_revision_id FROM event_revisions root
+                    JOIN event_current_observations new_root ON new_root.repository = root.repository
+                        AND new_root.pr_number = root.pr_number AND new_root.kind = root.kind
+                        AND new_root.event_id = root.event_id
+                    WHERE root.revision_id =
+                        json_extract(a.details_json, '$.thread_hold.root_revision_id')
+                    ORDER BY new_root.observation_id DESC LIMIT 1)
+                AND (json_extract(a.details_json, '$.thread_hold.classification') != 'unchanged_reminder'
+                     OR NOT EXISTS (SELECT 1 FROM event_revisions edited
+                         WHERE edited.repository = e.repository AND edited.pr_number = e.pr_number
+                           AND edited.kind = e.kind AND edited.event_id = e.event_id
+                           AND edited.body_hash != e.body_hash))
+            )
+        )"""
+        # A temporarily superseded held revision may become current again
+        # (A→B→A). Its administrative skip did not assess that human evidence.
+        policy_filter += """ AND (
+            json_extract(a.details_json, '$.outcome') IS NOT 'superseded_revision'
+            OR NOT EXISTS (SELECT 1 FROM actions held
+                WHERE held.event_revision_id = a.event_revision_id
+                  AND json_extract(held.details_json, '$.outcome') = 'thread_human_review')
+            OR a.event_revision_id != (SELECT observation.event_revision_id
+                FROM event_current_observations observation
+                WHERE observation.repository = e.repository AND observation.pr_number = e.pr_number
+                  AND observation.kind = e.kind AND observation.event_id = e.event_id
+                ORDER BY observation.observation_id DESC LIMIT 1)
+        )"""
         filters = [
             f"""NOT EXISTS (
                 SELECT 1 FROM actions AS a
                 JOIN runs AS r ON r.run_id = a.run_id
                 WHERE a.event_revision_id = e.revision_id
                   AND a.status IN ({terminal_placeholders})
+                  AND json_extract(a.details_json, '$.outcome')
+                      IS NOT 'translation_batch_deferred'
+                  AND json_extract(a.details_json, '$.prevention_pending') IS NOT 1
                   {mode_filter}
+                  {policy_filter}
             )"""
         ]
         if repository is not None:
@@ -8129,6 +8256,7 @@ class GuardianState:
         event_revision_ids: Sequence[int],
         feedback_urls: Sequence[str] | None = None,
         replacements: Sequence[ProposedReplacement] | None = None,
+        repository_policy: RepositoryPolicy | None = None,
     ) -> str:
         """Validate and hash exact assessed evidence before remediation work."""
 
@@ -8326,10 +8454,46 @@ class GuardianState:
                 raise ValueError("replacements must contain proposed replacements.")
             for proposal in proposals:
                 event = feedback_by_id.get(proposal.feedback_id)
-                if event is None or event["locale"] != proposal.locale:
+                if event is None:
                     raise ValueError(
                         "replacement feedback_id does not match exact event evidence."
                     )
+                if event["locale"] != proposal.locale:
+                    # A consolidated review may cover several locales. Its anchor
+                    # locale is not authority for those targets: recheck the exact
+                    # stored actor against the current target-locale policy.
+                    source, _ = source_by_pair[
+                        (str(event["repository"]), int(event["pr_number"]))
+                    ]
+                    body_prefix = self._connection.execute(
+                        "SELECT substr(body, 1, ?) FROM event_raw_bodies "
+                        "WHERE event_revision_id = ?",
+                        (len(QUALITY_REPORT_MARKER), int(event["revision_id"])),
+                    ).fetchone()
+                    if (
+                        not isinstance(repository_policy, RepositoryPolicy)
+                        or (repository_policy.base_repo, repository_policy.base_repo_id)
+                        != (source.repository, source.repository_id)
+                        or body_prefix is None
+                        or body_prefix[0] == QUALITY_REPORT_MARKER
+                        or not matches_any_path_glob(
+                            proposal.path, repository_policy.allowed_path_globs,
+                        )
+                    ):
+                        raise ValueError("replacement target lacks exact locale authority.")
+                    actors = (
+                        repository_policy.trusted_reviewer_by_id(
+                            proposal.locale, int(event["author_id"]),
+                        ),
+                        repository_policy.trusted_bot_by_id(
+                            proposal.locale, int(event["author_id"]),
+                        ),
+                    )
+                    if not any(
+                        actor is not None and actor.type == event["author_type"]
+                        for actor in actors
+                    ):
+                        raise ValueError("replacement target lacks exact locale authority.")
         return _historical_remediation_evidence_hash(
             pulls,
             normalized_urls,
@@ -8342,6 +8506,7 @@ class GuardianState:
         event_revision_ids: Sequence[int],
         feedback_urls: Sequence[str] | None = None,
         replacements: Sequence[ProposedReplacement] | None = None,
+        repository_policy: RepositoryPolicy | None = None,
     ) -> str:
         """Validate exact evidence is still current in the durable ledger."""
 
@@ -8352,6 +8517,7 @@ class GuardianState:
             event_revision_ids=revision_ids,
             feedback_urls=feedback_urls,
             replacements=replacements,
+            repository_policy=repository_policy,
         )
         revision_rows: list[sqlite3.Row] = []
         for offset in range(0, len(revision_ids), _SQLITE_IN_QUERY_CHUNK):
@@ -8798,7 +8964,7 @@ class GuardianState:
         details: Mapping[str, Any] | None = None,
         occurred_at: datetime | None = None,
     ) -> int:
-        """Append an auditable action; completed/skipped actions resolve a revision."""
+        """Append an action; batch deferrals remain pending despite skipped status."""
 
         if status not in _ACTION_STATUSES:
             raise ValueError(f"Unsupported action status {status!r}.")
@@ -8820,6 +8986,409 @@ class GuardianState:
                 ),
             )
         return int(cursor.lastrowid)
+
+    def record_project_policy_proposal(
+        self, *, run_id: str, event_revision_id: int, proposal_id: str,
+        path: str, evidence_status: str, occurred_at: datetime,
+    ) -> None:
+        """Record a private decision without resolving feedback; recover artifact-first crashes."""
+        if not re.fullmatch(r"[0-9a-f]{64}", proposal_id):
+            raise ValueError("Project-policy proposal identity must be a digest.")
+        if evidence_status not in {"needs_operator_review", "evidence_incomplete", "declined"}:
+            raise ValueError("Project-policy proposal evidence status is invalid.")
+        with self._connection:
+            self._connection.execute(
+                """INSERT INTO actions (
+                       run_id, event_revision_id, action, status, details_json, occurred_at
+                   )
+                   SELECT ?, ?, 'project_policy_proposal', 'pending', ?, ?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM actions WHERE event_revision_id = ?
+                       AND action = 'project_policy_proposal'
+                       AND json_extract(details_json, '$.proposal_id') = ?
+                   )""",
+                (run_id, event_revision_id,
+                 _canonical_json({"proposal_id": proposal_id, "path": path,
+                                  "outcome": evidence_status, "decision_required": True}),
+                 _serialize_datetime(occurred_at), event_revision_id, proposal_id),
+            )
+
+    def latest_feedback_report(
+        self,
+        revision_id: int,
+        *,
+        repository_id: int | None = None,
+        actor_id: int | None = None,
+        actor_type: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        """The completed action itself is the durable reporting outbox intent.
+
+        Publication completion plans persist these details before a push, and
+        atomically recover them alongside the correction result after a crash.
+        """
+        row = self._connection.execute(
+            """SELECT details_json FROM actions WHERE event_revision_id = ?
+               AND json_extract(details_json, '$.report_reason') IS NOT NULL
+               ORDER BY action_id DESC LIMIT 1""",
+            (revision_id,),
+        ).fetchone()
+        if row is None and repository_id is not None and actor_id is not None:
+            # An acknowledged owned push creates a new head-bound revision.
+            # Replay only across that exact signed publication, with unchanged
+            # feedback content/base and immutable repository/writer identity.
+            row = self._connection.execute(
+                """SELECT a.details_json FROM event_revisions current
+                   JOIN event_revisions prior ON prior.repository = current.repository
+                     AND prior.pr_number = current.pr_number AND prior.kind = current.kind
+                     AND prior.event_id = current.event_id AND prior.revision_hash = current.revision_hash
+                   JOIN actions a ON a.event_revision_id = prior.revision_id
+                   JOIN publication_events p ON p.run_id = a.run_id
+                     AND p.original_head_sha = prior.head_sha AND p.base_sha = current.base_sha
+                     AND p.commit_sha = current.head_sha
+                   WHERE current.revision_id = ? AND p.repository_id = ?
+                     AND p.publication_actor_id = ? AND p.publication_actor_type = ?
+                     AND p.phase IN ('published', 'replied')
+                     AND json_extract(a.details_json, '$.report_reason') IS NOT NULL
+                   ORDER BY a.action_id DESC LIMIT 1""",
+                (revision_id, repository_id, actor_id, actor_type),
+            ).fetchone()
+        return json.loads(row["details_json"]) if row else None
+
+    def thread_hold_seed(
+        self, revision_id: int, *, policy_digest: str, config_digest: str,
+        mode: GuardianMode,
+    ) -> Mapping[str, Any] | None:
+        """Read only the latest completed decision for this exact root revision."""
+        if not re.fullmatch(r"[0-9a-f]{64}", config_digest):
+            return None
+        row = self._connection.execute(
+            """SELECT a.*, r.status AS run_status, r.mode AS run_mode FROM actions a
+               JOIN runs r ON r.run_id = a.run_id WHERE a.event_revision_id = ?
+               ORDER BY a.action_id DESC LIMIT 1""", (revision_id,),
+        ).fetchone()
+        if row is None or row["status"] != "completed" or row["run_status"] != "completed" or row["run_mode"] != mode.value:
+            return None
+        details = json.loads(row["details_json"])
+        if (any(details.get(key) != value for key, value in {
+            "outcome": "needs_human", "verdict": "needs_human",
+            "report_reason": "insufficient_evidence", "decision_required": True,
+            "report_policy_digest": policy_digest, "report_config_digest": config_digest,
+            "changed_keys": 0, "held_value_edits": 0, "recurrence_candidates": 0,
+        }.items()) or details.get("report_outcome", "needs_human") != "needs_human"
+                or details.get("commit_sha") or details.get("deferred_value_edits")):
+            return None
+        return {"root_revision_id": revision_id, "root_action_id": row["action_id"],
+                "decision_epoch": self.feedback_decision_epoch(revision_id, details)}
+
+    def thread_hold_for_revision(
+        self, revision_id: int, *, policy_digest: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        """Effective held intake supersedes report lookup, including old failures."""
+        row = self._connection.execute(
+            """SELECT details_json FROM actions WHERE event_revision_id = ?
+               ORDER BY action_id DESC LIMIT 1""", (revision_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        details = json.loads(row[0])
+        if details.get("outcome") != "thread_human_review" or (policy_digest is not None and details.get("report_policy_digest") != policy_digest):
+            return None
+        hold = details["thread_hold"]
+        current = self._connection.execute(
+            """SELECT (SELECT MAX(a.action_id) FROM actions a WHERE a.event_revision_id = root.revision_id),
+                      (SELECT e.event_revision_id FROM event_current_observations e WHERE e.repository = root.repository
+                        AND e.pr_number = root.pr_number AND e.kind = root.kind AND e.event_id = root.event_id
+                        ORDER BY e.observation_id DESC LIMIT 1)
+               FROM event_revisions root WHERE root.revision_id = ?""", (hold["root_revision_id"],),
+        ).fetchone()
+        if current is None or tuple(current) != (hold["root_action_id"], hold["root_revision_id"]):
+            return None
+        revision = self.get_event_revision(revision_id)
+        if hold["classification"] == "unchanged_reminder" and revision is not None and self.feedback_content_was_edited(revision):
+            return None
+        return details
+
+    def thread_hold_evidence_for_operator(
+        self, *, limit: int = 20, after_revision_id: int = 0,
+    ) -> tuple[int, tuple[Mapping[str, Any], ...]]:
+        """Bounded current human-owned evidence; bodies stay in the private audit."""
+        if (type(limit) is not int or not 1 <= limit <= 100
+                or type(after_revision_id) is not int or not 0 <= after_revision_id <= 9223372036854775807):
+            raise ValueError("Invalid human evidence page.")
+        query = """WITH current AS (
+                SELECT e.*, a.details_json,
+                    ROW_NUMBER() OVER (PARTITION BY e.repository, e.pr_number, e.kind, e.event_id
+                                       ORDER BY o.observation_id DESC, a.action_id DESC) AS position
+                FROM event_current_observations o JOIN event_revisions e ON e.revision_id = o.event_revision_id
+                LEFT JOIN actions a ON a.event_revision_id = e.revision_id
+            ) SELECT revision_id, repository, pr_number, event_id, details_json
+              FROM current WHERE position = 1 AND deleted = 0
+                AND json_extract(details_json, '$.outcome') = 'thread_human_review'
+        """
+        total = self._connection.execute("SELECT COUNT(*) FROM (" + query + ")").fetchone()[0]
+        rows = self._connection.execute(
+            query + " AND revision_id > ? ORDER BY revision_id LIMIT ?", (after_revision_id, limit),
+        ).fetchall()
+        # This view intentionally retains invalidated decisions as awaiting
+        # review until intake records the governed reassessment/release.
+        entries = tuple({"revision_id": row["revision_id"], "repository": row["repository"],
+                         "pr_number": row["pr_number"], "event_id": row["event_id"],
+                         **json.loads(row["details_json"])["thread_hold"]}
+                        for row in rows)
+        return int(total), entries
+
+    def held_feedback_decision(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        kind: str,
+        event_id: str,
+        config_digest: str,
+    ) -> Mapping[str, Any] | None:
+        """Head movement or bot replies cannot release a configuration decision."""
+        row = self._connection.execute(
+            """SELECT a.details_json FROM actions a
+               JOIN event_revisions e ON e.revision_id = a.event_revision_id
+               WHERE e.repository = ? AND e.pr_number = ? AND e.kind = ? AND e.event_id = ?
+               AND json_extract(a.details_json, '$.decision_required') = 1
+               AND json_extract(a.details_json, '$.report_config_digest') = ?
+               AND json_extract(a.details_json, '$.outcome') IS NOT 'thread_human_review'
+               ORDER BY a.action_id DESC LIMIT 1""",
+            (repository, pr_number, kind, event_id, config_digest),
+        ).fetchone()
+        return json.loads(row["details_json"]) if row else None
+
+    def held_feedback_report_for_revision(
+        self,
+        revision_id: int,
+        policy_digest: str,
+    ) -> Mapping[str, Any] | None:
+        """Keep an unresolved decision visible without replaying an old correction."""
+        row = self._connection.execute(
+            """SELECT a.details_json FROM event_revisions current
+               JOIN event_revisions prior ON prior.repository = current.repository
+                 AND prior.pr_number = current.pr_number AND prior.kind = current.kind
+                 AND prior.event_id = current.event_id
+               JOIN actions a ON a.event_revision_id = prior.revision_id
+               WHERE current.revision_id = ?
+                 AND json_extract(a.details_json, '$.decision_required') = 1
+                 AND json_extract(a.details_json, '$.report_reason') IS NOT NULL
+                 AND json_extract(a.details_json, '$.report_policy_digest') = ?
+               ORDER BY a.action_id DESC LIMIT 1""",
+            (revision_id, policy_digest),
+        ).fetchone()
+        if row is None:
+            return None
+        details = json.loads(row["details_json"])
+        from localize.guardian.reporting import held_report_reason
+
+        details.update(
+            outcome="needs_human", verdict="needs_human", commit_sha=None,
+            report_reason=held_report_reason(details["report_reason"]),
+            decision_required=True,
+        )
+        details.pop("report_outcome", None)
+        return details
+
+    def feedback_report_delivery(self, report_key: str) -> Mapping[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM feedback_report_deliveries WHERE report_key = ?",
+            (report_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def feedback_content_was_edited(self, revision: EventRevision) -> bool:
+        """Head movement alone is not a comment edit; changed bytes are evidence."""
+        return self._connection.execute(
+            """SELECT 1 FROM event_revisions WHERE repository = ? AND pr_number = ?
+               AND kind = ? AND event_id = ? AND body_hash != ? LIMIT 1""",
+            (revision.repository, revision.pr_number, revision.kind,
+             revision.event_id, revision.body_hash),
+        ).fetchone() is not None
+
+    def feedback_decision_epoch(self, revision_id: int, details: Mapping[str, Any]) -> int:
+        """A restored earlier decision follows a new transition, not an old receipt."""
+        row = self._connection.execute(
+            """SELECT action_id FROM actions WHERE event_revision_id = ?
+               AND json_extract(details_json, '$.report_reason') IS NOT NULL
+               AND NOT (json_extract(details_json, '$.verdict') IS ?
+                    AND json_extract(details_json, '$.outcome') IS ?
+                    AND json_extract(details_json, '$.report_reason') IS ?
+                    AND json_extract(details_json, '$.decision_required') IS ?)
+               ORDER BY action_id DESC LIMIT 1""",
+            (revision_id, details.get("verdict"), details.get("outcome"),
+             details.get("report_reason"), details.get("decision_required")),
+        ).fetchone()
+        return int(row["action_id"]) if row else 0
+
+    def posted_convergent_feedback_report(self, convergence_key: str) -> Mapping[str, Any] | None:
+        """Only acknowledged delivery can stand in for an unchanged followup.
+
+        Legacy payloads remain byte-for-byte intact. Without a context-bound
+        acknowledgement, the next followup publishes once and seeds convergence.
+        """
+        row = self._connection.execute(
+            """SELECT * FROM feedback_report_deliveries WHERE status = 'posted'
+               AND json_extract(payload_json, '$.convergence_key') = ?
+               ORDER BY rowid LIMIT 1""", (convergence_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_convergent_feedback_report(
+        self, report_key: str, payload: Mapping[str, Any], *, converged_to: str,
+    ) -> None:
+        """Atomically retain an alias of an already acknowledged explanation.
+
+        Never leave a pending alias that a restarted process could mistake for
+        a new GitHub write. Existing pending deliveries must use exact retries.
+        """
+        with self._connection:
+            original = self.feedback_report_delivery(converged_to)
+            if (original is None or original["status"] != "posted"
+                    or not payload.get("convergence_key")
+                    or json.loads(original["payload_json"]).get("convergence_key") != payload["convergence_key"]
+                    or self.feedback_report_delivery(report_key) is not None):
+                raise ValueError("Convergent reporting requires an exact posted receipt and a new alias.")
+            self._connection.execute(
+                """UPDATE feedback_report_deliveries SET status = 'superseded'
+                   WHERE status = 'pending'
+                   AND json_extract(payload_json, '$.repository_id') = ?
+                   AND json_extract(payload_json, '$.pr_number') = ?
+                   AND json_extract(payload_json, '$.feedback_id') = ?""",
+                (payload["repository_id"], payload["pr_number"], payload["feedback_id"]),
+            )
+            self._connection.execute(
+                """INSERT INTO feedback_report_deliveries
+                   (report_key, payload_json, status, result_json) VALUES (?, ?, 'posted', ?)""",
+                (report_key, _canonical_json({**payload, "converged_to": converged_to}), original["result_json"]),
+            )
+
+    def feedback_summary_bodies(
+        self, repository_id: int, pr_number: int
+    ) -> tuple[str, ...]:
+        """Known exact summary versions, including ambiguous publication attempts."""
+        rows = self._connection.execute(
+            """SELECT payload_json FROM feedback_report_deliveries
+               WHERE json_extract(payload_json, '$.summary') = 1
+               AND json_extract(payload_json, '$.repository_id') = ?
+               AND json_extract(payload_json, '$.pr_number') = ?
+               ORDER BY rowid DESC LIMIT 100""",
+            (repository_id, pr_number),
+        ).fetchall()
+        return tuple(json.loads(row["payload_json"])["body"] for row in rows)
+
+    def feedback_reporting_counts(self) -> tuple[int, int]:
+        """Count delivery acknowledgements and latest recorded human decisions."""
+        pending = self._connection.execute(
+            "SELECT COUNT(*) FROM feedback_report_deliveries WHERE status = 'pending'"
+        ).fetchone()[0]
+        decisions = self._connection.execute(
+            """WITH latest AS (
+                SELECT a.details_json, ROW_NUMBER() OVER (
+                    PARTITION BY e.repository, e.pr_number, e.kind, e.event_id
+                    ORDER BY a.action_id DESC) AS position
+                FROM actions a JOIN event_revisions e ON e.revision_id = a.event_revision_id
+                WHERE json_extract(a.details_json, '$.report_reason') IS NOT NULL
+                  AND COALESCE(json_extract(a.details_json, '$.report_outcome'), '') != 'failed'
+            ) SELECT COUNT(*) FROM latest WHERE position = 1
+              AND json_extract(details_json, '$.decision_required') = 1"""
+        ).fetchone()[0]
+        return int(pending), int(decisions)
+
+    def supersede_inactive_feedback_report_pulls(
+        self,
+        repository_id: int,
+        open_pr_numbers: Sequence[int],
+    ) -> None:
+        """Retire delivery retries outside a complete authorized open-PR view.
+
+        This is not a delivery acknowledgement or a policy decision. If a pull
+        becomes eligible again, exact-source reconciliation can resume.
+        """
+        with self._connection:
+            self._connection.execute(
+                """UPDATE feedback_report_deliveries SET status = 'superseded'
+                   WHERE status = 'pending'
+                   AND json_extract(payload_json, '$.repository_id') = ?
+                   AND json_extract(payload_json, '$.pr_number') NOT IN
+                       (SELECT value FROM json_each(?))""",
+                (repository_id, json.dumps(tuple(open_pr_numbers))),
+            )
+
+    def supersede_unavailable_feedback_reports(
+        self, repository_id: int, pr_number: int, live_ids: Sequence[str]
+    ) -> None:
+        """Retire pending messages only after fresh intake withdrew their source."""
+        with self._connection:
+            self._connection.execute(
+                """UPDATE feedback_report_deliveries SET status = 'superseded'
+                   WHERE status = 'pending'
+                   AND json_extract(payload_json, '$.repository_id') = ?
+                   AND json_extract(payload_json, '$.pr_number') = ?
+                   AND json_extract(payload_json, '$.feedback_id') IS NOT NULL
+                   AND json_extract(payload_json, '$.feedback_id') NOT IN (SELECT value FROM json_each(?))""",
+                (repository_id, pr_number, json.dumps(tuple(live_ids))),
+            )
+
+    def queue_feedback_report(
+        self, report_key: str, payload: Mapping[str, Any]
+    ) -> None:
+        """Preserve exact bytes for retry after an ambiguous GitHub response."""
+        encoded = _canonical_json(payload)
+        with self._connection:
+            if payload.get("feedback_id"):
+                self._connection.execute(
+                    """UPDATE feedback_report_deliveries SET status = 'superseded'
+                       WHERE status = 'pending' AND report_key != ?
+                       AND json_extract(payload_json, '$.repository_id') = ?
+                       AND json_extract(payload_json, '$.pr_number') = ?
+                       AND json_extract(payload_json, '$.feedback_id') = ?""",
+                    (
+                        report_key,
+                        payload["repository_id"],
+                        payload["pr_number"],
+                        payload["feedback_id"],
+                    ),
+                )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO feedback_report_deliveries (report_key, payload_json, status) VALUES (?, ?, 'pending')",
+                (report_key, encoded),
+            )
+            row = self.feedback_report_delivery(report_key)
+            if row is None or row["payload_json"] != encoded:
+                raise ValueError(
+                    "Feedback report identity conflicts with its durable payload."
+                )
+
+    def finish_feedback_report(
+        self,
+        report_key: str,
+        *,
+        result: Mapping[str, Any] | None = None,
+        superseded: bool = False,
+    ) -> None:
+        with self._connection:
+            self._connection.execute(
+                "UPDATE feedback_report_deliveries SET status = ?, result_json = ? WHERE report_key = ?",
+                (
+                    "superseded" if superseded else "posted",
+                    _canonical_json(result),
+                    report_key,
+                ),
+            )
+            row = self.feedback_report_delivery(report_key)
+            if row and not superseded:
+                payload = json.loads(row["payload_json"])
+                if payload.get("summary"):
+                    self._connection.execute(
+                        """UPDATE feedback_report_deliveries SET status = 'superseded'
+                           WHERE status = 'pending' AND report_key != ?
+                           AND json_extract(payload_json, '$.summary') = 1
+                           AND json_extract(payload_json, '$.repository_id') = ?
+                           AND json_extract(payload_json, '$.pr_number') = ?""",
+                        (report_key, payload["repository_id"], payload["pr_number"]),
+                    )
 
     def record_cost(
         self,
@@ -8932,6 +9501,81 @@ class GuardianState:
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown or finalized model call {call_id}.")
+
+    def try_reserve_prevention_publication_slot(
+        self,
+        *,
+        draft_key: str,
+        daily_limit: int,
+        reserved_at: datetime | None = None,
+    ) -> bool:
+        """Durably charge one UTC-day prevention publication before a remote write.
+
+        A slot is never refunded: once reserved, the following push or pull
+        request creation may have succeeded even if its response is lost. The
+        same candidate may retry or be recovered under its existing slot.
+        """
+
+        if isinstance(daily_limit, bool) or not isinstance(daily_limit, int):
+            raise ValueError("Daily prevention publication limit must be an integer.")
+        if daily_limit < 0:
+            raise ValueError("Daily prevention publication limit must not be negative.")
+        if not isinstance(draft_key, str) or not draft_key or "\x00" in draft_key:
+            raise ValueError("Prevention draft key must be a non-empty string.")
+        if daily_limit == 0:
+            return False
+        timestamp = reserved_at or _now()
+        start = datetime.combine(
+            timestamp.astimezone(_UTC).date(), time.min, tzinfo=_UTC
+        )
+        end = start + timedelta(days=1)
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            existing = self._connection.execute(
+                "SELECT 1 FROM prevention_publication_slots WHERE draft_key = ?",
+                (draft_key,),
+            ).fetchone()
+            if existing is not None:
+                self._connection.commit()
+                return True
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS reserved
+                FROM prevention_publication_slots
+                WHERE reserved_at >= ? AND reserved_at < ?
+                """,
+                (_serialize_datetime(start), _serialize_datetime(end)),
+            ).fetchone()
+            if int(row["reserved"]) >= daily_limit:
+                self._connection.rollback()
+                return False
+            self._connection.execute(
+                """
+                INSERT INTO prevention_publication_slots (draft_key, reserved_at)
+                VALUES (?, ?)
+                """,
+                (draft_key, _serialize_datetime(timestamp)),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return True
+
+    def prevention_publication_slots_for_day(self, day: date) -> int:
+        """Return prevention publication slots reserved during one UTC day."""
+
+        start = datetime.combine(day, time.min, tzinfo=_UTC)
+        end = start + timedelta(days=1)
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS reserved
+            FROM prevention_publication_slots
+            WHERE reserved_at >= ? AND reserved_at < ?
+            """,
+            (_serialize_datetime(start), _serialize_datetime(end)),
+        ).fetchone()
+        return int(row["reserved"])
 
     def model_calls_committed_for_day(self, day: date) -> int:
         """Return completed, ambiguous, and in-flight calls for one UTC day."""
@@ -9118,6 +9762,41 @@ class GuardianState:
         if actual != expected:
             raise RuntimeError("assessment cache identity collision")
         return str(row["result_json"])
+
+    def invalidate_assessment_result(
+        self,
+        *,
+        cache_key: str,
+        result_json: str,
+        invalidated_at: datetime | None = None,
+    ) -> None:
+        """Evict only the rejected bytes, retaining billing and an atomic audit."""
+
+        if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+            raise ValueError("assessment cache key must be a SHA-256 digest")
+        with self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM assessment_results WHERE cache_key = ? AND result_json = ?",
+                (cache_key, result_json),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Rejected assessment changed before invalidation.")
+            self._connection.execute(
+                """
+                INSERT INTO health (
+                    component, status, message, details_json, checked_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    "guardian-assessment-cache", "warning",
+                    "Invalid cached assessment evicted; bounded reassessment required.",
+                    _canonical_json({
+                        "cache_key": cache_key,
+                        "reason": "invalid_cached_assessment",
+                    }),
+                    _serialize_datetime(invalidated_at or _now()),
+                ),
+            )
 
     def cache_assessment_and_settle_budget(
         self,
@@ -9324,6 +10003,23 @@ class GuardianState:
             )
         return int(cursor.lastrowid)
 
+    def prevention_decline(self, decline_key: str) -> Mapping[str, Any] | None:
+        """Find a private disposition bound to exact code, policy and source evidence."""
+        if not re.fullmatch(r"[0-9a-f]{64}", decline_key):
+            raise ValueError("Invalid prevention decline key")
+        row = self._connection.execute(
+            _PREVENTION_DECLINE_SQL, (decline_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        from localize.guardian.prevention_decision import parse_decision
+        details = loads_bounded_json(row["details_json"])
+        parse_decision({key: details.get(key) for key in
+                        ("schema_version", "outcome", "reason", "explanation", "inspected_paths")})
+        if details["outcome"] != "declined":
+            raise RuntimeError("Invalid persisted prevention decline")
+        return details
+
     def latest_health(self, component: str) -> HealthRecord | None:
         """Return the latest health observation for a component."""
 
@@ -9387,6 +10083,13 @@ class GuardianState:
             LIMIT 1
             """
         ).fetchone()
+        last_poll_row = self._connection.execute(
+            """
+            SELECT checked_at FROM health
+            WHERE component = 'guardian' AND status = 'ok'
+            ORDER BY checked_at DESC, health_id DESC LIMIT 1
+            """
+        ).fetchone()
         pending_row = self._connection.execute(
             f"""
             SELECT COUNT(*) AS pending_count FROM event_revisions AS e
@@ -9395,7 +10098,10 @@ class GuardianState:
                 JOIN runs AS r ON r.run_id = a.run_id
                 WHERE a.event_revision_id = e.revision_id
                   AND a.status IN ('completed', 'skipped')
+                  AND json_extract(a.details_json, '$.outcome')
+                      IS NOT 'translation_batch_deferred'
                   AND r.mode IN ({placeholders})
+                  AND json_extract(a.details_json, '$.prevention_pending') IS NOT 1
             )
             """,
             resolution_modes,
@@ -9676,6 +10382,9 @@ class GuardianState:
         ):  # pragma: no cover - aggregates always return one row
             raise RuntimeError("Guardian status aggregation failed.")
         return GuardianStateStatus(
+            last_successful_poll=(
+                str(last_poll_row["checked_at"]) if last_poll_row else None
+            ),
             last_completed_run=(
                 str(last_run_row["finished_at"]) if last_run_row else None
             ),
@@ -10071,6 +10780,39 @@ class GuardianState:
         ).issubset(item[0] for item in canonical):
             raise RuntimeError("Publication completion plan is missing or malformed.")
         return canonical
+
+    def publication_deferred_revision_ids(
+        self, publication: PublicationRecord,
+    ) -> frozenset[int]:
+        """Keep partially corrected reviews actionable on the published head."""
+        exists = self._connection.execute(
+            "SELECT 1 FROM publication_completion_plan_items "
+            "WHERE publication_key = ? LIMIT 1", (publication.publication_key,),
+        ).fetchone()
+        if exists is None:
+            # Pre-plan legacy publications did not support partial batches.
+            return frozenset()
+        plan = self._publication_completion_plan_in_transaction(publication)
+        return frozenset(
+            revision_id for revision_id, _status, details in plan
+            if loads_bounded_json(details).get("outcome") == "translation_batch_deferred"
+        )
+
+    def publication_pending_prevention_revision_ids(
+        self, publication: PublicationRecord,
+    ) -> frozenset[int]:
+        """Identify completed translations whose prevention work remains pending."""
+        exists = self._connection.execute(
+            "SELECT 1 FROM publication_completion_plan_items "
+            "WHERE publication_key = ? LIMIT 1", (publication.publication_key,),
+        ).fetchone()
+        if exists is None:
+            return frozenset()
+        plan = self._publication_completion_plan_in_transaction(publication)
+        return frozenset(
+            revision_id for revision_id, _status, details in plan
+            if loads_bounded_json(details).get("prevention_pending") is True
+        )
 
     def _record_publication_completion_plan_in_transaction(
         self,
@@ -10603,12 +11345,14 @@ class GuardianState:
             """
             SELECT terminal.reason, terminal.occurred_at
             FROM publication_reply_terminal_events AS terminal
-            JOIN remediation_successor_publications AS successor
+            LEFT JOIN remediation_successor_publications AS successor
               ON successor.publication_key = terminal.publication_key
             JOIN publication_events AS publication
               ON publication.publication_key = terminal.publication_key
              AND publication.phase = 'published'
             WHERE terminal.publication_key = ?
+              AND (terminal.reason = 'trusted_feedback_changed'
+                   OR successor.publication_key IS NOT NULL)
             LIMIT 2
             """,
             (publication_key,),
@@ -10661,13 +11405,15 @@ class GuardianState:
             """
             SELECT publication.occurred_at
             FROM publication_events AS publication
-            JOIN remediation_successor_publications AS successor
+            LEFT JOIN remediation_successor_publications AS successor
               ON successor.publication_key = publication.publication_key
             WHERE publication.publication_key = ?
               AND publication.phase = 'published'
+              AND (? = 'trusted_feedback_changed'
+                   OR successor.publication_key IS NOT NULL)
             LIMIT 2
             """,
-            (publication_key,),
+            (publication_key, reason),
         ).fetchall()
         if len(published) != 1:
             raise ValueError(
@@ -10725,13 +11471,15 @@ class GuardianState:
                 """
                 SELECT publication.*
                 FROM publication_events AS publication
-                JOIN remediation_successor_publications AS successor
+                LEFT JOIN remediation_successor_publications AS successor
                   ON successor.publication_key = publication.publication_key
                 WHERE publication.publication_key = ?
+                  AND (? = 'trusted_feedback_changed'
+                       OR successor.publication_key IS NOT NULL)
                 ORDER BY publication.publication_event_id DESC
                 LIMIT 2
                 """,
-                (publication_key,),
+                (publication_key, reason),
             ).fetchall()
             if not rows:
                 raise ValueError(
@@ -10878,6 +11626,7 @@ class GuardianState:
         head_sha: str,
         publication_actor_id: int,
         publication_actor_type: str,
+        include_terminal_corrections: bool = False,
     ) -> PublicationRecord | None:
         """Return an actor-bound replied publication for the exact current head.
 
@@ -10895,6 +11644,17 @@ class GuardianState:
         ) or publication_actor_type not in {"User", "Bot"}:
             raise ValueError("publication_actor_type must be User or Bot.")
         _validate_repository_id_filter(repository_id)
+        terminal_clause = """
+            (p.phase = 'replied' OR (
+                ? = 1 AND p.phase = 'published' AND EXISTS (
+                    SELECT 1 FROM publication_reply_terminal_events AS terminal
+                    JOIN runs AS run ON run.run_id = p.run_id
+                    WHERE terminal.publication_key = p.publication_key
+                      AND terminal.reason = 'trusted_feedback_changed'
+                      AND run.status = 'completed'
+                )
+            ))
+        """
 
         if repository_id is None:
             repository_where = "p.repository = ?"
@@ -10904,11 +11664,11 @@ class GuardianState:
             # route, so no mutable-name filter can exclude it safely. Check all
             # exact head/actor matches before trusting the immutable-ID lookup.
             ambiguous_legacy = self._connection.execute(
-                """
+                f"""
                 SELECT 1 FROM publication_events AS p
                 WHERE p.repository_id IS NULL
                   AND p.pr_number = ? AND p.commit_sha = ?
-                  AND p.phase = 'replied'
+                  AND {terminal_clause}
                   AND p.publication_actor_id = ?
                   AND p.publication_actor_type = ?
                 LIMIT 1
@@ -10916,6 +11676,7 @@ class GuardianState:
                 (
                     pr_number,
                     head_sha,
+                    int(include_terminal_corrections),
                     publication_actor_id,
                     publication_actor_type,
                 ),
@@ -10931,7 +11692,7 @@ class GuardianState:
             f"""
             SELECT p.* FROM publication_events AS p
             WHERE {repository_where} AND p.pr_number = ? AND p.commit_sha = ?
-              AND p.phase = 'replied'
+              AND {terminal_clause}
               AND p.publication_actor_id = ?
               AND p.publication_actor_type = ?
             ORDER BY p.publication_event_id DESC
@@ -10941,6 +11702,7 @@ class GuardianState:
                 *repository_parameters,
                 pr_number,
                 head_sha,
+                int(include_terminal_corrections),
                 publication_actor_id,
                 publication_actor_type,
             ),

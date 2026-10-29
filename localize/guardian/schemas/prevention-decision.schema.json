@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "outcome", "reason", "explanation", "inspected_paths"],
+  "properties": {
+    "schema_version": {"type": "integer", "enum": [1]},
+    "outcome": {"type": "string", "enum": ["patch", "declined"]},
+    "reason": {"type": "string", "enum": ["", "project_policy", "no_generic_defect", "already_covered"]},
+    "explanation": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "inspected_paths": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 256}}
+  }
+}

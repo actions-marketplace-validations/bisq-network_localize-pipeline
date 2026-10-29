@@ -231,6 +231,10 @@ _CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "hour": {"type": "integer", "minimum": 0, "maximum": 23},
                 "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+                "poll_interval_seconds": {
+                    "type": ["integer", "null"], "minimum": 900, "maximum": 86400,
+                },
+                "max_polls_per_day": {"type": "integer", "minimum": 1, "maximum": 96},
             },
         },
         "runtime": {
@@ -243,6 +247,10 @@ _CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "codex_home": _NON_EMPTY_STRING,
                 "codex_reasoning_effort": {
+                    "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
+                },
+                "prevention_model": _NON_EMPTY_STRING,
+                "prevention_reasoning_effort": {
                     "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
                 },
                 "codex_executable": _NON_EMPTY_STRING,
@@ -287,6 +295,14 @@ _CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 0,
                 },
                 "max_remediation_drafts_per_run": {
+                    "type": "integer",
+                    "minimum": 0,
+                },
+                "max_prevention_drafts_per_day": {
+                    "type": "integer",
+                    "minimum": 0,
+                },
+                "max_new_real_data_findings": {
                     "type": "integer",
                     "minimum": 0,
                 },
@@ -346,6 +362,15 @@ _CONFIG_SCHEMA: dict[str, Any] = {
                             "login": _NON_EMPTY_STRING,
                             "id": {"type": "integer", "minimum": 1},
                             "type": {"const": "User"},
+                        },
+                    },
+                    "quality_report_actor": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["login", "id", "type"],
+                        "properties": {
+                            "login": _NON_EMPTY_STRING,
+                            "id": {"type": "integer", "minimum": 1},
+                            "type": {"enum": ["User", "Bot"]},
                         },
                     },
                     "allowed_pr_authors": _actor_list_schema(("User", "Bot")),
@@ -1042,6 +1067,10 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
                     )
                 ),
                 source_locale=raw_policy["source_locale"],
+                quality_report_actor=(
+                    TrustedActor(**raw_policy["quality_report_actor"])
+                    if raw_policy.get("quality_report_actor") is not None else None
+                ),
                 trusted_reviewers=actors_for("trusted_reviewers"),
                 trusted_bots=actors_for("trusted_bots"),
                 private_repo_model_opt_in=raw_policy.get(
@@ -1076,6 +1105,7 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
     )
     for field in (
         "codex_model",
+        "prevention_model",
         "codex_executable",
         "git_executable",
         "signing_program",
@@ -1162,6 +1192,8 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
                 "codex_reasoning_effort",
                 runtime_defaults.codex_reasoning_effort,
             ),
+            prevention_model=raw_runtime.get("prevention_model"),
+            prevention_reasoning_effort=raw_runtime.get("prevention_reasoning_effort"),
             codex_auth_mode=auth_mode,
             codex_home=codex_home,
             codex_executable=raw_runtime.get(
@@ -1236,6 +1268,14 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
                 "max_model_calls_per_day",
                 defaults.max_model_calls_per_day,
             ),
+            max_prevention_drafts_per_day=raw_limits.get(
+                "max_prevention_drafts_per_day",
+                defaults.max_prevention_drafts_per_day,
+            ),
+            max_new_real_data_findings=raw_limits.get(
+                "max_new_real_data_findings",
+                defaults.max_new_real_data_findings,
+            ),
             daily_cost_limit_usd=(
                 float(raw_limits["daily_cost_limit_usd"])
                 if has_daily_cost
@@ -1261,7 +1301,7 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
     required_calls = limits.max_attempts * (
         1
         + (
-            limits.max_prevention_drafts_per_run
+            limits.prevention_drafts_per_poll
             if mode is GuardianMode.PROPOSE_PREVENTION
             else 0
         )
@@ -1281,12 +1321,12 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
         )
     if (
         mode is GuardianMode.PROPOSE_PREVENTION
-        and limits.max_prevention_drafts_per_run > 0
+        and limits.prevention_drafts_per_poll > 0
         and limits.daily_cost_limit_usd is not None
         and limits.model_call_reservation_usd is not None
         and limits.daily_cost_limit_usd < limits.model_call_reservation_usd
         * limits.max_attempts
-        * (1 + limits.max_prevention_drafts_per_run)
+        * (1 + limits.prevention_drafts_per_poll)
     ):
         raise GuardianConfigError(
             "propose-prevention requires daily_cost_limit_usd to reserve one "
@@ -1299,6 +1339,10 @@ def parse_guardian_config(raw_config: Mapping[str, Any]) -> GuardianConfig:
         schedule = GuardianSchedule(
             hour=raw_schedule.get("hour", schedule_defaults.hour),
             minute=raw_schedule.get("minute", schedule_defaults.minute),
+            poll_interval_seconds=raw_schedule.get("poll_interval_seconds"),
+            max_polls_per_day=raw_schedule.get(
+                "max_polls_per_day", schedule_defaults.max_polls_per_day,
+            ),
         )
     except ValueError as exc:
         raise GuardianConfigError(f"Invalid guardian configuration at schedule: {exc}") from None

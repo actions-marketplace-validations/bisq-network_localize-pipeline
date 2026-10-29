@@ -126,7 +126,8 @@ def test_builds_deterministic_side_effect_free_draft_plan(tmp_path):
     )
     assert "failed on the exact base" in plan.body
     assert "passed on its direct child" in plan.body
-    assert "review_comment:42:revision-a" in plan.body
+    assert "2 reviewed feedback items" in plan.body
+    assert "review_comment:42:revision-a" not in plan.body
     assert "publish only this signed candidate" in plan.body
     assert "cannot merge or deploy" in plan.body
 
@@ -163,6 +164,26 @@ def test_untrusted_root_cause_cannot_inject_markdown_or_mentions(tmp_path):
     assert "[click](https://attacker.invalid)" not in plan.body
 
 
+@pytest.mark.parametrize("executable", [
+    "/Users/private-operator/runtime/bin/pytest",
+    "/home/private-operator/bin/custom-private-runner",
+    "C:\\Users\\private-operator\\Scripts\\pytest.exe",
+])
+def test_public_regression_proof_never_contains_operator_argv(tmp_path, executable):
+    """Keep host paths and arbitrary command arguments in the private audit only."""
+    argv = (executable, "--cache-dir=/private/operator-cache", "private-argument")
+    results = (
+        _result("base", TestOutcome.FAILED, argv=argv),
+        _result("patched", TestOutcome.PASSED, argv=argv),
+    )
+    plan = _plan(tmp_path, test_results=results)
+    for private_text in ("private-operator", "/private/", "private-argument", "custom-private-runner"):
+        assert private_text not in plan.body
+    assert "fingerprint" not in plan.body
+    assert "private audit" in plan.body
+    assert results[0].argv == argv
+
+
 def test_generated_draft_text_has_deterministic_utf8_byte_bounds(tmp_path):
     large_argument = "界" * 1365
     commands = tuple(
@@ -197,8 +218,8 @@ def test_generated_draft_text_has_deterministic_utf8_byte_bounds(tmp_path):
     assert len(first.title) <= 120
     assert len(first.title.encode("utf-8")) <= 256
     assert len(first.body.encode("utf-8")) <= 60 * 1024
-    assert "full-list fingerprint" in first.body
-    assert "additional item" in first.body
+    assert "fingerprint" not in first.body
+    assert "100 reviewed feedback items" in first.body
 
 
 def test_rejects_a_previously_seen_root_cause_and_evidence_hash(tmp_path):

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import (
@@ -24,33 +25,38 @@ from typing import (
 import yaml
 
 from localize.ignore_keys import compile_ignore_key_patterns, is_ignored_key
-from localize.localization_formats import (
+from localize.formats.adapters import get_localization_adapter
+from localize.formats.metadata import (
     JAVA_PROPERTIES_FORMAT,
     LocalizationFormat,
     load_localization_format,
 )
-from localize.localization_layouts import (
+from localize.formats.layouts import (
     SUFFIX_LAYOUT,
     LocalizationLayout,
     load_localization_layout,
 )
-from localize.localization_profiles import (
+from localize.formats.profiles import (
     LocalizationProfile,
     load_localization_profiles,
 )
+from localize.formats.placeholders import strip_placeholder_tokens
 from localize.semantic_quality import (
     SemanticFinding,
     SemanticQAStats,
     SemanticRule,
     TranslationChange,
     analyze_translation_changes,
+    evaluate_retained_source_words,
+    evaluate_semantic_rules,
     iter_all_translation_entries,
     iter_translation_changes_from_diff,
     load_semantic_rules,
     normalize_value,
     normalize_retained_source_word_allowlist,
 )
-from localize.translation_validator import find_disallowed_control_characters
+from localize.source_identical_acceptance import is_accepted_source_identical, normalize_acceptances
+from localize.formats.validation import find_disallowed_control_characters
 
 
 @dataclass
@@ -67,9 +73,14 @@ class QualityGateConfig:
     retained_source_word_allowlist: Dict[str, Tuple[str, ...]] = field(
         default_factory=dict
     )
+    source_identical_allowlist: Dict[str, Tuple[str, ...]] = field(
+        default_factory=dict
+    )
+    accepted_source_identical_translations: Dict[str, Dict[str, str]] = field(default_factory=dict)
     ignore_key_patterns: List[Pattern[str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize gate policy, including reviewed source-value exemptions."""
         return {
             "source_identical_min_block_count": self.source_identical_min_block_count,
             "source_identical_max_count": self.source_identical_max_count,
@@ -79,6 +90,8 @@ class QualityGateConfig:
             "block_on_semantic_qa_warnings": self.block_on_semantic_qa_warnings,
             "semantic_qa_audit_scope": self.semantic_qa_audit_scope,
             "retained_source_word_allowlist": self.retained_source_word_allowlist,
+            "source_identical_allowlist": self.source_identical_allowlist,
+            "accepted_source_identical_translations": self.accepted_source_identical_translations,
             "ignore_key_patterns": [
                 pattern.pattern for pattern in self.ignore_key_patterns
             ],
@@ -92,6 +105,8 @@ class SourceIdenticalStats:
     source_identical_count: int = 0
     expected_source_identical_count: int = 0
     unexpected_source_identical_count: int = 0
+    localized_to_source_regression_count: int = 0
+    new_source_identical_prose_count: int = 0
     unexpected_source_identical_ratio: float = 0.0
     control_character_findings_count: int = 0
     examples: List[Dict[str, str]] = field(default_factory=list)
@@ -108,12 +123,33 @@ _TOKEN_PATTERNS = [
     re.compile(r"^[A-Z0-9_.:+/#-]{2,}$"),
 ]
 _ENUM_LIKE_KEY = re.compile(r"^[A-Z0-9_.$-]+$")
+_PROSE_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _is_prose(value: str) -> bool:
+    """Include short UI phrases while leaving single shared-language terms alone."""
+    text = strip_placeholder_tokens(value).strip()
+    words = _PROSE_WORD.findall(text)
+    return len(words) >= 3 or (
+        len(words) == 2
+        and (words[1].islower() or text.endswith((".", "!", "?")))
+    )
 
 
 def is_expected_source_identical(
-    key: str, value: str, brand_glossary: Iterable[str]
+    key: str,
+    value: str,
+    brand_glossary: Iterable[str],
+    locale_code: str = "",
+    source_identical_allowlist: Optional[Mapping[str, Iterable[str]]] = None,
+    accepted_source_identical_translations: Optional[Mapping[str, Mapping[str, str]]] = None,
+    target_value: Optional[str] = None,
 ) -> bool:
-    """Return true for values that are commonly and legitimately untranslated."""
+    """Recognize exact reviewed targets and legacy normalized shared values."""
+    if is_accepted_source_identical(
+        locale_code, key, value, target_value, accepted_source_identical_translations or {},
+    ):
+        return True
     normalized = normalize_value(value)
     if not normalized:
         return True
@@ -121,6 +157,17 @@ def is_expected_source_identical(
         return True
     glossary = {term.strip().casefold() for term in brand_glossary if str(term).strip()}
     if normalized.casefold() in glossary:
+        return True
+    allowlist = normalize_retained_source_word_allowlist(
+        source_identical_allowlist or {}
+    )
+    allowed_values = {
+        normalize_value(term).casefold()
+        for term in (*allowlist.get("*", ()), *allowlist.get(locale_code, ()))
+    }
+    if normalized.casefold() in allowed_values:
+        return True
+    if not strip_placeholder_tokens(normalized).strip():
         return True
     if not any(character.isalpha() for character in normalized):
         return True
@@ -137,6 +184,8 @@ def analyze_source_identical_changes(
     localization_format: LocalizationFormat = JAVA_PROPERTIES_FORMAT,
     localization_layout: LocalizationLayout = SUFFIX_LAYOUT,
     ignore_key_patterns: Sequence[Pattern[str] | str] = (),
+    source_identical_allowlist: Optional[Mapping[str, Iterable[str]]] = None,
+    accepted_source_identical_translations: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> SourceIdenticalStats:
     """Analyze staged translation changes for suspicious English-source fallbacks."""
     changes = iter_translation_changes_from_diff(
@@ -153,6 +202,8 @@ def analyze_source_identical_changes(
         brand_glossary=brand_glossary,
         examples_limit=examples_limit,
         ignore_key_patterns=_ensure_ignore_key_patterns(ignore_key_patterns),
+        source_identical_allowlist=source_identical_allowlist,
+        accepted_source_identical_translations=accepted_source_identical_translations,
     )
 
 
@@ -177,7 +228,10 @@ def _analyze_source_identical_translation_changes(
     brand_glossary: Iterable[str],
     examples_limit: int,
     ignore_key_patterns: Sequence[Pattern[str]] = (),
+    source_identical_allowlist: Optional[Mapping[str, Iterable[str]]] = None,
+    accepted_source_identical_translations: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> SourceIdenticalStats:
+    """Classify changes without exempting unrelated locales or partial phrases."""
     stats = SourceIdenticalStats()
 
     for change in _filter_ignored_changes(changes, ignore_key_patterns):
@@ -204,12 +258,28 @@ def _analyze_source_identical_translation_changes(
             continue
 
         stats.source_identical_count += 1
-        if is_expected_source_identical(change.key, source_value, brand_glossary):
+        if is_expected_source_identical(
+            change.key,
+            source_value,
+            brand_glossary,
+            change.locale_code,
+            source_identical_allowlist,
+            accepted_source_identical_translations,
+            target_value=change.new_value,
+        ):
             stats.expected_source_identical_count += 1
             continue
 
         stats.checked_entries_count += 1
         stats.unexpected_source_identical_count += 1
+        if not normalize_value(change.old_value or "") and _is_prose(source_value):
+            stats.new_source_identical_prose_count += 1
+        if (
+            change.old_value is not None
+            and normalize_value(change.old_value)
+            and normalize_value(change.old_value) != normalize_value(source_value)
+        ):
+            stats.localized_to_source_regression_count += 1
         if len(stats.examples) < examples_limit:
             stats.examples.append(
                 {
@@ -283,6 +353,8 @@ def analyze_source_identical_changes_for_profiles(
     localization_profiles: Sequence[LocalizationProfile],
     examples_limit: int = 10,
     ignore_key_patterns: Sequence[Pattern[str]] = (),
+    source_identical_allowlist: Optional[Mapping[str, Iterable[str]]] = None,
+    accepted_source_identical_translations: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> SourceIdenticalStats:
     """Analyze suspicious source-identical changes across configured profiles."""
     return _analyze_source_identical_translation_changes(
@@ -298,6 +370,8 @@ def analyze_source_identical_changes_for_profiles(
         brand_glossary=brand_glossary,
         examples_limit=examples_limit,
         ignore_key_patterns=ignore_key_patterns,
+        source_identical_allowlist=source_identical_allowlist,
+        accepted_source_identical_translations=accepted_source_identical_translations,
     )
 
 
@@ -346,6 +420,7 @@ def analyze_semantic_qa_changes_for_profiles(
     localization_profiles: Sequence[LocalizationProfile] = (),
     examples_limit: int = 10,
     ignore_key_patterns: Sequence[Pattern[str]] = (),
+    source_affected_changes: Sequence[TranslationChange] = (),
 ) -> SemanticQAStats:
     """Scan changed translations across all configured format/layout profiles."""
     changes = _deduplicate_translation_changes(
@@ -357,13 +432,99 @@ def analyze_semantic_qa_changes_for_profiles(
             localization_profiles=localization_profiles,
         )
     )
-    return analyze_translation_changes(
-        changes=list(_filter_ignored_changes(changes, ignore_key_patterns)),
-        semantic_rules=semantic_rules,
-        brand_glossary=brand_glossary,
-        retained_source_word_allowlist=retained_source_word_allowlist,
-        examples_limit=examples_limit,
+    changes = list(_filter_ignored_changes(changes, ignore_key_patterns))
+    rule_changes = _deduplicate_translation_changes(
+        _filter_ignored_changes([*changes, *source_affected_changes], ignore_key_patterns)
     )
+    findings = evaluate_semantic_rules(rule_changes, semantic_rules)
+    findings.extend(evaluate_retained_source_words(
+        changes, brand_glossary,
+        retained_source_word_allowlist=retained_source_word_allowlist,
+    ))
+    return SemanticQAStats.from_findings(findings, examples_limit=examples_limit)
+
+
+def source_affected_translation_entries(
+    repo_root: str,
+    input_folder: str,
+    locale_codes: Sequence[str],
+    localization_profiles: Sequence[LocalizationProfile],
+    source_diff_base: str,
+) -> List[TranslationChange]:
+    """Map source-value changes since a trusted Git baseline to current targets.
+
+    Compare parsed complete files, rather than added diff lines, so continuation
+    edits and nested JSON changes retain their actual entry identities.
+    """
+    root = Path(repo_root).resolve()
+    folder = Path(input_folder).resolve()
+    relative = folder.relative_to(root).as_posix()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=root, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Source-change audit Git context is unavailable: {result.stderr.strip()}")
+        return result.stdout
+
+    base = git("rev-parse", "--verify", "--end-of-options", f"{source_diff_base}^{{commit}}").strip()
+    base = git("merge-base", base, "HEAD").strip()
+    changed_paths = git(
+        "diff", "--name-only", "-z", "--diff-filter=ACMRT", "--no-ext-diff",
+        base, "--", relative,
+    ).split("\0")
+    if not any(changed_paths):
+        return []
+    base_paths = set(git("ls-tree", "-r", "--name-only", "-z", base, "--", relative).split("\0"))
+    affected: List[TranslationChange] = []
+    with tempfile.TemporaryDirectory(prefix="localize-source-audit-") as temporary:
+        for profile in dict.fromkeys(localization_profiles):
+            fmt, layout = profile.localization_format, profile.localization_layout
+            adapter = get_localization_adapter(fmt)
+            source_changes: Dict[str, Dict[str, str]] = {}
+            for path in changed_paths:
+                if not path:
+                    continue
+                source = root / path
+                source_rel = source.relative_to(folder)
+                if "archive" in source_rel.parts or not layout.is_source_file(source_rel.as_posix(), locale_codes, fmt):
+                    continue
+                _, current_values = adapter.parse_file(str(source))
+                previous_values: Dict[str, str] = {}
+                if path in base_paths:
+                    snapshot = Path(temporary) / f"source{fmt.file_extension}"
+                    blob = subprocess.run(
+                        ["git", "show", f"{base}:{path}"], cwd=root, text=False,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                    )
+                    if blob.returncode:
+                        detail = blob.stderr.decode("utf-8", errors="replace").strip()
+                        raise RuntimeError(f"Source-change audit baseline blob is unavailable: {detail}")
+                    snapshot.write_bytes(blob.stdout)
+                    _, previous_values = adapter.parse_file(str(snapshot))
+                changed_values = {key: value for key, value in current_values.items()
+                                  if previous_values.get(key) != value}
+                if changed_values:
+                    source_changes[source_rel.as_posix()] = changed_values
+            if not source_changes:
+                continue
+            for target in sorted(folder.rglob(f"*{fmt.file_extension}")):
+                target_rel = target.relative_to(folder)
+                if "archive" in target_rel.parts or not layout.is_target_file(target_rel.as_posix(), locale_codes, fmt):
+                    continue
+                source_rel = layout.source_path_for_target(target_rel.as_posix(), locale_codes, fmt)
+                changed_values = source_changes.get(source_rel)
+                if not changed_values:
+                    continue
+                _, targets = adapter.parse_file(str(target))
+                locale = layout.extract_locale(target_rel.as_posix(), locale_codes, fmt) or ""
+                affected.extend(TranslationChange(
+                    file=target_rel.as_posix(), locale_code=locale, key=key,
+                    source_value=value, old_value=None, new_value=targets[key],
+                ) for key, value in changed_values.items() if key in targets)
+    return _deduplicate_translation_changes(affected)
 
 
 def analyze_all_translation_entries_for_profiles(
@@ -398,6 +559,7 @@ def analyze_all_translation_entries_for_profiles(
 def load_quality_gate_config(
     config_path: str,
 ) -> Tuple[QualityGateConfig, List[str], List[str], List[SemanticRule]]:
+    """Load gate thresholds, locale-scoped exemptions and semantic rules."""
     with open(config_path, "r", encoding="utf-8") as file:
         raw_config = yaml.safe_load(file) or {}
 
@@ -440,6 +602,10 @@ def load_quality_gate_config(
             semantic_qa_audit_scope=semantic_qa_audit_scope,
             retained_source_word_allowlist=normalize_retained_source_word_allowlist(
                 quality_gate.get("retained_source_word_allowlist", {})
+            ),
+            accepted_source_identical_translations=normalize_acceptances(raw_config.get("accepted_source_identical_translations")),
+            source_identical_allowlist=normalize_retained_source_word_allowlist(
+                quality_gate.get("source_identical_allowlist", {})
             ),
             ignore_key_patterns=compile_ignore_key_patterns(
                 raw_config.get("ignore_key_patterns", [])
@@ -699,14 +865,21 @@ def build_quality_gate_report(
         "remediated_ai_findings_count": remediated_ai_findings_count,
     }
 
+    # Never tolerate destruction of an existing localized value.
+    if source_stats.localized_to_source_regression_count:
+        blocking_reasons.append(
+            "Existing localized values were replaced by unexpected source-identical text."
+        )
+    if source_stats.new_source_identical_prose_count:
+        blocking_reasons.append(
+            "New translations contain unexpected source-identical prose."
+        )
     source_identical_blocking = (
         source_stats.unexpected_source_identical_count
         >= config.source_identical_min_block_count
         and (
-            source_stats.unexpected_source_identical_count
-            > config.source_identical_max_count
-            or source_stats.unexpected_source_identical_ratio
-            > config.source_identical_max_ratio
+            source_stats.unexpected_source_identical_count > config.source_identical_max_count
+            or source_stats.unexpected_source_identical_ratio > config.source_identical_max_ratio
         )
     )
     if source_identical_blocking:
@@ -967,6 +1140,8 @@ def render_quality_gate_markdown(report: Dict[str, Any]) -> str:
 
 
 def get_staged_diff(repo_root: str, changed_files: Sequence[str]) -> str:
+    if not changed_files:
+        return ""
     result = subprocess.run(
         [
             "git",
@@ -1012,12 +1187,17 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument("--validation-summary", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-markdown", required=True)
-    parser.add_argument("--changed-files", nargs="+", required=True)
+    parser.add_argument("--changed-files", nargs="+", default=[])
+    parser.add_argument("--source-diff-base", help="Trusted Git baseline for configured rules on source-affected targets.")
     parser.add_argument("--audit-scope", choices=["changed", "all"], default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.changed_files and not args.source_diff_base:
+        parser.error("provide --changed-files or --source-diff-base")
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Check staged translations using configured policy and write review reports."""
     args = _parse_args(argv)
     config, locale_codes, brand_glossary, semantic_rules = load_quality_gate_config(
         args.config
@@ -1032,6 +1212,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         brand_glossary=brand_glossary,
         localization_profiles=localization_profiles,
         ignore_key_patterns=config.ignore_key_patterns,
+        source_identical_allowlist=config.source_identical_allowlist,
+        accepted_source_identical_translations=config.accepted_source_identical_translations,
     )
     audit_scope = args.audit_scope or config.semantic_qa_audit_scope
     if audit_scope == "all":
@@ -1046,6 +1228,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ignore_key_patterns=config.ignore_key_patterns,
         )
     else:
+        source_affected_changes = (
+            source_affected_translation_entries(
+                args.repo_root, args.input_folder, locale_codes,
+                localization_profiles, args.source_diff_base,
+            ) if semantic_rules and args.source_diff_base else []
+        )
         semantic_stats = analyze_semantic_qa_changes_for_profiles(
             diff_text=diff_text,
             repo_root=args.repo_root,
@@ -1056,6 +1244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             retained_source_word_allowlist=config.retained_source_word_allowlist,
             localization_profiles=localization_profiles,
             ignore_key_patterns=config.ignore_key_patterns,
+            source_affected_changes=source_affected_changes,
         )
     report = build_quality_gate_report(
         source_stats=source_stats,

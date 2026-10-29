@@ -1126,6 +1126,12 @@ def test_parses_operator_pipeline_config_and_daily_schedule(tmp_path: Path) -> N
         "schedule: {hour: 1.5, minute: 0}",
         "schedule: {hour: 1.0, minute: 0}",
         "schedule: {hour: 0, minute: 0, timezone: UTC}",
+        "schedule: {poll_interval_seconds: 899}",
+        "schedule: {poll_interval_seconds: 86401}",
+        "schedule: {poll_interval_seconds: true}",
+        "schedule: {max_polls_per_day: 0}",
+        "schedule: {max_polls_per_day: 97}",
+        "schedule: {max_polls_per_day: true}",
     ],
 )
 def test_rejects_invalid_daily_schedule(
@@ -1362,6 +1368,7 @@ runtime:
   codex_api_key_command: [/opt/bin/model-token]
 limits:
   max_prevention_drafts_per_run: {max_drafts}
+  max_prevention_drafts_per_day: {max_drafts}
   max_attempts: {max_attempts}
   max_model_calls_per_day: {max_attempts * (1 + max_drafts)}
   daily_cost_limit_usd: {daily_limit}
@@ -1395,6 +1402,7 @@ runtime:
   codex_api_key_command: [/opt/bin/model-token]
 limits:
   max_prevention_drafts_per_run: {max_drafts}
+  max_prevention_drafts_per_day: {max_drafts}
   max_attempts: {max_attempts}
   max_model_calls_per_day: {max_attempts * (1 + max_drafts)}
   daily_cost_limit_usd: {daily_limit}
@@ -1549,6 +1557,69 @@ limits:
     assert config.runtime.signing_key == fingerprint
     assert config.runtime.signing_format is SigningFormat.OPENPGP
     assert config.runtime.signing_public_key is None
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, ("gpt-6-sol", "high")),
+        ({"prevention_model": "gpt-6-astra"}, ("gpt-6-astra", "high")),
+        ({"prevention_reasoning_effort": "medium"}, ("gpt-6-sol", "medium")),
+        (
+            {"prevention_model": "gpt-6-astra", "prevention_reasoning_effort": "xhigh"},
+            ("gpt-6-astra", "xhigh"),
+        ),
+    ],
+)
+def test_prevention_model_overrides_leave_assessment_settings_unchanged(
+    overrides: dict, expected: tuple[str, str],
+) -> None:
+    raw = yaml.safe_load(_minimal_config())
+    raw["runtime"] = {
+        "codex_model": "gpt-6-sol", "codex_reasoning_effort": "high", **overrides,
+    }
+    runtime = parse_guardian_config(raw).runtime
+
+    assert (runtime.codex_model, runtime.codex_reasoning_effort) == ("gpt-6-sol", "high")
+    assert (
+        runtime.effective_prevention_model,
+        runtime.effective_prevention_reasoning_effort,
+    ) == expected
+    if not overrides:
+        changed = replace(runtime, codex_model="other-model", codex_reasoning_effort="low")
+        assert changed.effective_prevention_model == "other-model"
+        assert changed.effective_prevention_reasoning_effort == "low"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("prevention_model", ""),
+        ("prevention_model", " "),
+        ("prevention_model", "gpt-6-astra\n--unsafe"),
+        ("prevention_model", "x" * 4097),
+        ("prevention_model", True),
+        ("prevention_model", ["gpt-6-astra"]),
+        ("prevention_reasoning_effort", "extreme"),
+        ("prevention_reasoning_effort", "none"),
+        ("prevention_reasoning_effort", ["high"]),
+    ],
+)
+def test_invalid_prevention_model_settings_fail_closed(field: str, value: object) -> None:
+    raw = yaml.safe_load(_minimal_config())
+    raw["runtime"] = {field: value}
+    with pytest.raises(GuardianConfigError, match=field):
+        parse_guardian_config(raw)
+    with pytest.raises(ValueError, match=field):
+        GuardianRuntime(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["prevention_model", "prevention_reasoning_effort"])
+def test_prevention_override_yaml_requires_omission_rather_than_null(field: str) -> None:
+    raw = yaml.safe_load(_minimal_config())
+    raw["runtime"] = {field: None}
+    with pytest.raises(GuardianConfigError, match=field):
+        parse_guardian_config(raw)
 
 
 @pytest.mark.parametrize(
@@ -2426,3 +2497,96 @@ def test_stable_replacement_model_carries_review_evidence() -> None:
     assert replacement.feedback_id == "review-comment:42"
     assert replacement.source_value == "Push to %0 was rejected (%1). %2 %3"
     assert replacement.evidence == ("Maintainer supplied the correction.",)
+
+
+def test_prevention_daily_cap_and_real_data_bound_have_safe_defaults(
+    tmp_path: Path,
+) -> None:
+    config = load_guardian_config(_write_config(tmp_path, _minimal_config()))
+
+    assert config.limits.max_prevention_drafts_per_day == 1
+    assert config.limits.max_new_real_data_findings == 5
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "offending"),
+    [
+        ({"max_prevention_drafts_per_day": -1}, "max_prevention_drafts_per_day"),
+        ({"max_prevention_drafts_per_day": True}, "max_prevention_drafts_per_day"),
+        ({"max_new_real_data_findings": -1}, "max_new_real_data_findings"),
+        ({"max_new_real_data_findings": 1.5}, "max_new_real_data_findings"),
+    ],
+)
+def test_prevention_daily_cap_and_real_data_bound_reject_invalid_values(
+    kwargs: dict[str, object],
+    offending: str,
+) -> None:
+    with pytest.raises(ValueError, match=offending):
+        GuardianLimits(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "limit_line",
+    ("  max_prevention_drafts_per_day: -1\n", "  max_new_real_data_findings: -1\n"),
+)
+def test_loader_rejects_negative_prevention_daily_limits(
+    tmp_path: Path,
+    limit_line: str,
+) -> None:
+    config_text = _minimal_config().replace(
+        "repositories:\n",
+        "limits:\n" + limit_line + "repositories:\n",
+        1,
+    )
+
+    with pytest.raises(GuardianConfigError):
+        load_guardian_config(_write_config(tmp_path, config_text))
+
+
+def test_zero_daily_prevention_cap_is_a_kill_switch_without_prevention_budget(
+    tmp_path: Path,
+) -> None:
+    config_text = """mode: propose-prevention
+runtime:
+  codex_auth_mode: api-key
+  codex_api_key_command: [/opt/bin/model-token]
+limits:
+  max_prevention_drafts_per_run: 2
+  max_prevention_drafts_per_day: 0
+  max_attempts: 2
+  max_model_calls_per_day: 2
+  daily_cost_limit_usd: 10
+  model_call_reservation_usd: 5
+""" + _config_with_prevention()
+
+    config = load_guardian_config(_write_config(tmp_path, config_text))
+
+    assert config.limits.max_prevention_drafts_per_day == 0
+    assert config.limits.prevention_drafts_per_poll == 0
+
+
+def test_daily_prevention_cap_bounds_required_model_call_capacity(
+    tmp_path: Path,
+) -> None:
+    template = """mode: propose-prevention
+runtime:
+  codex_auth_mode: api-key
+  codex_api_key_command: [/opt/bin/model-token]
+limits:
+  max_prevention_drafts_per_run: 3
+  max_prevention_drafts_per_day: 1
+  max_attempts: 2
+  max_model_calls_per_day: CALLS
+  daily_cost_limit_usd: DAILY
+  model_call_reservation_usd: 5
+""" + _config_with_prevention()
+
+    def render(calls: int, daily: float) -> str:
+        return template.replace("CALLS", str(calls)).replace("DAILY", str(daily))
+
+    config = load_guardian_config(_write_config(tmp_path, render(4, 20)))
+    assert config.limits.prevention_drafts_per_poll == 1
+    with pytest.raises(GuardianConfigError, match="max_model_calls_per_day"):
+        load_guardian_config(_write_config(tmp_path, render(3, 20)))
+    with pytest.raises(GuardianConfigError, match="assessment plus"):
+        load_guardian_config(_write_config(tmp_path, render(4, 19.99)))

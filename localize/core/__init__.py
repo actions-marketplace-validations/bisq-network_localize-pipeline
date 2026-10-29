@@ -1,6 +1,6 @@
 """Public core orchestration API."""
 
-from localize.pipeline_core import (
+from localize.core.pipeline import (
     ProcessQueueResult,
     TranslationPipelineOptions,
     TranslationPipelinePaths,
@@ -8,7 +8,7 @@ from localize.pipeline_core import (
     TranslationPipelineSteps,
     run_translation_pipeline,
 )
-from localize.connectors import (
+from localize.core.connectors import (
     FileReporterConnector,
     FilesystemSourceConnector,
     FunctionProcessorConnector,

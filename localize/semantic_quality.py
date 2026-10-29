@@ -13,10 +13,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Pattern, Sequence, Tuple
 
-from localize.localization_adapters import get_localization_adapter
-from localize.localization_formats import JAVA_PROPERTIES_FORMAT, LocalizationFormat
-from localize.localization_layouts import SUFFIX_LAYOUT, LocalizationLayout
-from localize.properties_parser import _has_unescaped_trailing_backslash
+from localize.formats.adapters import get_localization_adapter
+from localize.formats.metadata import JAVA_PROPERTIES_FORMAT, LocalizationFormat
+from localize.formats.layouts import SUFFIX_LAYOUT, LocalizationLayout
+from localize.formats.properties import _has_unescaped_trailing_backslash
 
 
 @dataclass(frozen=True)
@@ -535,7 +535,7 @@ def evaluate_retained_source_words(
     locale_allowed_words: Dict[str, set[str]] = {}
     glossary_words = _glossary_words(brand_glossary)
     for change in changes:
-        if change.locale_code in {"en", "pcm"}:
+        if _locale_language_code(change.locale_code) in {"en", "pcm"}:
             continue
         if not change.source_value:
             continue
@@ -595,12 +595,19 @@ def _allowed_source_words_for_locale(
     locale_code: str,
     retained_source_word_allowlist: Mapping[str, Iterable[str]],
 ) -> set[str]:
+    language_code = _locale_language_code(locale_code)
     return _allowlist_words(
         (
             *retained_source_word_allowlist.get("*", ()),
+            *retained_source_word_allowlist.get(language_code, ()),
             *retained_source_word_allowlist.get(locale_code, ()),
         )
     )
+
+
+def _locale_language_code(locale_code: str) -> str:
+    """Return the language component of a BCP 47 or underscore locale code."""
+    return re.split(r"[-_]", locale_code, maxsplit=1)[0].casefold()
 
 
 def _retained_source_words(

@@ -25,7 +25,11 @@ from localize.guardian.credentials import (
     CredentialSnapshot,
     SecretCommand,
 )
-from localize.guardian.github import GitHubAuthenticationError, OpenPullPathIdentity
+from localize.guardian.github import (
+    GitHubAuthenticationError,
+    OpenPullPathIdentity,
+    matches_guardian_pr_body,
+)
 from localize.guardian.json_safety import loads_bounded_json
 from localize.guardian.models import (
     HistoricalRemediationPolicy,
@@ -123,6 +127,7 @@ class RemediationDraftResult:
     merged_at: str | None = None
 
     def __post_init__(self) -> None:
+        """Reject inconsistent created, merged, and closed PR result metadata."""
         if self.pull_id is not None and (
             isinstance(self.pull_id, bool)
             or not isinstance(self.pull_id, int)
@@ -135,8 +140,8 @@ class RemediationDraftResult:
             raise ValueError("remediation draft lifecycle flags must be booleans")
         if type(self.merged) is not bool:
             raise ValueError("remediation draft lifecycle flags must be booleans")
-        if self.created and (self.state != "open" or not self.draft):
-            raise ValueError("new remediation pull requests must be open drafts")
+        if self.created and self.state != "open":
+            raise ValueError("new remediation pull requests must be open")
         if self.merged and (self.state != "closed" or self.draft):
             raise ValueError("remediation draft merged lifecycle is inconsistent")
         if self.base_sha is not None and (
@@ -283,7 +288,12 @@ class RemediationGitHubBroker:
         timeout_seconds: float = 30.0,
         token_command_timeout: float = 30.0,
         deadline: PollDeadline | None = None,
+        create_as_draft: bool = True,
     ) -> None:
+        """Bind the authorized remediation target, credentials, and creation state."""
+        if type(create_as_draft) is not bool:
+            raise TypeError("create_as_draft must be a boolean")
+        self.create_as_draft = create_as_draft
         if not isinstance(policy, RepositoryPolicy):
             raise TypeError("policy must be a RepositoryPolicy")
         closed_policy = policy.closed_pr_backfill
@@ -457,6 +467,21 @@ class RemediationGitHubBroker:
         self,
         client: httpx.Client,
     ) -> tuple[int, str]:
+        """Return immutable actor authority independently of its mutable login."""
+        actor_id, actor_type, _login = self._authenticated_actor_identity(client)
+        return actor_id, actor_type
+
+    def publication_author_email(self) -> str:
+        """Use the current authenticated login after enforcing pinned actor authority."""
+        with self._client() as (client, _actor):
+            actor_id, _actor_type, login = self._authenticated_actor_identity(client)
+            return f"{actor_id}+{login}@users.noreply.github.com"
+
+    def _authenticated_actor_identity(
+        self,
+        client: httpx.Client,
+    ) -> tuple[int, str, str]:
+        """Validate the pinned credential actor and retain its current login."""
         payload = _mapping(
             self._request(client, "GET", "/user"),
             label="authenticated actor",
@@ -479,7 +504,7 @@ class RemediationGitHubBroker:
             raise GitHubAuthenticationError(
                 "GitHub remediation actor is not allowed by policy."
             )
-        return actor_id, actor_type
+        return actor_id, actor_type, login
 
     @staticmethod
     def _publication_identity(
@@ -487,6 +512,7 @@ class RemediationGitHubBroker:
         *,
         repository_id: int,
     ) -> _RepositoryPublicationIdentity:
+        """Validate privacy and fork-network metadata used for publication authority."""
         private = repository.get("private")
         fork = repository.get("fork")
         if type(private) is not bool or type(fork) is not bool:
@@ -704,17 +730,17 @@ class RemediationGitHubBroker:
         return branch
 
     @staticmethod
-    def marker(evidence_hash: str, candidate_sha: str) -> str:
-        """Return the exact idempotency marker embedded in the draft body."""
+    def marker(evidence_hash: str, candidate_sha: str, *, legacy: bool = False) -> str:
+        """Label public drafts; retain old markers only for exact recovery."""
 
         if not _HASH_RE.fullmatch(evidence_hash) or not _SHA_RE.fullmatch(
             candidate_sha
         ):
             raise ValueError("remediation marker identity is invalid")
-        return (
-            "<!-- localize-guardian-remediation:v1 "
-            f"evidence={evidence_hash} candidate={candidate_sha} -->"
-        )
+        if legacy:
+            return ("<!-- localize-guardian-remediation:v1 "
+                    f"evidence={evidence_hash} candidate={candidate_sha} -->")
+        return "## Localize Guardian — automated translation corrections"
 
     def _validated_html_url(self, value: object, *, number: int) -> str:
         if (
@@ -790,6 +816,7 @@ class RemediationGitHubBroker:
         require_new_draft: bool,
         expected_number: int | None,
     ) -> RemediationDraftResult:
+        """Authenticate remote remediation identity without trusting appended notes."""
         pull = _mapping(raw, label="remediation pull request")
         pull_id = _positive_int(pull.get("id"), label="pull request id")
         number = _positive_int(pull.get("number"), label="pull request number")
@@ -814,7 +841,7 @@ class RemediationGitHubBroker:
                 "GitHub returned malformed remediation pull request metadata."
             )
         merged, merged_at, closed_at = _pull_lifecycle(pull, state=state)
-        if require_new_draft and (state != "open" or draft is not True):
+        if require_new_draft and (state != "open" or draft is not self.create_as_draft):
             raise RemediationRuntimeError(
                 "GitHub did not create a draft remediation pull request."
             )
@@ -836,7 +863,7 @@ class RemediationGitHubBroker:
             or _positive_int(base_repo.get("id"), label="base repository id")
             != self.policy.base_repo_id
             or pull.get("title") != expected_title
-            or pull_body != expected_body
+            or not matches_guardian_pr_body(pull_body, expected_body)
             or marker not in pull_body
             or (require_new_draft and base_sha != expected_base_sha)
             or (author_id, author.get("type")) != expected_author
@@ -948,13 +975,20 @@ class RemediationGitHubBroker:
             "GitHub remediation pull request history pagination exceeded its bound."
         )
 
-    @staticmethod
     def _validate_recovery_history(
+        self,
         pull: RemediationDraftResult,
         history: tuple[str, ...],
     ) -> None:
+        """Accept ready creation or legacy drafts, retaining reopen and redraft vetoes."""
         state = "open"
-        draft = True
+        # Ready-created PRs have no ready_for_review event. Legacy drafts may
+        # still be recovered, but a redraft or reopen remains a human veto.
+        draft = not (
+            not self.create_as_draft
+            and not pull.draft
+            and "ready_for_review" not in history
+        )
         merged = False
         valid = True
         for event in history:
@@ -1121,7 +1155,7 @@ class RemediationGitHubBroker:
             candidate_sha if marker_candidate_sha is None else marker_candidate_sha
         )
         _full_sha(marker_sha, label="marker candidate SHA")
-        marker = self.marker(evidence_hash, marker_sha)
+        marker = self.marker(evidence_hash, marker_sha, legacy="\nEvidence SHA-256: " in body)
         title = _safe_single_line(title, label="title", max_bytes=_MAX_TITLE_BYTES)
         body = _safe_body(body)
         expected_body = _safe_body(f"{marker}\n{body}")
@@ -1157,7 +1191,7 @@ class RemediationGitHubBroker:
         before_create: Callable[[], None],
         before_post: Callable[[], None],
     ) -> RemediationDraftResult:
-        """Recover an exact prior PR or create one new human-review draft."""
+        """Recover an exact prior PR or create one in the requested review state."""
 
         if not callable(before_create) or not callable(before_post):
             raise TypeError("draft publication guards must be callable")
@@ -1170,7 +1204,8 @@ class RemediationGitHubBroker:
             max_bytes=_MAX_TITLE_BYTES,
         )
         body = _safe_body(body)
-        marker = self.marker(evidence_hash, candidate_sha)
+        legacy_body = "\nEvidence SHA-256: " in body
+        marker = self.marker(evidence_hash, candidate_sha, legacy=legacy_body)
         draft_body = _safe_body(f"{marker}\n{body}")
         push_owner = self.remediation.push_repository.full_name.split("/", 1)[0]
 
@@ -1193,6 +1228,10 @@ class RemediationGitHubBroker:
                     expected_body=draft_body,
                 )
 
+            if legacy_body:
+                raise RemediationRuntimeError(
+                    "Legacy machine-only draft text cannot be republished; prepare a new human-readable proposal."
+                )
             if self._base_sha(client) != expected_base_sha:
                 raise RemediationRuntimeError(
                     "Remediation target base moved before draft creation."
@@ -1261,7 +1300,7 @@ class RemediationGitHubBroker:
                         "/", 1
                     )[1],
                     "base": self.policy.base_branch,
-                    "draft": True,
+                    "draft": self.create_as_draft,
                     "maintainer_can_modify": False,
                 },
             )
@@ -1621,6 +1660,7 @@ def _draft_text(
     evidence_hash: str,
     batch_hash: str,
 ) -> tuple[str, str]:
+    """Describe a bot-generated correction proposal using public evidence only."""
     title = "[Localize Guardian bot] Historical translation corrections"
     source_urls = tuple(
         f"https://{base.revision.host}/{policy.base_repo}/pull/{item.pr_number}"
@@ -1628,7 +1668,7 @@ def _draft_text(
     )
     body = "\n".join(
         (
-            "Bot-generated draft for human review only.",
+            "Bot-generated pull request for human review only.",
             "",
             "This current-base candidate does not modify or comment on the closed "
             "source pull requests and is never merged automatically.",
@@ -1642,8 +1682,7 @@ def _draft_text(
             f"Changed localization files: {len(patch_result.changed_files)}",
             f"Changed translation entries: {len(patch_result.changed_keys)}",
             "",
-            f"Evidence SHA-256: `{evidence_hash}`",
-            f"Batch SHA-256: `{batch_hash}`",
+            "Review the changed strings and existing checks before merging.",
             "",
         )
     )
@@ -2221,6 +2260,7 @@ class RemediationCoordinator:
         repository_identity = (policy.base_repo, policy.base_repo_id)
 
         def publication_capacity_available() -> bool:
+            """Check the bounded creation allowance without consuming a slot."""
             return bool(
                 self._publication_slots_used < self.max_drafts
                 and repository_identity not in self._publication_repositories_used
@@ -2298,6 +2338,7 @@ class RemediationCoordinator:
             event_revision_ids=revision_ids,
             feedback_urls=urls,
             replacements=proposals,
+            repository_policy=policy,
         )
         if evidence_hash != _evidence_hash(pulls, urls):
             raise RemediationRuntimeError(
@@ -2308,11 +2349,13 @@ class RemediationCoordinator:
         require_live_lease()
 
         def require_current_evidence() -> None:
+            """Reauthenticate current source evidence before publishing remediation."""
             current_hash = self.state.validate_current_historical_remediation_evidence(
                 source_pulls=pulls,
                 event_revision_ids=revision_ids,
                 feedback_urls=urls,
                 replacements=proposals,
+                repository_policy=policy,
             )
             if current_hash != evidence_hash:
                 raise RemediationRuntimeError(
@@ -2508,6 +2551,7 @@ class RemediationCoordinator:
                         consumed = [False]
 
                         def before_recovered_create() -> None:
+                            """Revalidate recovered candidate authority before creating its missing PR."""
                             require_live_lease()
                             require_no_open_translation_overlap(
                                 changed_paths,
@@ -2603,6 +2647,7 @@ class RemediationCoordinator:
             return RemediationBatchOutcome(deferred=1)
         self._require_remaining()
         commit = workspace.commit_historical_remediation_changes(
+            author_email=broker.publication_author_email(),
             expected_paths=tuple(sorted(patch_result.changed_files)),
             feedback_repository=policy.base_repo,
             feedback_pull_numbers=tuple(item.pr_number for item in pulls),
@@ -2659,6 +2704,7 @@ class RemediationCoordinator:
         consumed = [False]
 
         def consume_slot() -> None:
+            """Consume capacity once before a remote operation that may succeed."""
             self._consume_slot(
                 repository_identity=repository_identity,
                 require_live_lease=require_live_lease,
@@ -2666,6 +2712,7 @@ class RemediationCoordinator:
             )
 
         def before_push() -> None:
+            """Revalidate publication capacity and exact authority at the push boundary."""
             require_live_lease()
             require_no_open_translation_overlap(changed_paths, None)
             require_live_lease()
@@ -2686,6 +2733,7 @@ class RemediationCoordinator:
             require_exact_sources_still_closed(pulls, revision_ids)
 
         def before_create() -> None:
+            """Recheck source and publication authority immediately before PR creation."""
             require_live_lease()
             require_no_open_translation_overlap(changed_paths, None)
             require_live_lease()

@@ -735,10 +735,12 @@ def test_build_controller_wires_exact_runtime_policy_and_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Check runtime wiring for policy, checkout authority, and scoped credentials."""
     config = _config()
     captured: dict[str, object] = {}
 
     def git_environment() -> dict[str, str]:
+        """Yield the isolated Git credential environment used by the runtime fixture."""
         return {"GIT_ASKPASS": "/private/helper"}
 
     github_credential = SimpleNamespace(argv=config.runtime.github_token_command)
@@ -746,11 +748,13 @@ def test_build_controller_wires_exact_runtime_policy_and_credentials(
 
     class FakeCodexDriver:
         def __init__(self, **kwargs: object) -> None:
+            """Record injected test dependencies without accessing external services."""
             captured["codex"] = kwargs
             self.model = str(kwargs["model"])
 
     class FakeController:
         def __init__(self, **kwargs: object) -> None:
+            """Record injected test dependencies without accessing external services."""
             captured["controller"] = kwargs
 
     monkeypatch.setattr(runtime, "CodexDriver", FakeCodexDriver)
@@ -762,6 +766,7 @@ def test_build_controller_wires_exact_runtime_policy_and_credentials(
     )
 
     def resolve_model_key(helper: object) -> str:
+        """Resolve the test model key through the injected credential provider."""
         captured["model_helper"] = helper
         return "model-secret"
 
@@ -828,6 +833,25 @@ def test_build_controller_wires_exact_runtime_policy_and_credentials(
         "credential_environment": git_environment,
         "git_binary": "/opt/bin/git",
         "signing_program": "/opt/bin/gpg",
+        "timeout_seconds": 120.0,
+    }
+    # Read-only PR bases need snapshot materialization even with backfill off.
+    historical = HistoricalRevision(
+        host="github.com", owner="acme", repository="widgets", sha="b" * 40
+    )
+    monkeypatch.setattr(
+        runtime,
+        "materialize_historical_checkout",
+        lambda incoming, **kwargs: (
+            captured.update(readonly_revision=incoming, readonly_kwargs=kwargs)
+            or sentinel
+        ),
+    )
+    assert controller_kwargs["checkout_factory"](historical) is sentinel
+    assert captured["readonly_revision"] == historical
+    assert captured["readonly_kwargs"] == {
+        "credential_environment": git_environment,
+        "git_binary": "/opt/bin/git",
         "timeout_seconds": 120.0,
     }
 
@@ -982,6 +1006,7 @@ def test_explicit_closed_remediation_wires_separate_broker_and_coordinator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Wire ready remediation publication only under its explicit private policy."""
     config = _config_with_closed_backfill(remediation=True)
     policy = config.repositories[0]
     state = SimpleNamespace()
@@ -1074,6 +1099,7 @@ def test_explicit_closed_remediation_wires_separate_broker_and_coordinator(
     assert broker is captured["remediation_broker"]
     assert captured["remediation_broker"] == {
         "policy": policy,
+        "create_as_draft": False,
         "credential": github_credential,
         "github_host": "github.com",
         "base_url": "https://api.github.com",
@@ -1332,6 +1358,9 @@ def test_write_broker_exists_only_for_write_modes(
         lambda **kwargs: captured.setdefault("broker", kwargs) or object(),
     )
     config = _config(mode)
+    config = replace(config, runtime=replace(
+        config.runtime, prevention_model="gpt-6-astra", prevention_reasoning_effort="medium",
+    ))
     github_credential = SimpleNamespace(argv=config.runtime.github_token_command)
     controller = runtime._build_controller(
         config=config,
@@ -1344,6 +1373,9 @@ def test_write_broker_exists_only_for_write_modes(
 
     factory = controller["write_broker_factory"]
     assert (factory is not None) is write_enabled
+    assert (controller["prevention_runner"] is not None) is (
+        mode is GuardianMode.PROPOSE_PREVENTION
+    )
     if factory is not None:
         broker = factory(_policy())
         assert broker is captured["broker"]
@@ -1357,6 +1389,7 @@ def test_propose_mode_wires_credential_separated_prevention_coordinator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Keep authoring credentials separate from ready prevention publication."""
     captured: dict[str, object] = {}
     config = _config(GuardianMode.PROPOSE_PREVENTION)
     state = SimpleNamespace()
@@ -1417,6 +1450,7 @@ def test_propose_mode_wires_credential_separated_prevention_coordinator(
         "executable": "/opt/bin/codex",
         "timeout_seconds": 120.0,
         "max_attempts": 2,
+        "max_new_real_data_findings": 5,
     }
     assert captured["test_runner"] == {"timeout_seconds": 120.0}
     coordinator_kwargs = captured["coordinator"]
@@ -1424,6 +1458,8 @@ def test_propose_mode_wires_credential_separated_prevention_coordinator(
     assert coordinator_kwargs["publish_credential_environment"] is git_environment
     assert coordinator_kwargs["signing_key"] == "A" * 40
     assert coordinator_kwargs["max_drafts"] == 1
+    assert coordinator_kwargs["max_drafts_per_day"] == 1
+    assert coordinator_kwargs["max_new_real_data_findings"] == 5
     assert coordinator_kwargs["max_model_calls_per_day"] == 2
     assert coordinator_kwargs["api_billed"] is True
     assert coordinator_kwargs["temporary_root"] == tmp_path
@@ -1434,6 +1470,7 @@ def test_propose_mode_wires_credential_separated_prevention_coordinator(
     assert broker is captured["prevention_broker"]
     assert captured["prevention_broker"] == {
         "policy": prevention,
+        "create_as_draft": False,
         "credential": github_credential,
         "github_host": "github.com",
         "base_url": "https://api.github.com",
@@ -1492,6 +1529,40 @@ def test_run_once_creates_private_state_and_uses_bounded_controller(
         _mode(artifact) == 0o600 and artifact.stat().st_nlink == 1
         for artifact in state_directory.glob("state.sqlite3*")
     )
+
+
+def test_failed_poll_retains_diagnostic_and_announces_without_raw_error(
+    tmp_path, monkeypatch, capsys,
+):
+    from localize.guardian.controller import _safe_failure_name
+    from localize.guardian.diagnostics import git_failure
+    from localize.guardian.workspace import WorkspaceError
+
+    config_path = tmp_path / "guardian.yaml"
+    _write_minimal_config(config_path)
+
+    class FailedController:
+        def poll_once(self):
+            error = git_failure(WorkspaceError("secret /Users/private"),
+                                operation="push", returncode=128,
+                                output="Permission denied: secret /Users/private")
+            name = _safe_failure_name(error, repository="acme/widgets", run_id="run-1")
+            return PollOutcome(lease_acquired=True, remediation_failures=(name,))
+
+    @contextmanager
+    def credentials(*_args, **_kwargs):
+        yield lambda: {}
+
+    monkeypatch.setattr(runtime, "git_credential_environment", credentials)
+    monkeypatch.setattr(runtime, "_build_controller", lambda **_kwargs: FailedController())
+    assert runtime.run_once(config_path=config_path) == 1
+    output = capsys.readouterr().err
+    assert "Guardian poll failed; private diagnostic #" in output
+    assert "secret" not in output
+    assert "/Users/" not in output
+    with GuardianState(tmp_path / ".guardian/state.sqlite3") as state:
+        assert state.latest_health("guardian-failure").details["operation"] == "push"
+        assert state.status_snapshot(mode=GuardianMode.OBSERVE).last_successful_poll is None
 
 
 def test_run_once_shares_one_rotating_github_credential_with_rest_and_git(
@@ -2144,6 +2215,25 @@ def test_scheduled_due_uses_local_day_instead_of_utc_day() -> None:
             schedule=GuardianSchedule(),
         )
         is False
+    )
+
+
+def test_responsive_interval_uses_elapsed_time_across_dst_fallback() -> None:
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Europe/Vienna")
+    checkpoint = SimpleNamespace(
+        checked_at=datetime(2026, 10, 25, 0, 55, tzinfo=UTC),
+        details={"local_date": "2026-10-25", "attempt_count": 1},
+    )
+    state = SimpleNamespace(latest_health=lambda component: checkpoint)
+    assert not runtime._scheduled_poll_is_due(
+        state, now=datetime(2026, 10, 25, 1, 5, tzinfo=UTC).astimezone(zone),
+        schedule=GuardianSchedule(poll_interval_seconds=900),
+    )
+    assert runtime._scheduled_poll_is_due(
+        state, now=datetime(2026, 10, 25, 1, 10, tzinfo=UTC).astimezone(zone),
+        schedule=GuardianSchedule(poll_interval_seconds=900),
     )
 
 

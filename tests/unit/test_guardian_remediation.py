@@ -214,7 +214,9 @@ def _broker(
     policy: RepositoryPolicy | None = None,
     actor: object | None = None,
     deadline: PollDeadline | None = None,
+    create_as_draft: bool = True,
 ) -> RemediationGitHubBroker:
+    """Construct a mock GitHub broker with explicit actor and publication state."""
     authenticated_actor = (
         {"login": "translator", "id": 7, "type": "User"} if actor is None else actor
     )
@@ -231,8 +233,20 @@ def _broker(
         base_url="https://api.github.test",
         transport=httpx.MockTransport(authenticated_handler),
         deadline=deadline,
+        create_as_draft=create_as_draft,
     )
     return broker
+
+
+def test_remediation_commit_email_uses_authenticated_renamed_actor() -> None:
+    """Keep immutable actor authority while using the current GitHub login."""
+    broker = _broker(
+        lambda request: pytest.fail(f"Unexpected request: {request.url.path}"),
+        actor={"login": "renamed-translator", "id": 7, "type": "User"},
+    )
+    assert broker.publication_author_email() == (
+        "7+renamed-translator@users.noreply.github.com"
+    )
 
 
 def test_remediation_broker_deadline_stops_trickling_response() -> None:
@@ -293,8 +307,7 @@ def test_remediation_pagination_reclamps_each_page_to_remaining_deadline() -> No
         ({"created": "yes"}, "flags"),
         ({"draft": 1}, "flags"),
         ({"merged": 1}, "flags"),
-        ({"created": True, "draft": False}, "open drafts"),
-        ({"created": True, "state": "closed"}, "open drafts"),
+        ({"created": True, "state": "closed"}, "must be open"),
         ({"state": "open", "merged": True, "draft": False}, "merged"),
         ({"state": "closed", "merged": True}, "merged"),
         ({"base_sha": "short"}, "base SHA"),
@@ -610,15 +623,14 @@ def test_policy_rejects_remediation_namespace_without_exact_allowlist() -> None:
         )
 
 
-def test_remediation_marker_contains_only_stable_evidence_and_candidate_ids() -> None:
+def test_remediation_marker_is_a_readable_heading() -> None:
     evidence_hash = "c" * 64
 
     marker = RemediationGitHubBroker.marker(evidence_hash, CANDIDATE_SHA)
 
-    assert marker == (
-        "<!-- localize-guardian-remediation:v1 "
-        f"evidence={evidence_hash} candidate={CANDIDATE_SHA} -->"
-    )
+    assert marker == "## Localize Guardian — automated translation corrections"
+    assert evidence_hash not in marker
+    assert CANDIDATE_SHA not in marker
 
 
 @pytest.mark.parametrize(
@@ -740,6 +752,16 @@ def test_pull_lookup_rejects_duplicates_on_the_first_page() -> None:
     ("state", "draft", "merged_at", "events", "expected_merged"),
     [
         pytest.param("open", True, None, [], False, id="open-draft"),
+        pytest.param("open", False, None, [], False, id="created-ready"),
+        pytest.param(
+            "closed", False, None, [_issue_event(1, "closed")], False,
+            id="created-ready-closed",
+        ),
+        pytest.param(
+            "closed", False, "2026-09-03T08:00:00Z",
+            [_issue_event(1, "merged"), _issue_event(2, "closed")], True,
+            id="created-ready-merged",
+        ),
         pytest.param(
             "open",
             False,
@@ -781,13 +803,18 @@ def test_pull_lookup_rejects_duplicates_on_the_first_page() -> None:
         ),
     ],
 )
+@pytest.mark.parametrize("create_as_draft", [True, False])
+@pytest.mark.parametrize("annotated", [False, True])
 def test_find_draft_preserves_exact_remote_lifecycle(
     state: str,
     draft: bool,
     merged_at: str | None,
     events: list[object],
     expected_merged: bool,
+    create_as_draft: bool,
+    annotated: bool,
 ) -> None:
+    """Recover exact remediation lifecycle states with or without review notes."""
     policy = replace(
         _policy(),
         allowed_pr_authors=(TrustedActor("existing-pr-bot", 77, "Bot"),),
@@ -805,6 +832,12 @@ def test_find_draft_preserves_exact_remote_lifecycle(
         draft=draft,
         merged_at=merged_at,
     )
+    if annotated:
+        pull["body"] += (
+            "\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->"
+            "\n\n## Summary by CodeRabbit\n\n- Updated a translated label.\n\n"
+            "<!-- end of auto-generated comment: release notes by coderabbit.ai -->"
+        )
     exact_reads = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -822,7 +855,10 @@ def test_find_draft_preserves_exact_remote_lifecycle(
             return _response(request, events)
         raise AssertionError(request.url)
 
-    result = _broker(handler, policy=policy).find_draft(
+    broker = _broker(
+        handler, policy=policy, create_as_draft=create_as_draft
+    )
+    arguments = dict(
         branch=branch,
         expected_base_sha=BASE_SHA,
         candidate_sha=CANDIDATE_SHA,
@@ -830,6 +866,13 @@ def test_find_draft_preserves_exact_remote_lifecycle(
         title="title",
         body="body",
     )
+    if create_as_draft and not draft and not any(
+        event["event"] == "ready_for_review" for event in events
+    ):
+        with pytest.raises(RemediationRemoteConflictError, match="lifecycle"):
+            broker.find_draft(**arguments)
+        return
+    result = broker.find_draft(**arguments)
 
     assert result is not None
     assert result.created is False
@@ -1721,7 +1764,11 @@ def test_rejects_oversized_draft_title_and_body_before_network(
         )
 
 
-def test_opens_exact_human_review_draft_after_two_final_rechecks() -> None:
+@pytest.mark.parametrize("create_as_draft", [True, False])
+def test_opens_exact_human_review_draft_after_two_final_rechecks(
+    create_as_draft: bool,
+) -> None:
+    """Publish ready PRs without relaxing any final authority checks."""
     policy = replace(
         _policy(),
         allowed_pr_authors=(TrustedActor("existing-pr-bot", 77, "Bot"),),
@@ -1754,11 +1801,14 @@ def test_opens_exact_human_review_draft_after_two_final_rechecks() -> None:
                     branch=branch,
                     title=payload["title"],
                     body=payload["body"],
+                    draft=create_as_draft,
                 ),
             )
         raise AssertionError(request.url)
 
-    result = _broker(handler, policy=policy).open_draft(
+    result = _broker(
+        handler, policy=policy, create_as_draft=create_as_draft
+    ).open_draft(
         branch=branch,
         expected_base_sha=BASE_SHA,
         candidate_sha=CANDIDATE_SHA,
@@ -1776,6 +1826,7 @@ def test_opens_exact_human_review_draft_after_two_final_rechecks() -> None:
         created=True,
         pull_id=9_091,
         base_sha=BASE_SHA,
+        draft=create_as_draft,
     )
     assert lease_checks == ["checked", "final"]
     assert post_payloads == [
@@ -1785,7 +1836,7 @@ def test_opens_exact_human_review_draft_after_two_final_rechecks() -> None:
             "head": f"translator:{branch}",
             "head_repo": "translations",
             "base": "main",
-            "draft": True,
+            "draft": create_as_draft,
             "maintainer_can_modify": False,
         }
     ]
@@ -2596,11 +2647,17 @@ class _BrokerSpy:
         branches: dict[str, str | None] | None = None,
         existing: dict[str, RemediationDraftResult] | None = None,
     ) -> None:
+        """Initialize a publication spy with independent actor and remote state."""
         self.base = base
         self.order = order
         self.branches = branches if branches is not None else {}
         self.existing = existing if existing is not None else {}
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.actor_login = "translator"
+
+    def publication_author_email(self) -> str:
+        """Return the test broker's current authenticated noreply identity."""
+        return f"7+{self.actor_login}@users.noreply.github.com"
 
     def capture_base(self) -> Any:
         self.calls.append(("capture_base", {}))
@@ -3219,11 +3276,16 @@ def _publish(
     )
 
 
-def test_coordinator_batches_origins_into_one_signed_human_review_draft() -> None:
+@pytest.mark.parametrize("actor_login", ["translator", "renamed-translator"])
+def test_coordinator_batches_origins_into_one_signed_human_review_draft(
+    actor_login: str,
+) -> None:
+    """Batch historical evidence into one signed, deduplicated review candidate."""
     order: list[str] = []
     base = _base_snapshot()
     state = _StateSpy(order=order)
     broker = _BrokerSpy(base, order=order)
+    broker.actor_login = actor_login
     workspace = _WorkspaceSpy(base, order=order)
     coordinator = _coordinator(state, broker)
 
@@ -3235,6 +3297,7 @@ def test_coordinator_batches_origins_into_one_signed_human_review_draft() -> Non
     assert outcome.deferred == 0
     assert len(workspace.commit_calls) == 1
     commit_call = workspace.commit_calls[0]
+    assert commit_call["author_email"] == f"7+{actor_login}@users.noreply.github.com"
     assert commit_call["feedback_pull_numbers"] == (12, 13)
     assert commit_call["feedback_urls"] == tuple(sorted(FEEDBACK_URLS))
     assert commit_call["signing_key"] == "ABCDEF"
@@ -3268,6 +3331,44 @@ def test_coordinator_batches_origins_into_one_signed_human_review_draft() -> Non
         "verify_publish_authority",
         "open_draft",
     }
+
+
+def test_publish_revalidates_evidence_with_exact_repository_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep target-locale authority available at each publication boundary."""
+    order: list[str] = []
+    base = _base_snapshot()
+    policy = _policy()
+    state = _StateSpy(order=order)
+    broker = _BrokerSpy(base, order=order)
+    workspace = _WorkspaceSpy(base, order=order)
+    validation_positions: list[int] = []
+
+    def validate_current_evidence(**kwargs: object) -> str:
+        assert kwargs.get("repository_policy") is policy
+        assert kwargs["replacements"] == _replacements()
+        validation_positions.append(len(order))
+        return _StateSpy.validate_current_historical_remediation_evidence(
+            state, **kwargs,
+        )
+
+    monkeypatch.setattr(f"{__name__}._policy", lambda: policy)
+    monkeypatch.setattr(
+        state,
+        "validate_current_historical_remediation_evidence",
+        validate_current_evidence,
+    )
+
+    outcome = _publish(_coordinator(state, broker), workspace, base)
+
+    assert len(outcome.drafts) == 1
+    commit = order.index("workspace:commit")
+    push = order.index("remote:branch-push")
+    post = order.index("remote:draft-post")
+    assert validation_positions[0] < commit
+    assert any(commit < position < push for position in validation_positions)
+    assert any(push < position < post for position in validation_positions)
 
 
 def test_new_overlap_at_branch_push_boundary_blocks_all_remote_writes() -> None:

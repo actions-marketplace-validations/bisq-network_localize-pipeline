@@ -346,6 +346,16 @@ class GuardianLimits:
     min_apply_confidence: float = 0.9
     raw_retention_days: int = 90
     max_remediation_drafts_per_run: int = 0
+    max_prevention_drafts_per_day: int = 1
+    max_new_real_data_findings: int = 5
+
+    @property
+    def prevention_drafts_per_poll(self) -> int:
+        """Prevention publications one poll may attempt under both caps."""
+        return min(
+            self.max_prevention_drafts_per_run,
+            self.max_prevention_drafts_per_day,
+        )
 
     def __post_init__(self) -> None:
         integer_bounds = (
@@ -361,6 +371,18 @@ class GuardianLimits:
             (
                 "max_remediation_drafts_per_run",
                 self.max_remediation_drafts_per_run,
+                0,
+                None,
+            ),
+            (
+                "max_prevention_drafts_per_day",
+                self.max_prevention_drafts_per_day,
+                0,
+                None,
+            ),
+            (
+                "max_new_real_data_findings",
+                self.max_new_real_data_findings,
                 0,
                 None,
             ),
@@ -427,10 +449,12 @@ class GuardianLimits:
 
 @dataclass(frozen=True)
 class GuardianSchedule:
-    """Once-daily local wall-clock schedule used by scheduled invocations."""
+    """Daily schedule with optional bounded same-day feedback polling."""
 
     hour: int = 0
     minute: int = 0
+    poll_interval_seconds: int | None = None
+    max_polls_per_day: int = 96
 
     def __post_init__(self) -> None:
         if isinstance(self.hour, bool) or not isinstance(self.hour, int):
@@ -441,6 +465,18 @@ class GuardianSchedule:
             raise ValueError("Schedule hour must be between 0 and 23.")
         if not 0 <= self.minute <= 59:
             raise ValueError("Schedule minute must be between 0 and 59.")
+        if self.poll_interval_seconds is not None and (
+            isinstance(self.poll_interval_seconds, bool)
+            or not isinstance(self.poll_interval_seconds, int)
+            or not 900 <= self.poll_interval_seconds <= 86400
+        ):
+            raise ValueError("Schedule poll interval must be between 900 and 86400 seconds.")
+        if (
+            isinstance(self.max_polls_per_day, bool)
+            or not isinstance(self.max_polls_per_day, int)
+            or not 1 <= self.max_polls_per_day <= 96
+        ):
+            raise ValueError("Schedule poll count must be between 1 and 96.")
 
 
 @dataclass(frozen=True)
@@ -459,6 +495,22 @@ class GuardianRuntime:
     signing_key: str | None = None
     signing_format: SigningFormat = SigningFormat.OPENPGP
     signing_public_key: str | None = None
+    prevention_model: str | None = None
+    prevention_reasoning_effort: str | None = None
+
+    @property
+    def effective_prevention_model(self) -> str:
+        """Inherit the assessment model unless the operator selects another."""
+        return self.codex_model if self.prevention_model is None else self.prevention_model
+
+    @property
+    def effective_prevention_reasoning_effort(self) -> str:
+        """Resolve the prevention effort independently of its model override."""
+        return (
+            self.codex_reasoning_effort
+            if self.prevention_reasoning_effort is None
+            else self.prevention_reasoning_effort
+        )
 
     def __post_init__(self) -> None:
         try:
@@ -490,6 +542,22 @@ class GuardianRuntime:
             raise ValueError(
                 "codex_reasoning_effort must be low, medium, high, xhigh, max, or "
                 "ultra."
+            )
+        if self.prevention_model is not None and (
+            not _is_bounded_single_line(self.prevention_model)
+            or not self.prevention_model.strip()
+        ):
+            raise ValueError(
+                "prevention_model must be a non-empty single-line value of at most "
+                "4096 UTF-8 bytes."
+            )
+        if self.prevention_reasoning_effort is not None and (
+            not isinstance(self.prevention_reasoning_effort, str)
+            or self.prevention_reasoning_effort not in _CODEX_REASONING_EFFORTS
+        ):
+            raise ValueError(
+                "prevention_reasoning_effort must be low, medium, high, xhigh, max, "
+                "or ultra."
             )
         _validate_codex_home(self.codex_home)
 
@@ -892,8 +960,15 @@ class RepositoryPolicy:
     closed_pr_backfill: ClosedPrBackfillPolicy | None = None
     publication_actor: TrustedActor | None = None
 
+    quality_report_actor: TrustedActor | None = None
+
     def __post_init__(self) -> None:
         _validate_repository_name(self.base_repo, field_name="base_repo")
+        if self.quality_report_actor is not None and (
+            not isinstance(self.quality_report_actor, TrustedActor)
+            or self.quality_report_actor.type not in {"User", "Bot"}
+        ):
+            raise ValueError("quality_report_actor must be a User or Bot identity.")
         if (
             isinstance(self.base_repo_id, bool)
             or not isinstance(self.base_repo_id, int)
@@ -1241,7 +1316,7 @@ class GuardianConfig:
             )
         if (
             self.mode is GuardianMode.PROPOSE_PREVENTION
-            and self.limits.max_prevention_drafts_per_run > 0
+            and self.limits.prevention_drafts_per_poll > 0
         ):
             actors.extend(
                 policy.prevention.publication_actor
@@ -1368,8 +1443,23 @@ class GuardianAssessment:
     rationale: str
     replacements: tuple[ProposedReplacement, ...] = ()
     recurrence_candidates: tuple[RecurrenceCandidate, ...] = ()
+    report_reason: str = "unspecified"
+    decision_required: bool = False
+    held_value_edits: int = 0
 
     def __post_init__(self) -> None:
+        from localize.guardian.reporting import validated_decision_required
+
+        object.__setattr__(self, "decision_required", validated_decision_required(
+            self.verdict, self.report_reason, self.decision_required
+        ))
+        if (
+            type(self.held_value_edits) is not int
+            or not 0 <= self.held_value_edits <= 100000
+        ):
+            raise ValueError(
+                "held_value_edits must be an integer between 0 and 100000."
+            )
         if self.verdict not in {"apply", "reject", "needs_human"}:
             raise ValueError("verdict must be apply, reject, or needs_human.")
         if not 0.0 <= self.confidence <= 1.0:

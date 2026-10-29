@@ -26,7 +26,17 @@ from localize.guardian.workspace import (
 )
 
 
+@pytest.fixture
+def askpass_helper(tmp_path: Path) -> str:
+    """Provide a regular executable without relying on system utility symlinks."""
+    helper = tmp_path / "askpass"
+    helper.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    helper.chmod(0o700)
+    return str(helper)
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> str:
+    """Run Git in a test repository, returning stdout and optionally asserting success."""
     completed = subprocess.run(
         ["git", "-C", str(repo), *args],
         check=False,
@@ -215,6 +225,31 @@ def test_materializes_base_and_head_as_detached_exact_sha_checkouts(tmp_path):
         assert _git(head.path, "rev-parse", "HEAD") == head_sha
 
 
+@pytest.mark.parametrize("historical", [False, True])
+def test_checkout_preserves_blobs_despite_later_line_ending_attributes(tmp_path, historical):
+    """Adding text attributes without renormalizing must not dirty a checkout."""
+    remote, _, _ = _create_remote(tmp_path)
+    source = tmp_path / "source"
+    original = b"@echo off\r\necho wrapper\r\n"
+    (source / "gradlew.bat").write_bytes(original)
+    _git(source, "-c", "core.autocrlf=false", "add", "gradlew.bat")
+    _git(source, "commit", "-m", "Add CRLF wrapper")
+    (source / ".gitattributes").write_text("gradlew.bat text eol=crlf\n", encoding="utf-8")
+    _git(source, "add", ".gitattributes")
+    _git(source, "commit", "-m", "Set attributes without renormalizing old blobs")
+    sha = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", str(remote), "HEAD:refs/heads/translation-review")
+    materialize = materialize_historical_checkout if historical else materialize_exact_checkout
+    revision = (
+        _historical_revision(sha=sha)
+        if historical else _revision(ref="refs/heads/translation-review", sha=sha)
+    )
+    with materialize(revision, remote_url=remote.as_uri(), allow_file_remote=True) as workspace:
+        assert (workspace.path / "gradlew.bat").read_bytes() == original
+        assert _git(workspace.path, "status", "--porcelain") == ""
+        assert _git(workspace.path, "rev-parse", "HEAD") == sha
+
+
 def test_materialization_fails_closed_when_ref_does_not_resolve_to_expected_sha(
     tmp_path,
 ):
@@ -272,6 +307,7 @@ def test_checkout_stops_before_starting_git_after_the_poll_deadline(tmp_path):
 
 
 def test_checkout_promotes_a_deadline_bound_git_timeout(tmp_path):
+    """Convert a Git timeout bounded by the poll deadline into PollDeadlineExceeded."""
     calls: list[float] = []
 
     def timed_out_git(args, **kwargs):
@@ -291,7 +327,8 @@ def test_checkout_promotes_a_deadline_bound_git_timeout(tmp_path):
     assert calls == [3]
 
 
-def test_credentials_are_fetch_only_and_never_placed_in_argv(tmp_path):
+def test_credentials_are_fetch_only_and_never_placed_in_argv(tmp_path, askpass_helper):
+    """Expose credentials only to fetch's environment and never to command arguments."""
     remote, _base_sha, head_sha = _create_remote(tmp_path)
     secret = "guardian-secret-value"
     calls: list[tuple[tuple[str, ...], Mapping[str, str]]] = []
@@ -306,7 +343,7 @@ def test_credentials_are_fetch_only_and_never_placed_in_argv(tmp_path):
         remote_url=remote.as_uri(),
         allow_file_remote=True,
         credential_environment=lambda: {
-            "GIT_ASKPASS": "/usr/bin/false",
+            "GIT_ASKPASS": askpass_helper,
             "LOCALIZE_GUARDIAN_GIT_TOKEN": secret,
         },
         _process_runner=recording_run,
@@ -428,6 +465,7 @@ def test_commits_only_exact_translation_paths_and_links_feedback(tmp_path):
 
 
 def test_fork_commit_links_feedback_in_the_base_repository(tmp_path):
+    """Attribute a fork's feedback commit to the upstream repository's review thread."""
     remote, _base_sha, head_sha = _create_remote(tmp_path)
     with materialize_exact_checkout(
         _revision(ref="refs/heads/translation-review", sha=head_sha),
@@ -454,7 +492,10 @@ def test_fork_commit_links_feedback_in_the_base_repository(tmp_path):
         )
 
 
-def test_publishes_exact_descendant_with_expected_old_ref_and_confirms_ref(tmp_path):
+def test_publishes_exact_descendant_with_expected_old_ref_and_confirms_ref(
+    tmp_path, askpass_helper,
+):
+    """Publish with an exact remote-ref lease, isolated credentials, and ref confirmation."""
     remote, _base_sha, head_sha = _create_remote(tmp_path)
     calls = []
     publication_sequence: list[str] = []
@@ -490,7 +531,7 @@ def test_publishes_exact_descendant_with_expected_old_ref_and_confirms_ref(tmp_p
         published = workspace.publish_commit(
             commit,
             credential_environment=lambda: {
-                "GIT_ASKPASS": "/usr/bin/false",
+                "GIT_ASKPASS": askpass_helper,
                 "LOCALIZE_GUARDIAN_GIT_TOKEN": "publish-secret",
             },
             require_signature=False,
@@ -1090,8 +1131,9 @@ def test_unsigned_openpgp_commit_still_rejects_malformed_supplied_key(tmp_path):
 
 
 def test_signs_validated_prevention_modifications_and_new_tests_then_creates_branch(
-    tmp_path,
+    tmp_path, askpass_helper,
 ):
+    """Require signature verification and a live lease before creating a prevention branch."""
     remote, _base_sha, head_sha = _create_remote(tmp_path)
     original_run = subprocess.run
     calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
@@ -1134,7 +1176,7 @@ def test_signs_validated_prevention_modifications_and_new_tests_then_creates_bra
                 branch="guardian/prevention-abc",
                 branch_prefix="guardian/prevention-",
                 credential_environment=lambda: {
-                    "GIT_ASKPASS": "/usr/bin/false",
+                    "GIT_ASKPASS": askpass_helper,
                 },
                 before_push=lost_lease,
                 remote_url=remote.as_uri(),
@@ -1157,7 +1199,7 @@ def test_signs_validated_prevention_modifications_and_new_tests_then_creates_bra
             branch="guardian/prevention-abc",
             branch_prefix="guardian/prevention-",
             credential_environment=lambda: {
-                "GIT_ASKPASS": "/usr/bin/false",
+                "GIT_ASKPASS": askpass_helper,
                 "LOCALIZE_GUARDIAN_GIT_TOKEN": "prevention-secret",
             },
             before_push=lambda: lease_checks.append("checked"),
@@ -1627,3 +1669,68 @@ def test_commit_refuses_when_checkout_head_no_longer_matches_intake_sha(tmp_path
                 ),
                 sign=False,
             )
+
+
+@pytest.mark.parametrize("include_comment", [False, True])
+@pytest.mark.parametrize("historical_anchor", [False, True])
+def test_commit_accepts_separate_exact_private_quality_evidence(tmp_path, include_comment, historical_anchor):
+    """Private findings can authorize a real commit, alone or beside reviewer feedback."""
+    remote, base_sha, head_sha = _create_remote(tmp_path)
+    evidence_sha = base_sha if historical_anchor else head_sha
+    quality_url = f"https://github.example.com/acme/project/commit/{evidence_sha}"
+    comment_url = "https://github.example.com/acme/project/pull/7#discussion_r123"
+    with materialize_exact_checkout(
+        _revision(ref="refs/heads/translation-review", sha=head_sha),
+        remote_url=remote.as_uri(), allow_file_remote=True,
+    ) as workspace:
+        (workspace.path / "i18n/messages_ru.properties").write_text("hello=Здравствуйте\n")
+        result = workspace.commit_validated_changes(
+            expected_paths=("i18n/messages_ru.properties",), pull_number=7,
+            feedback_urls=(comment_url,) if include_comment else (),
+            quality_finding_urls=(quality_url,), quality_finding_head_sha=evidence_sha,
+            sign=False,
+        )
+        message = _git(workspace.path, "show", "-s", "--format=%B", result.commit_sha)
+        assert "Validated quality findings:" in message
+        assert quality_url in message
+        assert (comment_url in message) is include_comment
+        assert result.parent_sha == head_sha
+
+
+@pytest.mark.parametrize("suffix", [
+    "wrong-host", "wrong-repo", "wrong-sha", "short-sha", "query", "fragment",
+    "credentials", "port", "trailing-slash", "newline", "no-anchor",
+])
+def test_private_quality_commit_evidence_rejects_unbound_links(tmp_path, suffix):
+    """A separate evidence channel must still bind canonical URLs to the trusted anchor."""
+    from localize.guardian.workspace import _validate_quality_finding_urls
+
+    head_sha = "a" * 40
+    url = f"https://github.example.com/acme/project/commit/{head_sha}"
+    urls = {
+        "wrong-host": url.replace("github.example.com", "evil.example"),
+        "wrong-repo": url.replace("acme/project", "acme/other"),
+        "wrong-sha": url.replace(head_sha, "b" * 40),
+        "short-sha": url.replace(head_sha, "a" * 7),
+        "query": url + "?x=1", "fragment": url + "#diff-1",
+        "credentials": url.replace("https://", "https://token@"),
+        "port": url.replace("github.example.com", "github.example.com:443"),
+        "trailing-slash": url + "/", "newline": url + "\n", "no-anchor": url,
+    }
+    with pytest.raises(ValueError, match="quality"):
+        _validate_quality_finding_urls(
+            _revision(ref="refs/heads/translation-review", sha=head_sha),
+            7, (urls[suffix],), feedback_repository="acme/project",
+            quality_finding_head_sha=None if suffix == "no-anchor" else head_sha,
+        )
+
+
+def test_commit_link_cannot_enter_reviewer_feedback_channel():
+    """A public comment cannot gain private evidence authority by supplying a commit URL."""
+    from localize.guardian.workspace import _validate_feedback_urls
+
+    with pytest.raises(ValueError, match="exact pull request"):
+        _validate_feedback_urls(
+            _revision(ref="refs/heads/translation-review", sha="a" * 40), 7,
+            ("https://github.example.com/acme/project/commit/" + "a" * 40,),
+        )

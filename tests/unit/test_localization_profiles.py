@@ -2,12 +2,13 @@
 
 import pytest
 
-from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-from localize.localization_layouts import LocalizationLayout, SUFFIX_LAYOUT
-from localize.localization_profiles import LocalizationProfile, load_localization_profiles
+from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+from localize.formats.layouts import LocalizationLayout, SUFFIX_LAYOUT
+from localize.formats.profiles import LocalizationProfile, load_localization_profiles
 
 
 def test_load_localization_profiles_defaults_to_legacy_single_format():
+    """Use Java Properties with suffix-based locale names when no profile is configured."""
     profiles = load_localization_profiles({})
 
     assert profiles == (

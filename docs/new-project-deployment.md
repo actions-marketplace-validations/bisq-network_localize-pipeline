@@ -216,3 +216,38 @@ More detail: [docs/maintenance/disk-space-management.md](maintenance/disk-space-
 - Run a manual `docker compose ... run -T --rm translator` after rebuilds.
 - Keep deploy keys and tokens scoped to the target repository.
 - Rotate keys periodically.
+
+### Reviewed source-identical translations
+
+Some locales intentionally share exact English labels. For reviewed cases, use
+`accepted_source_identical_translations` with an exact locale, key and source
+value, for example:
+
+```yaml
+accepted_source_identical_translations:
+  pcm:
+    mobile.community.contacts.reason.privateChat: "Private chat"
+```
+
+The target must also equal that exact value. This keeps the corrected label out
+of source-regression retries and marks conflicting older memory entries unsafe
+for reuse. It does not ignore the key or allow other English values: later source
+changes, unexpected source echoes and failed attempts still process normally.
+The same exact policy applies to the deterministic source-identical quality gate.
+Wildcards and malformed entries are rejected. Removing a policy entry removes
+its exemption; conflicted memory remains unavailable until explicitly reviewed.
+
+### Source changes with unchanged targets
+
+For `translation_source: git`, the pipeline passes its existing persisted source
+baseline (`TRANSLATION_DIFF_BASE`) to the deterministic quality gate. Existing
+`semantic_quality_rules` also check current targets for the exact source keys
+whose parsed values changed, even when translation produces no file changes.
+A blocking no-change audit retains the old baseline and withholds the success
+heartbeat. A successful no-change run retains the existing baseline advancement
+behavior. No model call or PR is created merely to perform this audit.
+
+This does not add new semantic policy: configure rules for the invariants your
+project needs. Empty rule configurations skip source enumeration. The standalone
+`localize quality-gate --source-diff-base` interface and format/layout behavior are
+described in [the Action guide](github-action.md).

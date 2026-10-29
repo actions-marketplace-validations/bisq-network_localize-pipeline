@@ -55,7 +55,6 @@ _MAX_TITLE_CHARS = 120
 _MAX_TITLE_BYTES = 256
 _MAX_BODY_BYTES = 60 * 1024
 _MAX_BODY_LIST_BYTES = 16 * 1024
-_MAX_RENDERED_ARGV_BYTES = 4096
 # Full-tree inspection stays finite before tighter changed-file limits apply.
 _MAX_INVENTORY_ENTRIES = 100_000
 _MAX_INVENTORY_BYTES = 2 * 1024 * 1024 * 1024
@@ -895,15 +894,6 @@ def _truncate_utf8(
     return candidate[:low].rstrip() + suffix
 
 
-def _sequence_fingerprint(values: Sequence[str]) -> str:
-    digest = hashlib.sha256()
-    for value in values:
-        encoded = value.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-    return digest.hexdigest()
-
-
 def _bounded_code_list(values: Sequence[str], *, max_bytes: int) -> str:
     """Render complete list items and summarize any omitted tail deterministically."""
 
@@ -912,15 +902,11 @@ def _bounded_code_list(values: Sequence[str], *, max_bytes: int) -> str:
     if len(complete.encode("utf-8")) <= max_bytes:
         return complete
 
-    fingerprint = _sequence_fingerprint(values)
     selected: list[str] = []
     selected_bytes = 0
     for index, line in enumerate(rendered):
         omitted = len(rendered) - index - 1
-        omission = (
-            f"- {omitted} additional item(s) omitted; full-list fingerprint: "
-            f"{_code(fingerprint)}"
-        )
+        omission = f"- {omitted} additional item(s) omitted from this summary."
         separator_bytes = 1 if selected else 0
         projected = (
             selected_bytes
@@ -935,10 +921,7 @@ def _bounded_code_list(values: Sequence[str], *, max_bytes: int) -> str:
         selected_bytes += separator_bytes + len(line.encode("utf-8"))
 
     omitted = len(rendered) - len(selected)
-    omission = (
-        f"- {omitted} additional item(s) omitted; full-list fingerprint: "
-        f"{_code(fingerprint)}"
-    )
+    omission = f"- {omitted} additional item(s) omitted from this summary."
     result = "\n".join((*selected, omission))
     if len(result.encode("utf-8")) > max_bytes:  # pragma: no cover - fixed text
         raise PreventionPolicyError("generated list summary exceeds its byte bound")
@@ -946,19 +929,14 @@ def _bounded_code_list(values: Sequence[str], *, max_bytes: int) -> str:
 
 
 def _argv_display(argv: tuple[str, ...]) -> str:
-    rendered = json.dumps(list(argv), ensure_ascii=True)
-    if len(rendered.encode("utf-8")) <= _MAX_RENDERED_ARGV_BYTES:
-        return rendered
-    executable = _truncate_utf8(
-        argv[0],
-        max_bytes=512,
-        max_chars=512,
-    )
-    return (
-        f"{json.dumps([executable], ensure_ascii=True)}; "
-        f"{len(argv) - 1} additional argument(s) omitted; argv fingerprint: "
-        f"{_sequence_fingerprint(argv)}"
-    )
+    """Expose only a generic runner label, never private executable paths or args."""
+    executable = _executable_name(argv[0])
+    label = "Configured test runner"
+    if executable in {"pytest", "pytest.exe"}:
+        label = "pytest"
+    elif executable.startswith("python") and argv[1:3] == ("-m", "pytest"):
+        label = "python -m pytest"
+    return f"{label}: failed before the fix; passed after the fix."
 
 
 def _draft_text(
@@ -972,6 +950,7 @@ def _draft_text(
     paths: Sequence[str],
     focused_argv: Sequence[tuple[str, ...]],
 ) -> tuple[str, str]:
+    """Render bounded public evidence without disclosing private test commands."""
     title_prefix = "Prevent recurrence: "
     summary = _truncate_utf8(
         root_cause.replace("@", "＠"),
@@ -980,32 +959,27 @@ def _draft_text(
     )
     title = title_prefix + summary
 
-    feedback_lines = _bounded_code_list(
-        feedback_ids,
-        max_bytes=_MAX_BODY_LIST_BYTES,
-    )
     path_lines = _bounded_code_list(paths, max_bytes=_MAX_BODY_LIST_BYTES)
     command_lines = _bounded_code_list(
         tuple(_argv_display(argv) for argv in focused_argv),
         max_bytes=_MAX_BODY_LIST_BYTES,
     )
     body = (
-        "## Localize Guardian prevention draft\n\n"
+        "Automated proposal for maintainer review.\n\n"
         f"Root cause: {_code(root_cause)}\n\n"
-        f"Evidence fingerprint: {_code(evidence_hash)}\n\n"
         "### Review evidence\n\n"
-        f"{feedback_lines}\n\n"
+        f"Based on {len(feedback_ids)} reviewed feedback items and the regression checks below.\n\n"
         "### Bounded patch\n\n"
-        f"Base: {_code(base_sha)}\n\n"
-        f"Candidate direct child: {_code(candidate_sha)}\n\n"
-        f"Patch fingerprint: {_code(patch_hash)}\n\n"
+        f"Base commit: {base_sha}\n\n"
+        f"Proposed fix (a direct child of that base): {candidate_sha}\n\n"
         f"{path_lines}\n\n"
         "### Regression proof supplied by the controller\n\n"
-        "The same focused argv failed on the exact base and passed on its direct child:\n\n"
+        "The same focused regression checks failed on the exact base and passed on its direct child:\n\n"
+        "Runner names are shown below; local paths and exact commands stay in the private audit.\n\n"
         f"{command_lines}\n\n"
-        "Publication of this draft requires a separate broker to re-verify current "
+        "Publication of this proposal requires a separate broker to re-verify current "
         "state and publish only this signed candidate. The Guardian cannot merge or "
-        "deploy prevention drafts.\n"
+        "deploy prevention proposals.\n"
     )
     if len(title.encode("utf-8")) > _MAX_TITLE_BYTES:  # pragma: no cover - helper
         raise PreventionPolicyError("generated title exceeds its byte bound")
@@ -1089,6 +1063,28 @@ def plan_prevention_draft(
     )
 
 
+def inspect_prevention_decline(
+    *,
+    base_workspace: Path,
+    candidate_workspace: Path,
+    inspected_paths: Sequence[str],
+    deadline: PollDeadline | None = None,
+) -> None:
+    """A structured decline requires an unchanged tree and real inspected files."""
+    base = _trusted_workspace(base_workspace, label="base")
+    candidate = _trusted_workspace(candidate_workspace, label="candidate")
+    if _workspaces_overlap(base, candidate):
+        raise PreventionPolicyError("base and candidate workspaces overlap")
+    before = _inventory(base, deadline=deadline)
+    after = _inventory(candidate, deadline=deadline)
+    if _changed_entries(before, after, deadline=deadline):
+        raise PreventionPolicyError("declined prevention candidate contains changes")
+    if not inspected_paths or any(
+        path not in before or before[path].kind != "regular" for path in inspected_paths
+    ):
+        raise PreventionPolicyError("prevention decline references unavailable files")
+
+
 __all__ = [
     "DraftPreventionPlan",
     "DuplicatePreventionCandidateError",
@@ -1097,6 +1093,7 @@ __all__ = [
     "TestCommandResult",
     "TestOutcome",
     "inspect_prevention_patch",
+    "inspect_prevention_decline",
     "plan_prevention_draft",
     "prevention_evidence_hash",
 ]

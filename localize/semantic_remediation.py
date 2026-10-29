@@ -9,10 +9,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
-from localize.localization_adapters import get_localization_adapter
-from localize.localization_profiles import LocalizationProfile
-from localize.placeholder_rules import strip_placeholder_tokens
-from localize.translation_validator import (
+from localize.formats.adapters import get_localization_adapter
+from localize.formats.profiles import LocalizationProfile
+from localize.formats.placeholders import strip_placeholder_tokens
+from localize.formats.validation import (
     check_placeholder_parity,
     find_disallowed_control_characters,
 )

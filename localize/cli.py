@@ -28,7 +28,7 @@ from localize.app_config import (
 from localize.bootstrap_pr import BootstrapPrOptions, create_bootstrap_pr
 from localize.formats import list_localization_adapters, list_localization_formats
 from localize.init_config import main as init_config_main
-from localize.localization_profiles import load_localization_profiles
+from localize.formats.profiles import load_localization_profiles
 from localize.plugins import load_plugins
 from localize.translation_quality_gate import main as translation_quality_gate_main
 from localize.translation_memory import (
@@ -372,8 +372,11 @@ def _cmd_quality_gate(args: argparse.Namespace) -> int:
     ]
     if args.audit_scope:
         quality_args.extend(["--audit-scope", args.audit_scope])
-    quality_args.append("--changed-files")
-    quality_args.extend(args.changed_files)
+    if args.source_diff_base:
+        quality_args.extend(["--source-diff-base", args.source_diff_base])
+    if args.changed_files:
+        quality_args.append("--changed-files")
+        quality_args.extend(args.changed_files)
     return int(translation_quality_gate_main(quality_args))
 
 
@@ -611,7 +614,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     bootstrap_parser.add_argument("--branch", default="localize/onboarding", help="Onboarding branch name.")
     bootstrap_parser.add_argument("--base-branch", default=None, help="Optional base branch to check out first.")
-    bootstrap_parser.add_argument("--action-ref", default="v0.1.20", help="Action ref to use in the generated workflow.")
+    bootstrap_parser.add_argument("--action-ref", default="v0.1.21", help="Action ref to use in the generated workflow.")
     bootstrap_parser.add_argument(
         "--onboarding-guide-file",
         default="docs/localize-pipeline.md",
@@ -653,7 +656,8 @@ def _build_parser() -> argparse.ArgumentParser:
     quality_parser.add_argument("--validation-summary", required=True)
     quality_parser.add_argument("--output-json", required=True)
     quality_parser.add_argument("--output-markdown", required=True)
-    quality_parser.add_argument("--changed-files", nargs="+", required=True)
+    quality_parser.add_argument("--changed-files", nargs="+", default=[])
+    quality_parser.add_argument("--source-diff-base", help="Trusted Git baseline for configured rules on source-affected targets.")
     quality_parser.add_argument("--audit-scope", choices=["changed", "all"], default=None)
     quality_parser.set_defaults(func=_cmd_quality_gate)
 

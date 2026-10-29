@@ -23,6 +23,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from localize.guardian.deadline import PollDeadline, deadline_httpx_timeout
+from localize.guardian.diagnostics import http_failure
 from localize.guardian.credentials import (
     CredentialError,
     CredentialSnapshot,
@@ -70,6 +71,37 @@ _SKIP_MARKERS = (
 )
 
 
+def matches_guardian_pr_body(actual: object, expected: str) -> bool:
+    """Match exact Guardian text, optionally followed by bounded untrusted notes.
+
+    CodeRabbit appends release notes after starting review. Its marker is not
+    author authentication: the entire suffix is ignored, never used as evidence
+    or authority. Every byte of the ledger-bound original body must remain intact.
+    """
+    if actual == expected:
+        return True
+    if not isinstance(actual, str) or not expected or not actual.startswith(expected):
+        return False
+    suffix = actual[len(expected):]
+    if len(suffix) > 8192 or "\x00" in suffix:
+        return False
+    try:
+        if len(suffix.encode("utf-8")) > 8192:
+            return False
+    except UnicodeEncodeError:
+        return False
+    notes = suffix.lstrip("\n")
+    if not 1 <= len(suffix) - len(notes) <= 3:
+        return False
+    start = "<!-- This is an auto-generated comment: release notes by coderabbit.ai -->"
+    end = "<!-- end of auto-generated comment: release notes by coderabbit.ai -->"
+    notes = notes.removesuffix("\n")
+    if not notes.startswith(start + "\n") or not notes.endswith(end):
+        return False
+    content = notes[len(start):-len(end)]
+    return not any(marker in content for marker in (start, end, "<!-- localize-guardian"))
+
+
 def _valid_repository_name(value: object) -> bool:
     return bool(
         isinstance(value, str)
@@ -109,6 +141,10 @@ def _validate_base_branch(branch: str) -> None:
 
 class GitHubAPIError(RuntimeError):
     """A redacted GitHub or token-helper failure."""
+
+
+class GitHubSnapshotChangedError(GitHubAPIError):
+    """The complete pull snapshot changed during its consistency check."""
 
 
 class GitHubAuthenticationError(GitHubAPIError):
@@ -279,13 +315,16 @@ class FeedbackRevision:
     line: int | None = None
     commit_id: str | None = None
     deleted: bool = False
+    in_reply_to_id: int | None = None
 
     @property
     def object_key(self) -> tuple[str, int, FeedbackKind, str]:
+        """Identify the GitHub object independently of its observed revision."""
         return (self.repository, self.pull_number, self.kind, self.source_id)
 
     @property
     def revision_id(self) -> str:
+        """Hash the current feedback body and assessment-relevant metadata."""
         payload = json.dumps(
             {
                 "body": self.body,
@@ -579,6 +618,7 @@ def _parse_feedback(
     kind: FeedbackKind,
     payload: Mapping[str, Any],
 ) -> FeedbackRevision:
+    """Normalize GitHub feedback and retain its optional review-reply parent."""
     user = _as_mapping(payload.get("user") or {}, label="feedback author")
     source_id = str(_as_int(payload.get("id"), label="feedback id"))
     created_at = str(payload.get("created_at") or payload.get("submitted_at") or "")
@@ -612,6 +652,7 @@ def _parse_feedback(
         else None,
         path=str(payload.get("path")) if payload.get("path") is not None else None,
         line=line,
+        in_reply_to_id=_optional_int(payload.get("in_reply_to_id"), label="reply parent id"),
         commit_id=str(payload.get("commit_id"))
         if payload.get("commit_id") is not None
         else None,
@@ -663,22 +704,100 @@ def _latest_by_object(
     return latest
 
 
-def _coderabbit_coverage(feedback: Iterable[FeedbackRevision]) -> CodeRabbitCoverage:
-    bot_feedback = [
-        revision
-        for revision in feedback
-        if not revision.deleted and revision.author_login.lower() in _CODERABBIT_LOGINS
-    ]
-    if not bot_feedback:
+def _coderabbit_coverage(
+    feedback: Iterable[FeedbackRevision], *, head_sha: str
+) -> CodeRabbitCoverage:
+    """Describe reported review coverage, never infer it from conversation.
+
+    Only substantive review records or recognizable summary/limit notices can
+    replace coverage. A reply acknowledging one finding proves nothing about
+    the rest of the diff. REVIEWED requires a current-head binding and no
+    reported file skips; ABSENT includes unknown or stale coverage evidence.
+    This is informational metadata, not review approval or edit authority.
+    """
+    candidates: list[tuple[FeedbackRevision, CodeRabbitCoverageStatus]] = []
+    for revision in _latest_by_object(feedback).values():
+        if (revision.deleted or revision.author_type != "Bot"
+                or revision.author_login.lower() not in _CODERABBIT_LOGINS
+                or revision.kind is FeedbackKind.REVIEW_COMMENT
+                or not revision.body.strip()):
+            continue
+        body = revision.body.strip()
+        summary = revision.kind is FeedbackKind.ISSUE_COMMENT and (
+            body.startswith("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->")
+            or body.startswith("## Walkthrough")
+        )
+        # Evidence quoted in examples is not a coverage declaration.
+        proof_lines = []
+        fence = ""
+        for line in body.splitlines():
+            match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+            if match:
+                marker, rest = match.groups()
+                if not fence:
+                    fence = marker
+                elif marker[0] == fence[0] and len(marker) >= len(fence) and not rest.strip():
+                    fence = ""
+                continue
+            if not fence and not line.lstrip().startswith(">"):
+                proof_lines.append(line)
+        proof = "\n".join(proof_lines)
+        normalized = proof.casefold()
+        limited = any(marker in normalized for marker in _RATE_LIMIT_MARKERS)
+        skipped = any(marker in normalized for marker in _SKIP_MARKERS)
+        substantive = bool(re.search(
+            r"actionable comments posted:\s*\d+|"
+            r"No actionable comments were generated in the recent review\.",
+            proof, re.IGNORECASE,
+        ))
+        if not (summary or limited or skipped or
+                revision.kind is FeedbackKind.REVIEW and substantive):
+            continue
+        status = CodeRabbitCoverageStatus.ABSENT
+        if limited:
+            status = CodeRabbitCoverageStatus.RATE_LIMITED
+        elif skipped:
+            status = CodeRabbitCoverageStatus.SKIPPED
+        else:
+            # Ignore ancillary checks such as unsupported docstring coverage.
+            file_skips = re.findall(
+                r"Files skipped from review[^\n<:(]*(?::\s*|\(\s*)(\d+)", proof,
+            )
+            selected = re.findall(
+                r"Files selected for processing\s*(?::\s*|\(\s*)(\d+)", proof,
+            )
+            if any(int(count) for count in file_skips) or selected == ["0"]:
+                status = CodeRabbitCoverageStatus.SKIPPED
+            else:
+                current_review = (
+                    revision.kind is FeedbackKind.REVIEW and substantive
+                    and revision.commit_id == head_sha
+                )
+                markers = re.findall(r"^<!-- final_review_risk_coverage:(.{1,2048}?) -->[ \t]*$", proof, re.MULTILINE)
+                if summary and len(markers) == 1:
+                    try:
+                        coverage = json.loads(markers[0])
+                    except (ValueError, RecursionError):
+                        coverage = None
+                    current_review = isinstance(coverage, dict) and (
+                        coverage.get("kind") == "reviewed"
+                        and coverage.get("sourceCommitId") == head_sha
+                        and coverage.get("coveredCommitId") == head_sha
+                    )
+                if current_review:
+                    status = CodeRabbitCoverageStatus.REVIEWED
+        candidates.append((revision, status))
+    if not candidates:
         return CodeRabbitCoverage(CodeRabbitCoverageStatus.ABSENT)
-    latest = max(bot_feedback, key=lambda item: (item.updated_at, item.revision_id))
-    normalized = latest.body.casefold()
-    if any(marker in normalized for marker in _RATE_LIMIT_MARKERS):
-        status = CodeRabbitCoverageStatus.RATE_LIMITED
-    elif any(marker in normalized for marker in _SKIP_MARKERS):
-        status = CodeRabbitCoverageStatus.SKIPPED
-    else:
-        status = CodeRabbitCoverageStatus.REVIEWED
+    priority = {
+        CodeRabbitCoverageStatus.REVIEWED: 0,
+        CodeRabbitCoverageStatus.ABSENT: 1,
+        CodeRabbitCoverageStatus.SKIPPED: 2,
+        CodeRabbitCoverageStatus.RATE_LIMITED: 3,
+    }
+    latest, status = max(candidates, key=lambda item: (
+        item[0].updated_at, priority[item[1]], item[0].revision_id,
+    ))
     return CodeRabbitCoverage(status, latest.revision_id)
 
 
@@ -705,14 +824,20 @@ class _GitHubHTTP:
         is_rate_limited = bool(retry_after) or (
             rate_limit_remaining == "0" and bool(rate_limit_reset)
         )
+        create_pr = method == "POST" and response.request.url.path.endswith("/pulls")
         if response.status_code == 403 and is_rate_limited:
-            raise GitHubAPIError(f"GitHub API {method} request was rate limited")
+            raise http_failure(GitHubAPIError(f"GitHub API {method} request was rate limited"),
+                               method=method, status=response.status_code,
+                               create_pr=create_pr, reason="rate_limited")
         if response.status_code in {401, 403}:
-            raise GitHubAuthenticationError(
-                f"GitHub API {method} authentication failed"
+            raise http_failure(GitHubAuthenticationError(
+                f"GitHub API {method} authentication failed"),
+                method=method, status=response.status_code,
+                create_pr=create_pr, reason="authentication_failed",
             )
-        raise GitHubAPIError(
-            f"GitHub API {method} request failed with status {response.status_code}"
+        raise http_failure(GitHubAPIError(
+            f"GitHub API {method} request failed with status {response.status_code}"),
+            method=method, status=response.status_code, create_pr=create_pr,
         )
 
     def _bounded_json(self, response: httpx.Response, *, label: str) -> Any:
@@ -1210,6 +1335,18 @@ class GitHubReader:
             raise ValueError(
                 "exact open pull identity must contain a positive pull ID and number"
             )
+        for attempt in range(3):
+            try:
+                return self._collect_exact_open_pull_once(expected_pull)
+            except GitHubSnapshotChangedError:
+                if attempt == 2:
+                    raise
+        raise AssertionError("unreachable exact-pull retry state")
+
+    def _collect_exact_open_pull_once(
+        self, expected_pull: tuple[int, int],
+    ) -> PullRequestFeedbackSnapshot:
+        """Restart every identity and material read after a consistency race."""
         pull_id, pull_number = expected_pull
         repository_identity = self.repository_identity()
         pull = _parse_pull_request(
@@ -1900,7 +2037,7 @@ class GitHubReader:
         current, changed_files = collect_material()
         confirmed_feedback, confirmed_changed_files = collect_material()
         if confirmed_feedback != current or confirmed_changed_files != changed_files:
-            raise GitHubAPIError("GitHub pull request changed during hydration")
+            raise GitHubSnapshotChangedError("GitHub pull request changed during hydration")
 
         final_pull = _parse_pull_request(
             self.policy.repository,
@@ -1917,7 +2054,7 @@ class GitHubReader:
             label="pull-request updated_at",
         )
         if _pull_hydration_identity(final_pull) != _pull_hydration_identity(pull):
-            raise GitHubAPIError("GitHub pull request changed during hydration")
+            raise GitHubSnapshotChangedError("GitHub pull request changed during hydration")
 
         current_by_object = {revision.object_key: revision for revision in current}
         for object_key, old_revision in previous_by_object.items():
@@ -1950,7 +2087,7 @@ class GitHubReader:
             repository_identity=repository_identity,
             pull_request=pull,
             feedback=tuple(current),
-            coderabbit=_coderabbit_coverage(visible),
+            coderabbit=_coderabbit_coverage(visible, head_sha=pull.head_sha),
             changed_files=changed_files,
         )
 
@@ -2166,17 +2303,14 @@ class GitHubWriteBroker:
     def _reply_body(
         self,
         *,
-        marker: str,
         head_repository: str,
         commit_sha: str,
     ) -> str:
         short_sha = commit_sha[:12]
         commit_url = f"{self.web_base_url}/{head_repository}/commit/{commit_sha}"
         return (
-            f"{marker}\n"
-            "🤖 **Localize Guardian:** Applied a validated translation-only "
-            f"correction in [`{short_sha}`]({commit_url}). The review thread "
-            "remains open for reviewer confirmation."
+            f"🤖 **Localize Guardian:** Updated translations in [`{short_sha}`]({commit_url}). "
+            "Please review the diff."
         )
 
     def _validated_reply_comment(
@@ -2254,26 +2388,34 @@ class GitHubWriteBroker:
                 f"/repos/{self.policy.repository}/issues/{pull_number}/comments"
             )
             body = self._reply_body(
-                marker=marker,
                 head_repository=pull.head_repository,
                 commit_sha=commit_sha,
+            )
+            commit_url = f"{self.web_base_url}/{pull.head_repository}/commit/{commit_sha}"
+            legacy_body = (
+                marker + "\n🤖 **Localize Guardian:** Applied a validated translation-only "
+                f"correction in [`{commit_sha[:12]}`]({commit_url}). The review thread "
+                "remains open for reviewer confirmation."
             )
             matching: list[ReplyResult] = []
             for raw_comment in http.paginate(comments_url):
                 raw_body = str(raw_comment.get("body") or "")
-                if marker in raw_body:
+                if marker in raw_body or (
+                    raw_body.startswith("🤖 **Localize Guardian:**")
+                    and commit_url in raw_body
+                ):
                     matching.append(
                         self._validated_reply_comment(
                             raw_comment,
                             expected_actor=expected_actor,
-                            expected_body=body,
+                            expected_body=legacy_body if marker in raw_body else body,
                             pull_number=pull_number,
                             created=False,
                         )
                     )
             if len(matching) > 1:
                 raise PolicyViolation(
-                    "Multiple exact Guardian status comments share one marker."
+                    "Multiple exact Guardian status comments describe this correction."
                 )
             if matching:
                 return matching[0]
@@ -2291,7 +2433,6 @@ class GitHubWriteBroker:
                 expected_base_sha=expected_base_sha,
             )
             fresh_body = self._reply_body(
-                marker=marker,
                 head_repository=pull.head_repository,
                 commit_sha=commit_sha,
             )
@@ -2312,3 +2453,228 @@ class GitHubWriteBroker:
                 pull_number=pull_number,
                 created=True,
             )
+
+    def post_feedback_report(
+        self, *, pull_number: int, expected_head_sha: str, expected_base_sha: str,
+        expected_actor: TrustedActor, report_id: str, feedback_id: str,
+        details: Mapping[str, Any], before_create: Callable[[], None],
+        before_recover: Callable[[], None],
+    ) -> ReplyResult:
+        """Explain a disposition at its review thread, never resolving it.
+
+        Only deterministic templates cross this boundary. Review summaries and
+        issue comments use a linked PR-level reply because GitHub has no nested
+        reply endpoint for those objects.
+        """
+        from localize.guardian.reporting import legacy_report_body, report_body, report_key
+
+        self._validate_marker_id(report_id, label="report_id")
+        body = report_body(details, repository=self.policy.repository, feedback_id=feedback_id,
+                           pull_number=pull_number, web_base_url=self.web_base_url)
+        # Older writers included the internal feedback identifier in the title.
+        # Retain exact read-only recovery of those comments, never publish it.
+        title = body.split("\n", 1)[0]
+        historical_text = legacy_report_body(
+            details, repository=self.policy.repository, feedback_id=feedback_id,
+            pull_number=pull_number, web_base_url=self.web_base_url,
+        )
+        old_ids = {report_id}
+        if self.policy.repository_id is not None:
+            old_ids.add(report_key(repository_id=self.policy.repository_id,
+                                   pull_number=pull_number, feedback_id=feedback_id,
+                                   body=historical_text))
+        legacy_markers = tuple(f"<!-- localize-guardian:feedback:{key} -->" for key in sorted(old_ids))
+        legacy_bodies = tuple(marker + "\n" + historical_text for marker in legacy_markers)
+        assessed_link = (
+            f"[Assessed revision]({self.web_base_url}/{self.policy.repository}"
+            f"/commit/{expected_head_sha})"
+        )
+        body += f"\n\n{assessed_link}."
+        kind, raw_id = feedback_id.split(":", 1)
+        anchor = {"review_comment": "discussion_r", "issue_comment": "issuecomment-",
+                  "review": "pullrequestreview-"}[kind]
+        source_url = (f"{self.web_base_url}/{self.policy.repository}/pull/{pull_number}"
+                      f"#{anchor}{raw_id.split(':', 1)[0]}")
+        # Synthetic nitpick IDs are routed to a PR comment, never an API path.
+        review_id = int(raw_id) if kind == "review_comment" and raw_id.isdecimal() else None
+        return self._post_explanation(
+            pull_number=pull_number, expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha, expected_actor=expected_actor,
+            body=body, marker=title, before_create=before_create, before_recover=before_recover,
+            identity_parts=(f"[Source feedback]({source_url})", assessed_link),
+            legacy_markers=legacy_markers, legacy_bodies=legacy_bodies,
+            review_id=review_id,
+        )
+
+    def _explanation_matches(
+        self, http: _GitHubHTTP, *, pull_number: int, review_id: int | None,
+        expected_actor: TrustedActor, marker: str, identity_parts: Sequence[str],
+        legacy_markers: Sequence[str],
+    ) -> tuple[int | None, list[Mapping[str, Any]]]:
+        """Read the complete bounded collection and identify one exact route."""
+        prefix = f"/repos/{self.policy.repository}"
+        parent_id = None
+        if review_id is not None:
+            parent = _as_mapping(http.request_json("GET", f"{prefix}/pulls/comments/{review_id}"), label="review comment")
+            if parent.get("pull_request_url") != f"{self.base_url.rstrip('/')}{prefix}/pulls/{pull_number}":
+                raise PolicyViolation("Review comment belongs to a different pull request.")
+            parent_id = _as_int(parent.get("in_reply_to_id") or parent.get("id"), label="review parent id")
+        collection = f"{prefix}/pulls/{pull_number}/comments" if parent_id else f"{prefix}/issues/{pull_number}/comments"
+        matches = [
+            item for item in http.paginate(collection)
+            if isinstance(item.get("user"), Mapping)
+            and (item["user"].get("id"), item["user"].get("type")) == (expected_actor.id, expected_actor.type)
+            and item.get("in_reply_to_id") == parent_id
+            and (((bool(identity_parts) or str(item.get("body") or "").startswith(marker))
+                  and all(part in str(item.get("body") or "") for part in identity_parts))
+                 or any(old in str(item.get("body") or "") for old in legacy_markers))
+        ]
+        if len(matches) > 1:
+            raise PolicyViolation("Ambiguous Guardian explanation markers.")
+        return parent_id, matches
+
+    def _validate_explanation(
+        self, item: Mapping[str, Any], *, expected_body: str, expected_actor: TrustedActor,
+        pull_number: int, parent_id: int | None, created: bool,
+    ) -> ReplyResult:
+        actor = _trusted_actor_from_payload(item.get("user"), label="explanation author")
+        comment_id = _as_int(item.get("id"), label="explanation id")
+        anchor = f"discussion_r{comment_id}" if parent_id else f"issuecomment-{comment_id}"
+        url = f"{self.web_base_url}/{self.policy.repository}/pull/{pull_number}#{anchor}"
+        if ((actor.id, actor.type) != (expected_actor.id, expected_actor.type)
+                or item.get("body") != expected_body or item.get("html_url") != url
+                or item.get("in_reply_to_id") != parent_id):
+            raise PolicyViolation("Guardian explanation actor, content, or route changed.")
+        return ReplyResult(comment_id=comment_id, html_url=url, body=expected_body, created=created)
+
+    def _recover_exact_explanation(
+        self, http: _GitHubHTTP, *, pull_number: int, expected_head_sha: str,
+        expected_base_sha: str, expected_actor: TrustedActor, body: str, marker: str,
+        before_recover: Callable[[], None], review_id: int | None,
+        identity_parts: Sequence[str], legacy_markers: Sequence[str], legacy_bodies: Sequence[str],
+        previous_body: str | Sequence[str] | None,
+    ) -> ReplyResult | None:
+        """A zero-write receipt lookup; failures never become publication fallback.
+
+        Durable intent and lease checks are separate from materializing source
+        checkouts. This branch only acknowledges content already on GitHub.
+        """
+        before_recover()
+        self._require_expected_actor(http, expected_actor=expected_actor)
+        self._fresh_pull(http, pull_number=pull_number, expected_head_sha=expected_head_sha,
+                         expected_base_sha=expected_base_sha)
+        parent_id, matches = self._explanation_matches(
+            http, pull_number=pull_number, review_id=review_id, expected_actor=expected_actor,
+            marker=marker, identity_parts=identity_parts, legacy_markers=legacy_markers,
+        )
+        if not matches:
+            return None
+        candidate = matches[0]
+        candidate_body = candidate.get("body")
+        if candidate_body != body and candidate_body not in legacy_bodies:
+            known = (previous_body,) if isinstance(previous_body, str) else tuple(previous_body or ())
+            if parent_id or not known or len(known) > 100 or candidate_body not in known:
+                raise PolicyViolation("Guardian explanation was edited externally.")
+            self._validate_explanation(candidate, expected_body=candidate_body, expected_actor=expected_actor,
+                                       pull_number=pull_number, parent_id=parent_id, created=False)
+            return None  # A known older summary still requires the full PATCH protocol.
+        receipt = self._validate_explanation(candidate, expected_body=candidate_body, expected_actor=expected_actor,
+                                             pull_number=pull_number, parent_id=parent_id, created=False)
+        before_recover()
+        self._require_expected_actor(http, expected_actor=expected_actor)
+        self._fresh_pull(http, pull_number=pull_number, expected_head_sha=expected_head_sha,
+                         expected_base_sha=expected_base_sha)
+        route = "pulls/comments" if parent_id else "issues/comments"
+        current = _as_mapping(http.request_json("GET", f"/repos/{self.policy.repository}/{route}/{receipt.comment_id}"), label="explanation")
+        if current.get("id") != receipt.comment_id:
+            raise PolicyViolation("Guardian explanation identity changed.")
+        return self._validate_explanation(current, expected_body=candidate_body, expected_actor=expected_actor,
+                                          pull_number=pull_number, parent_id=parent_id, created=False)
+
+    def _post_explanation(
+        self, *, pull_number: int, expected_head_sha: str, expected_base_sha: str,
+        expected_actor: TrustedActor, body: str, marker: str,
+        before_create: Callable[[], None], before_recover: Callable[[], None], review_id: int | None = None,
+        previous_body: str | Sequence[str] | None = None,
+        identity_parts: Sequence[str] = (), legacy_markers: Sequence[str] = (),
+        legacy_bodies: Sequence[str] = (),
+    ) -> ReplyResult:
+        """Recover ambiguous writes only from exact actor/content/route matches."""
+        self._validate_sha(expected_head_sha, label="expected_head_sha")
+        self._validate_sha(expected_base_sha, label="expected_base_sha")
+        with self._client(self._mint_token()) as client:
+            http = _GitHubHTTP(client, deadline=self.deadline)
+            recovered = self._recover_exact_explanation(
+                http, pull_number=pull_number, expected_head_sha=expected_head_sha,
+                expected_base_sha=expected_base_sha, expected_actor=expected_actor,
+                body=body, marker=marker, before_recover=before_recover, review_id=review_id,
+                identity_parts=identity_parts, legacy_markers=legacy_markers,
+                legacy_bodies=legacy_bodies, previous_body=previous_body,
+            )
+            if recovered is not None:
+                return recovered
+
+            def fresh() -> None:
+                self._require_expected_actor(http, expected_actor=expected_actor)
+                self._fresh_pull(http, pull_number=pull_number,
+                                 expected_head_sha=expected_head_sha,
+                                 expected_base_sha=expected_base_sha)
+                before_create()
+
+            fresh()
+            repo = self.policy.repository
+            prefix = f"/repos/{repo}"
+            parent_id, matches = self._explanation_matches(
+                http, pull_number=pull_number, review_id=review_id, expected_actor=expected_actor,
+                marker=marker, identity_parts=identity_parts, legacy_markers=legacy_markers,
+            )
+            collection = f"{prefix}/pulls/{pull_number}/comments" if parent_id else f"{prefix}/issues/{pull_number}/comments"
+
+            def validate(item: Mapping[str, Any], expected_body: str, created: bool) -> ReplyResult:
+                return self._validate_explanation(item, expected_body=expected_body, expected_actor=expected_actor,
+                                                   pull_number=pull_number, parent_id=parent_id, created=created)
+
+            if matches and matches[0].get("body") == body:
+                return validate(matches[0], body, False)
+            if matches and matches[0].get("body") in legacy_bodies:
+                return validate(matches[0], matches[0]["body"], False)
+            if matches:
+                if previous_body is None or parent_id:
+                    raise PolicyViolation("Guardian explanation was edited externally.")
+                known_bodies = (previous_body,) if isinstance(previous_body, str) else tuple(previous_body)
+                if len(known_bodies) > 100 or matches[0].get("body") not in known_bodies:
+                    raise PolicyViolation("Guardian summary was edited externally.")
+                exact_previous_body = matches[0]["body"]
+                prior = validate(matches[0], exact_previous_body, False)
+                target = f"{prefix}/issues/comments/{prior.comment_id}"
+                method = "PATCH"
+            else:
+                target = f"{prefix}/pulls/{pull_number}/comments/{parent_id}/replies" if parent_id else collection
+                method = "POST"
+            fresh()
+            if matches:
+                # Re-read the exact old summary immediately before replacement.
+                validate(_as_mapping(http.request_json("GET", target), label="summary"), exact_previous_body, False)
+                before_create()
+            response = _as_mapping(http.request_json(method, target, payload={"body": body}), label="explanation")
+            return validate(response, body, method == "POST")
+
+    def post_feedback_summary(
+        self, *, pull_number: int, expected_head_sha: str, expected_base_sha: str,
+        expected_actor: TrustedActor, reports: Sequence[Mapping[str, Any]],
+        previous_body: str | Sequence[str] | None, before_create: Callable[[], None],
+        before_recover: Callable[[], None],
+    ) -> ReplyResult:
+        """Use one managed comment; never weaken PR description recovery checks."""
+        from localize.guardian.reporting import summary_body
+
+        marker = "🤖 **Localize Guardian — feedback status**"
+        return self._post_explanation(
+            pull_number=pull_number, expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha, expected_actor=expected_actor,
+            body=summary_body(reports, repository=self.policy.repository,
+                              pull_number=pull_number, web_base_url=self.web_base_url),
+            marker=marker, before_create=before_create, before_recover=before_recover,
+            legacy_markers=("<!-- localize-guardian:feedback-summary:v1 -->",),
+            previous_body=previous_body,
+        )

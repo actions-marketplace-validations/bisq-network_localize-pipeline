@@ -815,6 +815,114 @@ def test_reader_revalidates_one_exact_open_pull_without_listing() -> None:
     assert "/repos/acme/app/pulls" not in calls
 
 
+@pytest.mark.parametrize("changed_part", ["feedback", "pull"])
+def test_exact_open_pull_restarts_complete_hydration_after_change(
+    changed_part: str,
+) -> None:
+    calls: list[str] = []
+    pull_reads = 0
+    feedback_reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal pull_reads, feedback_reads
+        path = request.url.path
+        calls.append(path)
+        if path == "/repos/acme/app":
+            return _json_response(request, _repo_payload())
+        if path == "/repos/acme/app/pulls/2":
+            pull_reads += 1
+            updated_at = (
+                "2026-08-30T09:00:00Z"
+                if changed_part == "pull" and pull_reads == 1
+                else "2026-08-30T09:01:00Z"
+            )
+            return _json_response(request, _pr_payload(2, updated_at=updated_at))
+        if path == "/repos/acme/app/issues/2/comments":
+            feedback_reads += 1
+            body = (
+                "old advice"
+                if changed_part == "feedback" and feedback_reads == 1
+                else "current advice"
+            )
+            return _json_response(request, [_feedback_payload(20, body)])
+        if path.endswith(("/pulls/2/reviews", "/pulls/2/comments", "/pulls/2/files")):
+            return _json_response(request, [])
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    with httpx.Client(
+        base_url="https://api.github.test", transport=httpx.MockTransport(handler),
+    ) as client:
+        snapshot = GitHubReader(client, _policy()).collect_exact_open_pull((1002, 2))
+
+    assert snapshot.feedback[0].body == "current advice"
+    assert snapshot.pull_request.updated_at == "2026-08-30T09:01:00Z"
+    assert calls.count("/repos/acme/app") == 2
+    assert calls.count("/repos/acme/app/pulls/2") == (3 if changed_part == "feedback" else 4)
+    assert feedback_reads == 4
+
+
+def test_exact_open_pull_stops_after_three_changed_hydrations() -> None:
+    calls: list[str] = []
+    feedback_reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal feedback_reads
+        path = request.url.path
+        calls.append(path)
+        if path == "/repos/acme/app":
+            return _json_response(request, _repo_payload())
+        if path == "/repos/acme/app/pulls/2":
+            return _json_response(request, _pr_payload(2))
+        if path == "/repos/acme/app/issues/2/comments":
+            feedback_reads += 1
+            return _json_response(
+                request, [_feedback_payload(20, f"version {feedback_reads}")],
+            )
+        if path.endswith(("/pulls/2/reviews", "/pulls/2/comments", "/pulls/2/files")):
+            return _json_response(request, [])
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    with httpx.Client(
+        base_url="https://api.github.test", transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(GitHubAPIError, match="changed during hydration"):
+            GitHubReader(client, _policy()).collect_exact_open_pull((1002, 2))
+
+    assert calls.count("/repos/acme/app") == 3
+    assert calls.count("/repos/acme/app/pulls/2") == 3
+    assert feedback_reads == 6
+
+
+@pytest.mark.parametrize("failure", ["auth", "policy", "network"])
+def test_exact_open_pull_does_not_retry_unrelated_failures(failure: str) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(path)
+        if path == "/repos/acme/app":
+            if failure == "auth":
+                return _json_response(request, {"message": "Bad credentials"}, status=401)
+            if failure == "network":
+                raise httpx.ReadTimeout("private details", request=request)
+            return _json_response(request, _repo_payload())
+        if path == "/repos/acme/app/pulls/2":
+            return _json_response(request, _pr_payload(2, author_id=999))
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    with httpx.Client(
+        base_url="https://api.github.test", transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(
+            GitHubAuthenticationError if failure == "auth"
+            else GitHubAPIError if failure == "network" else PolicyViolation,
+        ):
+            GitHubReader(client, _policy()).collect_exact_open_pull((1002, 2))
+
+    assert calls.count("/repos/acme/app") == 1
+    assert calls.count("/repos/acme/app/pulls/2") == (1 if failure == "policy" else 0)
+
+
 @pytest.mark.parametrize(
     ("expected", "payload"),
     [
@@ -1066,7 +1174,7 @@ def test_closed_reader_rejects_pull_metadata_drift_during_hydration(
 
     assert result.snapshots == ()
     assert len(result.failures) == 1
-    assert result.failures[0].failure_type == "GitHubAPIError"
+    assert result.failures[0].failure_type == "GitHubSnapshotChangedError"
     assert revalidations == guardian_github._MAX_CLOSED_PULL_HYDRATION_ATTEMPTS
 
 
@@ -3327,7 +3435,7 @@ def test_writer_posts_one_concise_bot_labelled_commit_reply_without_resolving_th
     assert "Localize Guardian" in body
     assert f"https://github.test/translator-bot/app/commit/{NEW_SHA}" in body
     assert NEW_SHA[:12] in body
-    assert "remains open for reviewer confirmation" in body
+    assert "Please review the diff." in body
     assert "fixed everything" not in body.lower()
     assert len(body) < 600
 
@@ -3919,3 +4027,17 @@ def test_github_rate_limit_403_is_not_an_authentication_failure(
             )
 
     assert not isinstance(raised.value, GitHubAuthenticationError)
+
+
+def test_review_reply_parent_is_retained_for_reporting():
+    """Distinguish normalized review replies from root comments."""
+    from localize.guardian.github import _parse_feedback, FeedbackKind
+
+    payload = {"id": 4166280194, "in_reply_to_id": 4162550637,
+               "user": {"id": 999, "login": "coderabbitai[bot]", "type": "Bot"},
+               "body": "I withdraw the finding."}
+    reply = _parse_feedback("acme/widgets", 12, FeedbackKind.REVIEW_COMMENT, payload)
+    assert reply.in_reply_to_id == 4162550637
+    root = _parse_feedback("acme/widgets", 12, FeedbackKind.REVIEW_COMMENT,
+                           {key: value for key, value in payload.items() if key != "in_reply_to_id"})
+    assert root.in_reply_to_id is None

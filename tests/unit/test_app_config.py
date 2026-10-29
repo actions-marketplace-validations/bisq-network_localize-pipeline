@@ -14,8 +14,8 @@ from localize.app_config import (
     resolve_semantic_review_model,
     validate_config,
 )
-from localize.localization_formats import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
-from localize.localization_layouts import SUFFIX_LAYOUT
+from localize.formats.metadata import JSON_FORMAT, JAVA_PROPERTIES_FORMAT
+from localize.formats.layouts import SUFFIX_LAYOUT
 
 
 class TestAppConfig:
@@ -326,6 +326,7 @@ class TestLoadAppConfig:
 
 
     def test_load_config_reads_project_context_and_format(self):
+        """Load project context, glossary, custom format, and layout into the profile."""
         mock_config = {
             "dry_run": True,
             "project_context": "Translate for a developer tool.",
@@ -359,7 +360,8 @@ class TestLoadAppConfig:
         assert config.localization_profiles[0].localization_format.id == "custom_json"
 
     def test_load_config_records_profile_without_mutating_placeholder_state(self):
-        import localize.placeholder_rules as placeholder_rules
+        """Store the configured placeholder profile without changing the active one."""
+        import localize.formats.placeholders as placeholder_rules
 
         mock_config = {
             "dry_run": True,
@@ -377,7 +379,7 @@ class TestLoadAppConfig:
             assert config.placeholder_profile == "java-indexed"
             from collections import Counter
 
-            from localize.placeholder_rules import extract_placeholder_tokens
+            from localize.formats.placeholders import extract_placeholder_tokens
 
             assert extract_placeholder_tokens("%0 of %1") == Counter()
 
@@ -655,7 +657,7 @@ class TestLoadAppConfig:
                 with patch("os.access", return_value=True):
                     with patch("localize.app_config.setup_logger") as mock_logger:
                         mock_logger.return_value = MagicMock()
-                        with patch("localize.model_provider.AsyncOpenAI") as mock_openai:
+                        with patch("localize.providers.models.AsyncOpenAI") as mock_openai:
                             mock_client = MagicMock()
                             mock_openai.return_value = mock_client
                             with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-key"}):
@@ -1061,12 +1063,13 @@ class TestProviderAbstraction:
 
     @staticmethod
     def _load(mock_config, env):
+        """Load mocked YAML in an isolated environment and return the client factory spy."""
         with patch("builtins.open", mock_open(read_data=yaml.dump(mock_config))):
             with patch("os.path.exists", return_value=True):
                 with patch("os.access", return_value=True):
                     with patch("localize.app_config.setup_logger") as mock_logger:
                         mock_logger.return_value = MagicMock()
-                        with patch("localize.model_provider.AsyncOpenAI") as mock_openai:
+                        with patch("localize.providers.models.AsyncOpenAI") as mock_openai:
                             mock_openai.return_value = MagicMock()
                             with patch.dict(os.environ, env, clear=True):
                                 config = load_app_config()
@@ -1226,7 +1229,7 @@ class TestProviderAbstraction:
             with patch("os.path.exists", return_value=True):
                 with patch("os.access", return_value=True):
                     with patch("localize.app_config.setup_logger", return_value=captured):
-                        with patch("localize.model_provider.AsyncOpenAI", return_value=MagicMock()):
+                        with patch("localize.providers.models.AsyncOpenAI", return_value=MagicMock()):
                             with patch.dict(os.environ, {"OPENAI_API_KEY": "gsk_abc123"}, clear=True):
                                 load_app_config()
         warnings = [str(c) for c in captured.warning.call_args_list]
